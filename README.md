@@ -17,16 +17,36 @@ grafeio            # attach to your opencode install (spawns `opencode serve`)
 grafeio --demo     # touring mode: simulated events, no install required
 ```
 
-Layout:
+Layout (fullscreen, opencode-style chrome):
 
 ```
-+---------------------------------------------------------------+
-|  FLOOR              |  MAIL            |  BOARD               |
-|  (animated office)  |  (agent mail)    |  pending|doing|done  |
-+---------------------+------------------+----------------------+
-|  CHAT —> the boss (oikonomos)                                  |
-+---------------------------------------------------------------+
++ topbar: grafeio v0.1.0 | MODE | agents n                    clock +
++------------------------------------------------+-------------+
+|  FLOOR (animated office)                       |  AGENTS     |
+|  boss office · conference · cabins · pods ·    |  ---------- |
+|  tea machine · break room                      |  MAIL       |
+|                                                |  ---------- |
+|                                                |  BOARD      |
++------------------------------------------------+-------------+
+|  CHAT -> the boss (oikonomos)                              |
++-------------------------------------------------------------+
+|  statusbar: statusLine            n agents | board p/i/d    |
++-------------------------------------------------------------+
 ```
+
+## Gallery (real renders, `npx tsx scripts/to-png.ts`)
+
+Early shift — staffing, boss awaiting:
+
+![grafeio early](docs/shots/grafeio-1000.png)
+
+Mid shift — three briefs in flight, screens lit:
+
+![grafeio mid](docs/shots/grafeio-2500.png)
+
+Late shift — returns landing in MAIL, tasks moving to DONE, office chatter:
+
+![grafeio busy](docs/shots/grafeio-4000.png)
 
 Requirements: Node 20+, opencode (`brew install anomalyco/tap/opencode`) for
 the live mode.
