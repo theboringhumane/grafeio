@@ -1,0 +1,44 @@
+{
+  "name": "grafeio",
+  "version": "0.1.0",
+  "description": "γραφείο — the terminal office. A TUI where a manager agent runs a startup of sub-agent employees: chat with the boss, watch the floor, read the mail, track the board. Powered by opencode + agentmemory. By Lynxlabs.",
+  "keywords": [
+    "opencode",
+    "tui",
+    "ink",
+    "multi-agent",
+    "terminal",
+    "office",
+    "lynxlabs"
+  ],
+  "license": "MIT",
+  "author": "Lynxlabs",
+  "type": "module",
+  "bin": {
+    "grafeio": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "docs"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts false --clean",
+    "dev": "tsx src/index.ts",
+    "demo": "tsx src/index.ts --demo",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.18.15",
+    "ink": "^7.1.1",
+    "ink-text-input": "^6.0.0",
+    "react": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.2.0",
+    "ink-testing-library": "^4.0.0",
+    "tsup": "^8.3.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
