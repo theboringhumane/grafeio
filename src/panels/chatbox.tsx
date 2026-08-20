@@ -1,11 +1,12 @@
 /**
  * chatbox.tsx — persistent bottom bar, exactly CHAT_H rows, full width:
- *   ╭─ CHAT -> BOSS ─────╮   (title lives in the top border)
- *   │ <last 3 messages>   │
+ *   ╭─ CHAT -> BOSS ─────╮   (title lives in the top border, blackBright)
+ *   │ <last 3 messages>   │   ("you>" cyan, "boss>" yellow, bodies default)
  *   │ > <input>           │
  *   ╰─────────────────────╯
  * While a boss reply is pending, the input locks (frozen value, no focus)
- * and a typing indicator cycles. Manual borders keep the height exact.
+ * and a yellow-dim typing indicator cycles. Manual borders (yellow) keep
+ * the height exact.
  */
 import React, {useState} from "react";
 import {Box, Text} from "ink";
@@ -16,8 +17,10 @@ export const CHAT_H = 6;
 
 interface Line {
   key: string;
+  /** "you> " / "boss> " — colored; text = message body — default fg. */
+  prefix: string;
+  prefixColor: string;
   text: string;
-  color: string;
   dim: boolean;
 }
 
@@ -41,17 +44,17 @@ export function ChatBox({
 
   const lines: Line[] = chat.slice(-3).map((m) =>
     m.from === "user"
-      ? {key: m.id, text: `you> ${m.text}`, color: "white", dim: false}
+      ? {key: m.id, prefix: "you> ", prefixColor: "cyan", text: m.text, dim: false}
       : m.pending
-        ? {key: m.id, text: `boss> typing${dots}`, color: "yellow", dim: true}
-        : {key: m.id, text: `boss> ${m.text}`, color: "yellow", dim: false},
+        ? {key: m.id, prefix: "boss> ", prefixColor: "yellow", text: `typing${dots}`, dim: true}
+        : {key: m.id, prefix: "boss> ", prefixColor: "yellow", text: m.text, dim: false},
   );
   while (lines.length < 3)
-    lines.push({key: `pad-${lines.length}`, text: "", color: "white", dim: false});
+    lines.push({key: `pad-${lines.length}`, prefix: "", prefixColor: "white", text: "", dim: false});
 
   const title = "CHAT -> BOSS";
-  const topBody = `╭─ ${title} ${"─".repeat(w)}`;
-  const top = `${topBody.slice(0, Math.max(0, w - 1))}╮`;
+  // "╭─ " + title + " " + dashes + "╮" == w (matches the previous one-piece layout)
+  const dashes = "─".repeat(Math.max(1, w - 1 - 3 - title.length - 1));
   const bottom = `╰${"─".repeat(Math.max(0, w - 2))}╯`;
 
   const inputMax = Math.max(4, contentW - 2); // "> " prefix eats 2
@@ -65,18 +68,25 @@ export function ChatBox({
 
   return (
     <Box flexDirection="column" width={w} height={CHAT_H}>
-      <Text color="yellow" wrap="truncate">
-        {top}
+      <Text wrap="truncate">
+        <Text color="yellow">{"╭─ "}</Text>
+        <Text color="blackBright">{title}</Text>
+        <Text color="yellow">{` ${dashes}╮`}</Text>
       </Text>
       {lines.map((l) => {
-        const shown = l.text.slice(0, Math.max(0, contentW));
+        // truncate the composed line first, then split prefix/body for coloring
+        const shown = `${l.prefix}${l.text}`.slice(0, Math.max(0, contentW));
+        const shownPrefix = shown.slice(0, l.prefix.length);
+        const shownText = shown.slice(l.prefix.length);
+        const pad = " ".repeat(Math.max(0, contentW - shown.length));
         return (
           <Text key={l.key} wrap="truncate">
             <Text color="yellow">{"│ "}</Text>
-            <Text color={l.color} dimColor={l.dim}>
-              {shown}
-              {" ".repeat(Math.max(0, contentW - shown.length))}
+            <Text color={l.prefixColor} dimColor={l.dim}>
+              {shownPrefix}
             </Text>
+            <Text dimColor={l.dim}>{shownText}</Text>
+            <Text>{pad}</Text>
             <Text color="yellow">{" │"}</Text>
           </Text>
         );
@@ -98,8 +108,8 @@ export function ChatBox({
         </Box>
         <Text color="yellow">{" │"}</Text>
       </Box>
-      <Text color="yellow" wrap="truncate">
-        {bottom}
+      <Text wrap="truncate">
+        <Text color="yellow">{bottom}</Text>
       </Text>
     </Box>
   );

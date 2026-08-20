@@ -1,8 +1,10 @@
 /**
  * agents.tsx — AGENTS roster: the command-center panel.
- * Boss pinned first as "boss (oikonomos)"; one row per employee:
- *   name (left)  <glyph> <sprite word>  <current task, right-aligned, truncated>
- * Blocked employees show "!blocked" in red.
+ * Boss pinned first as "boss (oikonomos)" (yellow bold); one row per employee:
+ *   name (role color)  <glyph> <sprite word (semantic color)>  <task, dim, right>
+ * Sprite-word colors: working cyan, meeting yellow, coffee yellow-dim,
+ * blocked red bold, at desk blackBright (neutral chrome).
+ * Blocked (at-mailbox) employees show "blocked" in bold red.
  */
 import React from "react";
 import {Box, Text} from "ink";
@@ -21,6 +23,15 @@ const WORD: Record<SpriteState, string> = {
   "at-mailbox": "blocked",
 };
 
+/** Semantic chrome color per sprite word (keyed on WORD's display string). */
+const WORD_STYLE: Record<string, {color: string; dim?: boolean; bold?: boolean}> = {
+  working: {color: "cyan"},
+  meeting: {color: "yellow"},
+  coffee: {color: "yellow", dim: true},
+  blocked: {color: "red", bold: true},
+  "at desk": {color: "blackBright"},
+};
+
 const MAX_ROWS = 9;
 
 export function Agents({state}: {state: OfficeState}) {
@@ -34,9 +45,11 @@ export function Agents({state}: {state: OfficeState}) {
     <Box borderStyle="round" borderColor="white" flexDirection="column" paddingX={1}>
       <Text bold>AGENTS</Text>
       {shown.map((e) => {
-        const blocked = e.sprite === "at-mailbox";
-        const label = e.role === "manager" ? "boss (oikonomos)" : e.name;
-        const leftLen = label.length + 1 + ROLE_GLYPH[e.role].length + 1 + (blocked ? 8 : WORD[e.sprite].length);
+        const isBoss = e.role === "manager";
+        const label = isBoss ? "boss (oikonomos)" : e.name;
+        const word = WORD[e.sprite];
+        const style = WORD_STYLE[word] ?? {color: "white"};
+        const leftLen = label.length + 1 + ROLE_GLYPH[e.role].length + 1 + word.length;
         // 32 = 36-wide sidebar - 2 borders - 2 padding; 1 = separator gap
         const room = 32 - leftLen - 1;
         const task = e.task
@@ -47,17 +60,15 @@ export function Agents({state}: {state: OfficeState}) {
         return (
           <Box key={e.id} flexDirection="row" justifyContent="space-between">
             <Text wrap="truncate">
-              <Text>{label}</Text>
+              <Text color={nameColor(label)} bold={isBoss}>
+                {label}
+              </Text>
               <Text> </Text>
               <Text color={nameColor(label)}>{ROLE_GLYPH[e.role]}</Text>
               <Text> </Text>
-              {blocked ? (
-                <Text color="red" bold>
-                  !blocked
-                </Text>
-              ) : (
-                <Text dimColor>{WORD[e.sprite]}</Text>
-              )}
+              <Text color={style.color} dimColor={style.dim} bold={style.bold}>
+                {word}
+              </Text>
             </Text>
             {task ? (
               <Text dimColor wrap="truncate">

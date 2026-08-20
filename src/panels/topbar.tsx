@@ -2,7 +2,9 @@
  * topbar.tsx — one-line app bar, full width:
  *   left:  grafeio v0.1.0 | MODE | agents <n>
  *   right: <office clock> | <cwd basename>
- * Rendered as an inverted (brightBlack bg) bar.
+ * Rendered as an inverted (blackBright bg) bar with colored segments:
+ * app name bold white, DEMO yellow / LIVE green, agents count cyan,
+ * clock + cwd dim (brightBlack fg on a blackBright bar is invisible).
  */
 import React from "react";
 import {Text} from "ink";
@@ -24,11 +26,27 @@ export function barLine(left: string, right: string, width: number): string {
 }
 
 export function TopBar({state, width}: {state: OfficeState; width: number}) {
-  const left = ` grafeio v0.1.0 | ${state.mode.toUpperCase()} | agents ${state.employees.length}`;
-  const right = `${officeClock(state.tick)} | ${basename(process.cwd())} `;
+  const mode = state.mode.toUpperCase();
+  const modeColor = state.mode === "demo" ? "yellow" : "green";
+  const agents = String(state.employees.length);
+  const clock = officeClock(state.tick);
+  const cwd = basename(process.cwd());
+  const leftLen = ` grafeio v0.1.0 | ${mode} | agents ${agents}`.length;
+  const rightLen = `${clock} | ${cwd} `.length;
+  const gap = " ".repeat(Math.max(1, width - leftLen - rightLen));
   return (
-    <Text backgroundColor="brightBlack" color="white" wrap="truncate">
-      {barLine(left, right, width)}
+    <Text backgroundColor="blackBright" wrap="truncate">
+      <Text bold color="white">
+        {" grafeio v0.1.0"}
+      </Text>
+      <Text color="white">{" | "}</Text>
+      <Text color={modeColor}>{mode}</Text>
+      <Text color="white">{" | agents "}</Text>
+      <Text color="cyan">{agents}</Text>
+      <Text>{gap}</Text>
+      <Text dimColor>{clock}</Text>
+      <Text color="white">{" | "}</Text>
+      <Text dimColor>{`${cwd} `}</Text>
     </Text>
   );
 }

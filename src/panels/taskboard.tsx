@@ -2,6 +2,8 @@
  * taskboard.tsx — BOARD: three columns PENDING | DOING | DONE.
  * Sized for the 36-col sidebar: tight columns, truncated rows,
  * flex-grows to share space with the mailbox, clips cleanly when short.
+ * Colors: headers + rows inherit status color (PENDING yellow, DOING cyan,
+ * DONE green dimmed); owner tag in the owner's role color when resolvable.
  */
 import React from "react";
 import {Box, Text} from "ink";
@@ -16,6 +18,12 @@ const COLS: {title: string; status: TaskStatus}[] = [
   {title: "DONE", status: "done"},
 ];
 
+const STATUS_COLOR: Record<TaskStatus, string> = {
+  pending: "yellow",
+  "in-progress": "cyan",
+  done: "green",
+};
+
 function Column({title, status, tasks}: {title: string; status: TaskStatus; tasks: BoardTask[]}) {
   const rows = tasks.filter((t) => t.status === status).sort((a, b) => a.at - b.at);
   const shown = rows.slice(0, CAP);
@@ -23,18 +31,20 @@ function Column({title, status, tasks}: {title: string; status: TaskStatus; task
   const done = status === "done";
   return (
     <Box flexDirection="column" flexGrow={1} flexBasis={0} overflow="hidden">
-      <Text bold underline wrap="truncate">
+      <Text bold underline wrap="truncate" color={STATUS_COLOR[status]}>
         {title}
       </Text>
       {shown.length === 0 ? <Text dimColor>-</Text> : null}
       {shown.map((t) => (
-        <Text
-          key={t.id}
-          wrap="truncate"
-          dimColor={done}
-          color={done ? undefined : nameColor(t.owner ?? "")}
-        >
-          {`${t.title}${t.owner ? ` ${t.owner}` : ""}`}
+        <Text key={t.id} wrap="truncate">
+          <Text dimColor={done} color={STATUS_COLOR[t.status]}>
+            {t.title}
+          </Text>
+          {t.owner ? (
+            <Text dimColor={done} color={nameColor(t.owner)}>
+              {` ${t.owner}`}
+            </Text>
+          ) : null}
         </Text>
       ))}
       {overflow > 0 ? <Text dimColor>{`+${overflow} more`}</Text> : null}

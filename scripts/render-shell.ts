@@ -4,15 +4,25 @@
  * Own harness (render-snap.ts is owned by the floor dev): custom fake stdout,
  * because ink-testing-library hardcodes 100 columns. Not typechecked.
  *
- *   npx tsx scripts/render-shell.ts
+ *   npx tsx scripts/render-shell.ts           (stripped frames, as before)
+ *   npx tsx scripts/render-shell.ts --escape  (ANSI escapes literal, [33m form)
  *
  * Prints lastFrame() twice between markers:
  *   ===== SHELL A =====  ~1.5s (staffed, calm, awaiting work)
  *   ===== SHELL B =====  ~4.0s (busy: blocked red, mail, board moved, bubbles)
+ *
+ * After each frame it asserts:
+ *   - ANSI color codes present for boss yellow / dev cyan / done green / blocked red
+ *     -> prints "SHELL COLOR OK"
+ *   - stripped geometry unchanged vs the pre-color monochrome layout
+ *     (ROWS lines; sidebar titles AGENTS/MAIL/BOARD at column 86)
+ *     -> prints "SHELL GEOMETRY OK"
+ * Any assertion failure exits non-zero.
  */
 import React from "react";
 import {EventEmitter} from "node:events";
 import {render as inkRender} from "ink";
+import chalk from "chalk";
 import {App} from "../src/app.js";
 import type {
   BoardTask,
@@ -25,8 +35,59 @@ import type {
 const COLS = 120;
 const ROWS = 36;
 
+/** Sidebar chrome starts at COLS - 36 (SIDEBAR_W in app.tsx); titles sit 1 border + 1 padding in. */
+const SIDEBAR_TITLE_COL = COLS - 36 + 2; // 86
+
+const ESCAPE_MODE = process.argv.includes("--escape");
+
+// The harness pipes stdout, so chalk autodetects level 0 and ink renders plain.
+// Colors are the whole point of this snapshot: force them on.
+if (chalk.level === 0) chalk.level = 1;
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
+/** Show CSI sequences literally: ESC[33m -> "[33m" (keeps the frame readable). */
+const escapeAnsi = (s: string) => s.replace(/\x1b\[([0-9;]*)([A-Za-z])/g, "[$1$2");
+
+let failures = 0;
+
+function assertColors(frame: string, label: string) {
+  const checks: Array<[string, RegExp]> = [
+    ["boss yellow", /\x1b\[33m/],
+    ["dev cyan", /\x1b\[36m/],
+    ["done green", /\x1b\[32m/],
+    ["blocked red", /\x1b\[31m/],
+  ];
+  const missing = checks.filter(([, re]) => !re.test(frame)).map(([name]) => name);
+  if (missing.length > 0) {
+    failures++;
+    console.log(`${label} SHELL COLOR FAIL — missing: ${missing.join(", ")}`);
+  } else {
+    console.log(`${label} SHELL COLOR OK (boss yellow, dev cyan, done green, blocked red)`);
+  }
+}
+
+function assertGeometry(stripped: string, label: string) {
+  const problems: string[] = [];
+  const lines = stripped.replace(/\n+$/, "").split("\n");
+  if (lines.length !== ROWS) problems.push(`line count ${lines.length} != ${ROWS}`);
+  for (const title of ["AGENTS", "MAIL", "BOARD"]) {
+    const row = lines.find((l) => l.includes(` ${title}`));
+    if (!row) {
+      problems.push(`sidebar title ${title} missing`);
+      continue;
+    }
+    const col = row.indexOf(title);
+    if (col !== SIDEBAR_TITLE_COL)
+      problems.push(`sidebar title ${title} at col ${col} != ${SIDEBAR_TITLE_COL}`);
+  }
+  if (problems.length > 0) {
+    failures++;
+    console.log(`${label} SHELL GEOMETRY FAIL — ${problems.join("; ")}`);
+  } else {
+    console.log(`${label} SHELL GEOMETRY OK (${ROWS} lines; AGENTS/MAIL/BOARD at col ${SIDEBAR_TITLE_COL})`);
+  }
+}
 
 /** Minimal ink-compatible stdout pinned to 120x36 (ink-testing-library is 100-wide). */
 class FakeStdout extends EventEmitter {
@@ -187,16 +248,32 @@ async function main() {
     },
   );
 
+  const frames: Array<{label: string; marker: string; frame: string}> = [];
+
   await sleep(1500);
-  console.log("===== SHELL A (~1.5s, staffing calm) =====");
-  console.log(stripAnsi(stdout.lastFrame() ?? "(no frame)"));
+  frames.push({
+    label: "A",
+    marker: "===== SHELL A (~1.5s, staffing calm) =====",
+    frame: stdout.lastFrame() ?? "(no frame)",
+  });
 
   await sleep(2500);
-  console.log("===== SHELL B (~4.0s, busy) =====");
-  console.log(stripAnsi(stdout.lastFrame() ?? "(no frame)"));
+  frames.push({
+    label: "B",
+    marker: "===== SHELL B (~4.0s, busy) =====",
+    frame: stdout.lastFrame() ?? "(no frame)",
+  });
 
   inst.unmount();
-  process.exit(0);
+
+  for (const {label, marker, frame} of frames) {
+    console.log(marker);
+    console.log(ESCAPE_MODE ? escapeAnsi(frame) : stripAnsi(frame));
+    assertColors(frame, `SHELL ${label}`);
+    assertGeometry(stripAnsi(frame), `SHELL ${label}`);
+  }
+
+  process.exit(failures === 0 ? 0 : 1);
 }
 
 await main();

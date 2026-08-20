@@ -14,7 +14,16 @@
  *   - conference drops next (need W>=72 && H>=18)
  *   - pods row minimum: 2 rows x 4 pods, collapsing to 2x3 when cabins are gone
  *   - W<60 || H<16: "small terminal" badge (drawn once, centered, by floor.tsx)
+ *
+ * Props and zones may carry a chalk foreground color (and bold on props);
+ * floor.tsx stamps them onto its styled cell grid. Default paint:
+ * drywall zone walls gray; unstyled props render uncolored.
  */
+import type {ForegroundColorName} from "chalk";
+
+/** Ink/chalk foreground color names ("yellow" | "cyan" | "gray" | ...). */
+export type ColorName = ForegroundColorName;
+
 export interface Point {
   x: number;
   y: number;
@@ -33,6 +42,7 @@ export interface Zone {
   w: number;
   h: number;
   wall: string; // "-" for drywall rooms; cabins use ":", ";", "."
+  color?: ColorName; // wall paint; default gray (applied by floor.tsx)
   doors: Door[];
 }
 
@@ -40,6 +50,8 @@ export interface PlanProp {
   x: number;
   y: number;
   glyph: string;
+  color?: ColorName; // furniture paint; undefined = uncolored
+  bold?: boolean;
 }
 
 export interface Plan {
@@ -122,11 +134,11 @@ function buildPlan(W: number, H: number): Plan {
     doors: [{side: "s", at: Math.floor(bw / 2), size: 2}],
   });
   props.push(
-    {x: 3, y: 2, glyph: "[awaiting]"}, // nameplate
+    {x: 3, y: 2, glyph: "[awaiting]", color: "yellow", bold: true}, // nameplate
     {x: 3, y: 3, glyph: "[=BOSS=]"}, // boss desk
-    {x: 3, y: 5, glyph: "o"}, // guest chair
-    {x: 8, y: 5, glyph: "o"}, // guest chair
-    {x: 10, y: 1, glyph: "[###]"}, // wall calendar
+    {x: 3, y: 5, glyph: "o", color: "green"}, // guest chair
+    {x: 8, y: 5, glyph: "o", color: "green"}, // guest chair
+    {x: 10, y: 1, glyph: "[###]", color: "gray"}, // wall calendar
   );
   anchors.set("manager", {x: 11, y: 3});
   const meet: Point = {x: 5, y: 4};
@@ -144,19 +156,20 @@ function buildPlan(W: number, H: number): Plan {
     doors: [{side: "s", at: 3, size: 2}],
   });
   props.push(
-    {x: sx + 2, y: 2, glyph: "[=]"}, // pod 1 monitor
+    {x: sx + 2, y: 2, glyph: "[=]", color: "gray"}, // pod 1 monitor (screen off)
     {x: sx + 1, y: 3, glyph: "[______]"}, // pod 1 desk
-    {x: sx + 1, y: topH - 1, glyph: "[cpr]"}, // copier
+    {x: sx + 1, y: topH - 1, glyph: "[cpr]", color: "gray"}, // copier
     {x: sx + 1, y: topH - 2, glyph: "[o==o]"}, // treadmill (runner seat desk)
   );
   if (topH >= 8) {
     props.push(
-      {x: sx + 2, y: 4, glyph: "[=]"}, // pod 2 monitor
+      {x: sx + 2, y: 4, glyph: "[=]", color: "gray"}, // pod 2 monitor
       {x: sx + 1, y: 5, glyph: "[______]"}, // pod 2 desk
     );
   }
-  for (let r = 2; r <= topH - 1; r++) props.push({x: sx + sw - 5, y: r, glyph: "[||]"});
-  if (sw >= 20) for (let r = 2; r <= topH - 1; r++) props.push({x: sx + sw - 10, y: r, glyph: "[||]"});
+  for (let r = 2; r <= topH - 1; r++) props.push({x: sx + sw - 5, y: r, glyph: "[||]", color: "magenta"});
+  if (sw >= 20)
+    for (let r = 2; r <= topH - 1; r++) props.push({x: sx + sw - 10, y: r, glyph: "[||]", color: "magenta"});
   anchors.set("treadmill-1", {x: sx + 2, y: topH - 2});
 
   // ---- CONFERENCE ROOM (top-center) ----
@@ -174,15 +187,15 @@ function buildPlan(W: number, H: number): Plan {
     });
     const ty = 1 + Math.floor(topH / 2);
     const tlen = clamp(fw - 6, 6, 14);
-    props.push({x: fx + 3, y: ty, glyph: "=[" + "=".repeat(Math.max(0, tlen - 3)) + "]"});
+    props.push({x: fx + 3, y: ty, glyph: "=[" + "=".repeat(Math.max(0, tlen - 3)) + "]", color: "yellow"});
     const nchairs = clamp(Math.floor((fw - 8) / 6), 2, 8);
     const up = Math.ceil(nchairs / 2);
     const down = nchairs - up;
-    for (let i = 0; i < up; i++) props.push({x: fx + 4 + i * 3, y: ty - 1, glyph: "o"});
-    for (let i = 0; i < down; i++) props.push({x: fx + 4 + i * 3, y: ty + 1, glyph: "o"});
+    for (let i = 0; i < up; i++) props.push({x: fx + 4 + i * 3, y: ty - 1, glyph: "o", color: "green"});
+    for (let i = 0; i < down; i++) props.push({x: fx + 4 + i * 3, y: ty + 1, glyph: "o", color: "green"});
     props.push(
-      {x: fx + 1, y: topH - 1, glyph: "(Y)"}, // corner plant
-      {x: fx + fw - 7, y: 2, glyph: "[|> ]"}, // easel / whiteboard
+      {x: fx + 1, y: topH - 1, glyph: "(Y)", color: "green"}, // corner plant
+      {x: fx + fw - 7, y: 2, glyph: "[|> ]", color: "cyan"}, // easel / whiteboard
       {x: fx + fw - 6, y: 3, glyph: sslash()}, // tiny chart marks
     );
   }
@@ -201,13 +214,14 @@ function buildPlan(W: number, H: number): Plan {
         w: cw,
         h: 6,
         wall: [":", ";", "."][i],
+        color: (["magenta", "blue", "magentaBright"] as const)[i], // glass tint per cabin
         doors: [{side: "s", at: Math.floor(cw / 2), size: 2}],
       });
       props.push(
-        {x: cx + 4, y: cabY + 1, glyph: "[=]"},
+        {x: cx + 4, y: cabY + 1, glyph: "[=]", color: "gray"},
         {x: cx + 2, y: cabY + 2, glyph: "[=____=]"},
-        {x: cx + 4, y: cabY + 3, glyph: "(_)"},
-        {x: cx + cw - 3, y: cabY + 1, glyph: "(Y)"},
+        {x: cx + 4, y: cabY + 3, glyph: "(_)", color: "green"},
+        {x: cx + cw - 3, y: cabY + 1, glyph: "(Y)", color: "green"},
       );
       anchors.set(cabIds[i], {x: cx + 4, y: cabY + 3});
     }
@@ -216,9 +230,9 @@ function buildPlan(W: number, H: number): Plan {
     ["hr", "cabin-2"].forEach((id, i) => {
       const cx = 2 + i * 14;
       props.push(
-        {x: cx + 2, y: cabY, glyph: "[=]"},
+        {x: cx + 2, y: cabY, glyph: "[=]", color: "gray"},
         {x: cx, y: cabY + 1, glyph: "[______]"},
-        {x: cx + 2, y: cabY + 2, glyph: "(_)"},
+        {x: cx + 2, y: cabY + 2, glyph: "(_)", color: "green"},
       );
       anchors.set(id, {x: cx + 2, y: cabY + 2});
     });
@@ -241,13 +255,13 @@ function buildPlan(W: number, H: number): Plan {
     ],
   });
   props.push(
-    {x: bx0 + 2, y: by0 + 1, glyph: "[===]"}, // fridge
-    {x: bx0 + 2, y: by0 + 2, glyph: "[#####]"}, // kitchen counter
-    {x: bx0 + 8, y: by0 + 2, glyph: "[cof]"}, // coffee machine on the counter
+    {x: bx0 + 2, y: by0 + 1, glyph: "[===]", color: "yellow"}, // fridge
+    {x: bx0 + 2, y: by0 + 2, glyph: "[#####]", color: "yellow"}, // kitchen counter
+    {x: bx0 + 8, y: by0 + 2, glyph: "[cof]", color: "yellow"}, // coffee machine on the counter
     bwd >= 20
       ? {x: bx0 + bwd - 6, y: by0 + 2, glyph: "[vnd]"} // vending machine (right wall)
       : {x: bx0 + 2, y: by0 + 5, glyph: "[vnd]"}, // narrow room: under the fridge
-    {x: bx0 + bwd - 6, y: by0 + 4, glyph: "[cpy]"}, // rack
+    {x: bx0 + bwd - 6, y: by0 + 4, glyph: "[cpy]", color: "magenta"}, // rack
     {x: bx0 + 10, y: by0 + 5, glyph: "("}, // stool
     {x: bx0 + 11, y: by0 + 5, glyph: "(__)"}, // small table
     {x: bx0 + 15, y: by0 + 5, glyph: ")"}, // stool
@@ -270,9 +284,9 @@ function buildPlan(W: number, H: number): Plan {
     const px = 3 + (i % nb) * 11;
     const py = podRows[r];
     props.push(
-      {x: px + 3, y: py, glyph: "[=]"},
+      {x: px + 3, y: py, glyph: "[=]", color: "gray"}, // monitor (screen off; lit cyan bold by floor.tsx when a dev works here)
       {x: px, y: py + 1, glyph: "[______]"},
-      {x: px + 2, y: py + 2, glyph: "(_)"},
+      {x: px + 2, y: py + 2, glyph: "(_)", color: "green"},
     );
     if (i === scoutIdx[0]) anchors.set("scout-1", {x: px + 2, y: py + 2});
     else if (i === scoutIdx[1]) anchors.set("scout-2", {x: px + 2, y: py + 2});
@@ -281,11 +295,11 @@ function buildPlan(W: number, H: number): Plan {
 
   // ---- SCATTER: plants, bins, water cooler ----
   props.push(
-    {x: 2, y: H - 3, glyph: "[h2o]"}, // water cooler
-    {x: 2, y: H - 2, glyph: "(Y)"}, // plant, bottom-left corner
-    {x: 1, y: podRows[0] + 1, glyph: "(.)"}, // trash near pod row 1
-    {x: 1, y: podRows[1] + 1, glyph: "(.)"}, // trash near pod row 2
-    {x: bx0 - 2, y: H - 2, glyph: "(Y)"}, // plant by the break door
+    {x: 2, y: H - 3, glyph: "[h2o]", color: "blue"}, // water cooler
+    {x: 2, y: H - 2, glyph: "(Y)", color: "green"}, // plant, bottom-left corner
+    {x: 1, y: podRows[0] + 1, glyph: "(.)", color: "gray"}, // trash near pod row 1
+    {x: 1, y: podRows[1] + 1, glyph: "(.)", color: "gray"}, // trash near pod row 2
+    {x: bx0 - 2, y: H - 2, glyph: "(Y)", color: "green"}, // plant by the break door
   );
 
   return {width: W, height: H, gen, zones, props, anchors, hotspots: {meet, mail, tea, clock, overflow}, tiny};

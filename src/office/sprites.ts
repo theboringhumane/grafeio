@@ -10,7 +10,7 @@
  * re-walk to their (recomputed) targets.
  */
 import type {EmployeeRole, OfficeState, SpriteState} from "../state.js";
-import {currentPlan, type Plan, type Point} from "./floorplan.js";
+import {currentPlan, type ColorName, type Plan, type Point} from "./floorplan.js";
 import {seatAnchor} from "./roster.js";
 
 export const ROLE_GLYPH: Record<EmployeeRole, string> = {
@@ -20,6 +20,16 @@ export const ROLE_GLYPH: Record<EmployeeRole, string> = {
   scout: "S",
   reviewer: "D",
   runner: "R",
+};
+
+/** Sprite paint per role — matches the app legend (M yellow, H red, ...). */
+export const ROLE_COLOR: Record<EmployeeRole, ColorName> = {
+  manager: "yellow",
+  hr: "red",
+  developer: "cyan",
+  scout: "green",
+  reviewer: "magenta",
+  runner: "blue",
 };
 
 const COFFEE_TICKS = 60; // how long a break lasts

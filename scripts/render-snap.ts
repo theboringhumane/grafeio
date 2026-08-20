@@ -7,7 +7,7 @@
  * Timeline (stub tick = 50ms):
  *   t0  hires: boss + hr + 4 devs + 1 scout + 1 reviewer
  *   t2  2 dispatches                 t4  working
- *   t6  1 bubble ("big day. lots of meetings.")
+ *   t6  1 bubble ("big day. lots of meetings.") + 1 blocked (dikastes)
  *   t8  returned + mail              t10 idle-drift coffee
  *
  * Then prints lastFrame() at three sizes:
@@ -15,13 +15,23 @@
  *   ===== PLAN B =====   84x22  degraded (cabins collapsed)
  *   ===== PLAN C =====  140x30  busy frame (walkers mid-path, bubble visible)
  *
+ * Per frame, TWO verifications:
+ *   PLAIN MATCH — strip ANSI, compare line-by-line against buildGridPlain()
+ *                 on the same state (proves colored segments recompose to the
+ *                 exact same picture; zero layout drift)
+ *   COLOR OK    — the raw frame carries escape codes proving:
+ *                 yellow boss glyph, cyan bold lit dev screen, red bold blocked
+ *                 sprite, magenta cabin-1 glass wall, green plant, white bubble
+ *                 text. (PLAN B has no cabins; magenta skipped there.)
+ *
  * ink-testing-library hardcodes 100 columns, so we render through ink with a
  * fake 220-col stdout to keep the wide frames intact.
  */
+import "./set-color-env.js"; // FIRST: make chalk emit ANSI in this piped harness
 import React from "react";
 import {EventEmitter} from "node:events";
 import {render as inkRender} from "ink";
-import {Floor} from "../src/office/floor.js";
+import {Floor, buildGridPlain} from "../src/office/floor.js";
 import {initialState, officeReducer} from "../src/app.js";
 import type {
   BoardTask,
@@ -82,6 +92,9 @@ function mount(width: number, height: number) {
     rerender() {
       inst.rerender(React.createElement(Floor, {state, width, height}));
     },
+    rawFrame() {
+      return stdout.lastFrame() ?? "(no frame)";
+    },
     frame() {
       return stripAnsi(stdout.lastFrame() ?? "(no frame)");
     },
@@ -137,7 +150,10 @@ const script: Record<number, OfficeEvent[]> = {
     {type: "working", employeeId: "tekton-1", taskId: "t-1"},
     {type: "working", employeeId: "tekton-3"},
   ],
-  6: [{type: "bubble", employeeId: "tekton-2", text: "big day. lots of meetings.", ttl: 40}],
+  6: [
+    {type: "bubble", employeeId: "tekton-2", text: "big day. lots of meetings.", ttl: 40},
+    {type: "blocked", employeeId: "dikastes", note: "perm ask"}, // red bold at-mailbox, stays blocked
+  ],
   8: [
     {
       type: "returned",
@@ -168,42 +184,155 @@ function ev(e: OfficeEvent): void {
   state = officeReducer(state, e);
 }
 
+// ------- color verification helpers -------
+
+const PROOF_BUBBLE = "snap check. colors live.";
+
+interface Run {
+  codes: Set<string>;
+  text: string;
+}
+
+/** Parse a raw ink frame into {active codes -> text} runs (chalk open/close codes). */
+function parseRuns(raw: string): Run[] {
+  const runs: Run[] = [];
+  const re = /\x1b\[([0-9;]*)m/g;
+  let m: RegExpExecArray | null;
+  let codes = new Set<string>();
+  let last = 0;
+  while ((m = re.exec(raw))) {
+    if (m.index > last) {
+      runs.push({codes, text: raw.slice(last, m.index)});
+      codes = new Set();
+    }
+    for (const c of m[1].split(";")) if (c) codes.add(c);
+    last = re.lastIndex;
+  }
+  if (last < raw.length) runs.push({codes, text: raw.slice(last)});
+  return runs;
+}
+
+function hasRun(runs: Run[], codes: string[], match: RegExp): boolean {
+  return runs.some((r) => codes.every((c) => r.codes.has(c)) && match.test(r.text));
+}
+
+const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Verify one captured frame. Returns true when all checks pass.
+ *   (a) stripped grid lines === buildGridPlain(snap, w, h-1)  (PLAN layout)
+ *   (b) raw grid lines carry the required escape codes        (COLOR)
+ */
+function verify(
+  label: string,
+  w: number,
+  h: number,
+  raw: string,
+  snap: OfficeState,
+  opts: {cabins: boolean; bubbleText: string},
+): boolean {
+  let ok = true;
+
+  // (a) PLAN: strip ANSI, compare to the plain renderer line-by-line
+  const strippedLines = stripAnsi(raw).replace(/\r/g, "").split("\n").slice(0, h - 1);
+  const want = buildGridPlain(snap, w, Math.max(1, h - 1));
+  let plainFail = false;
+  for (let i = 0; i < Math.max(strippedLines.length, want.length); i++) {
+    if (strippedLines[i] !== want[i]) {
+      plainFail = true;
+      console.error(`PLAIN MISMATCH ${label} row ${i}:`);
+      console.error(`  got  |${strippedLines[i] ?? "(missing)"}|`);
+      console.error(`  want |${want[i] ?? "(missing)"}|`);
+    }
+  }
+  if (plainFail) ok = false;
+  else console.log(`PLAIN MATCH: ${label} (stripped frame === buildGridPlain, ${want.length} rows)`);
+
+  // (b) COLOR: escape codes inside the grid rows (legend excluded)
+  const gridRaw = raw.split("\n").slice(0, h - 1).join("\n");
+  const runs = parseRuns(gridRaw);
+  const bubbleProbe = opts.bubbleText.slice(0, 8);
+  const checks: [string, boolean][] = [
+    ["yellow", hasRun(runs, ["33"], /M/)], // boss glyph
+    ["cyan", hasRun(runs, ["36", "1"], /\[=\]/)], // lit dev screen (cyan bold)
+    ["red", hasRun(runs, ["31", "1"], /[A-Z]/)], // blocked sprite (red bold)
+    ["green", hasRun(runs, ["32"], /\(Y\)/)], // plant
+    ["white", hasRun(runs, ["37"], new RegExp(escapeRegExp(bubbleProbe)))], // bubble text
+  ];
+  if (opts.cabins) checks.splice(3, 0, ["magenta", hasRun(runs, ["35"], /:/)]); // cabin-1 glass ":"
+  const missing = checks.filter(([, pass]) => !pass).map(([name]) => name);
+  if (missing.length) {
+    ok = false;
+    console.error(`COLOR FAIL: ${label} missing ${missing.join(",")}`);
+  } else {
+    console.log(`COLOR OK: ${checks.map(([name]) => name).join(",")} present`);
+  }
+  return ok;
+}
+
 async function main() {
   // --- run the script at size C so frame C catches walkers mid-path + bubble ---
+  // NOTE: verify each frame IMMEDIATELY at capture — every later tick moves
+  // walkers (sprites live in a module map), so a frame verified later can no
+  // longer match its state snapshot.
   const C = {w: 140, h: 30};
   const viewC = mount(C.w, C.h);
-  let frameC = "";
+  let frameCraw = "";
+  let okC = false;
   for (let t = 0; t <= 10; t++) {
     for (const e of script[t] ?? []) ev(e);
     ev({type: "tick"});
     viewC.rerender();
     await sleep(50); // fast stub ticks
-    if (t === 7) frameC = viewC.frame(); // tekton-2 mid-walk, bubble fresh
+    if (t === 7) {
+      frameCraw = viewC.rawFrame(); // tekton-2 mid-walk, bubble fresh, dikastes blocked
+      console.log("===== PLAN C =====  140x30  busy frame (walkers mid-path, bubble visible)");
+      console.log(frameCraw);
+      okC = verify("PLAN C", C.w, C.h, frameCraw, state, {
+        cabins: true,
+        bubbleText: "big day. lots of meetings.",
+      });
+    }
   }
   viewC.unmount();
 
-  // --- settle + shoot the tour frames at the two other sizes ---
-  const shoot = async (w: number, h: number, settleTicks: number) => {
+  // --- settle, print and verify the tour frames at the two other sizes ---
+  const shoot = async (w: number, h: number, settleTicks: number, label: string, cabins: boolean) => {
     const view = mount(w, h);
     for (let i = 0; i < settleTicks; i++) {
       ev({type: "tick"});
       view.rerender();
     }
+    // fresh balloon so the white bubble-text check has a live target.
+    // Anchored on hr (cabin/freedesk) so it can never shade the boss office:
+    // a balloon over tekton-2 (meeting at the boss desk) hides the yellow boss
+    // glyph + nameplate and would break the yellow check by occlusion.
+    ev({type: "bubble", employeeId: "hr", text: PROOF_BUBBLE, ttl: 1000});
+    ev({type: "tick"});
+    view.rerender();
     await sleep(30);
-    const out = view.frame();
+    const raw = view.rawFrame();
+    console.log(`===== ${label} =====  ${w}x${h}${cabins ? "  full zones tour" : "  degraded (cabins collapsed)"}`);
+    console.log(raw);
+    const ok = verify(label, w, h, raw, state, {cabins, bubbleText: PROOF_BUBBLE});
     view.unmount();
-    return out;
+    return {raw, ok};
   };
 
-  const frameA = await shoot(120, 26, 45);
-  const frameB = await shoot(84, 22, 45);
+  const A = await shoot(120, 26, 45, "PLAN A", true);
+  const B = await shoot(84, 22, 45, "PLAN B", false);
 
-  console.log("===== PLAN A =====  120x26  full zones tour");
-  console.log(frameA);
-  console.log("===== PLAN B =====  84x22   degraded (cabins collapsed)");
-  console.log(frameB);
-  console.log("===== PLAN C =====  140x30  busy frame (walkers mid-path, bubble visible)");
-  console.log(frameC);
+  // layout-stability proof: PLAN A with escapes made literal ([33m style), then plain
+  console.log("===== PROOF: PLAN A raw (escapes literal, \\x1b[ shown as [) =====");
+  console.log(A.raw.replace(/\x1b\[/g, "["));
+  console.log("===== PROOF: PLAN A plain (ANSI stripped) =====");
+  console.log(stripAnsi(A.raw));
+
+  if (!A.ok || !B.ok || !okC) {
+    console.error("SNAP FAIL: one or more frames failed verification");
+    process.exit(1);
+  }
+  console.log("SNAP OK: all frames verified");
   process.exit(0);
 }
 
