@@ -51,9 +51,24 @@ export function spriteFrame(role: EmployeeRole, sprite: SpriteState, tick: numbe
       return beat ? `\\${L} ` : ` ${L}/`;
     case "coffee": // sipping, steam wisp
       return beat ? ` ${L}~` : ` ${L} `;
-    default: // at-desk: idle z-z blink
-      return tick % 16 < 2 ? `z${L}z` : ` ${L} `;
+    default: // at-desk: idle; sleep-z's float above (idleBlinkZs), NEVER glued into this row
+      return ` ${L} `;
   }
+}
+
+/**
+ * Floating sleep-z's for an idling (at-desk) sprite on its blink frames:
+ * "z" on the first blink frame (tick % 16 === 0), "zZ" on the deeper one
+ * (tick % 16 === 1), null otherwise. floor.tsx stamps these one row above
+ * the sprite's right shoulder at (x+2, y-1) — never inside the sprite's own
+ * row, where they glue into the role letter and read as typos ("zMz").
+ */
+export function idleBlinkZs(sprite: SpriteState, tick: number): string | null {
+  if (sprite !== "at-desk") return null;
+  const phase = ((tick % 16) + 16) % 16;
+  if (phase === 0) return "z";
+  if (phase === 1) return "zZ";
+  return null;
 }
 
 interface Walker {

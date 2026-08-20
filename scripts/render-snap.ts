@@ -322,6 +322,92 @@ async function main() {
   const A = await shoot(120, 26, 45, "PLAN A", true);
   const B = await shoot(84, 22, 45, "PLAN B", false);
 
+  // --- cabin size assert: glass cabins must survive at the real shell floor
+  // size (84x24 grid). Checks: ":"/";"/"." cabin walls present, "[typing]"
+  // nameplate absent (no pending chat here), and at least one empty chair
+  // rendering dim (gray+dim) instead of staffed-green.
+  let okD = true;
+  {
+    state = {...state, bubbles: []}; // clean frame: no balloons over the cabins
+    const view = mount(84, 25); // Floor height 25 -> grid 84x24
+    for (let i = 0; i < 45; i++) {
+      ev({type: "tick"});
+      view.rerender();
+    }
+    await sleep(30);
+    const raw = view.rawFrame();
+    const plain = stripAnsi(raw);
+    console.log("===== PLAN D =====  84x24  cabin size proof (real shell floor size)");
+    console.log(raw);
+    const haveWalls = /:{4,}/.test(plain) && /;{4,}/.test(plain) && /\.{4,}/.test(plain);
+    if (!haveWalls) {
+      okD = false;
+      console.error("CABIN FAIL: expected all three glass walls (: ; .) at 84x24");
+    }
+    if (/\[typing\]/.test(plain)) {
+      okD = false;
+      console.error("CABIN FAIL: [typing] nameplate with no pending chat");
+    }
+    const gridRuns = parseRuns(raw.split("\n").slice(0, 24).join("\n"));
+    if (!hasRun(gridRuns, ["2"], /\(_\)/)) {
+      okD = false;
+      console.error("CABIN FAIL: no dim empty chair (empty seats must read unstaffed)");
+    }
+    view.unmount();
+    if (!okD) {
+      console.error("SNAP FAIL: cabin size check failed");
+      process.exit(1);
+    }
+    console.log("CABIN SIZE OK");
+  }
+
+  // --- BLINK check: catch the idling manager on a blink frame (tick%16===0).
+  // Sleep-z's must FLOAT one row above the sprite's right shoulder and never
+  // glue into the sprite row: no "zMz" / "zHz" / "zSz" anywhere in the frame.
+  // Positive control: at 120 cols the boss anchor is (11,3), so the frame
+  // must show the floating "z" at (13,2) — otherwise the check is vacuous.
+  let okE = true;
+  {
+    const view = mount(120, 26);
+    let raw = "";
+    let blinkTick = -1;
+    for (let i = 0; i < 48; i++) {
+      ev({type: "tick"});
+      view.rerender();
+      const boss = state.employees.find((e) => e.id === "manager");
+      if (boss?.sprite === "at-desk" && state.tick % 16 === 0) {
+        await sleep(30);
+        raw = view.rawFrame();
+        blinkTick = state.tick;
+        break;
+      }
+      await sleep(5);
+    }
+    const plain = stripAnsi(raw);
+    console.log(`===== PLAN E =====  120x26  blink frame (tick ${blinkTick}, z floats above the shoulder)`);
+    console.log(raw);
+    if (blinkTick < 0) {
+      okE = false;
+      console.error("BLINK FAIL: never caught the manager at-desk on a blink frame");
+    }
+    const glued = plain.split("\n").filter((l) => /zMz|zHz|zSz/.test(l)); // machine-format frame grep, not NL
+    if (glued.length) {
+      okE = false;
+      console.error(`BLINK FAIL: z glued into a sprite row: ${glued.map((l) => JSON.stringify(l)).join(", ")}`);
+    }
+    const row2 = plain.replace(/\r/g, "").split("\n")[2] ?? "";
+    if (row2[13] !== "z") {
+      okE = false;
+      console.error(`BLINK FAIL: no floating z at (13,2) above the manager; row 2 = |${row2}|`);
+    }
+    view.unmount();
+    if (!okE) {
+      console.error("SNAP FAIL: blink check failed");
+      process.exit(1);
+    }
+    console.log("BLINK OK: no zMz/zHz/zSz in any row; floating z present at (13,2)");
+  }
+
   // layout-stability proof: PLAN A with escapes made literal ([33m style), then plain
   console.log("===== PROOF: PLAN A raw (escapes literal, \\x1b[ shown as [) =====");
   console.log(A.raw.replace(/\x1b\[/g, "["));

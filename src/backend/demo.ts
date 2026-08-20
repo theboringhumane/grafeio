@@ -86,6 +86,12 @@ class DemoBackend implements OfficeBackend {
       this.emit({ type: "working", employeeId: id, taskId: t?.id });
     });
 
+    // t+3s: ambient chatter starts early — the floor shouldn't feel mute
+    // before the first return lands.
+    this.at(3_000, () => {
+      this.emit({ type: "bubble", employeeId: "tekton-1", text: "standup moved to 4." });
+    });
+
     // t+2.5s: the scout returns with findings.
     this.at(2_500, () => {
       this.doReturn("skopos-1", "t2", {
@@ -103,6 +109,11 @@ class DemoBackend implements OfficeBackend {
           "FILES - scripts/smoke-demo.ts.\n" +
           "VERIFY - npx tsx scripts/smoke-demo.ts prints SMOKE OK.",
       });
+    });
+
+    // t+5s: skopos chimes in after the smoke-script ship.
+    this.at(5_000, () => {
+      this.emit({ type: "bubble", employeeId: "skopos-1", text: "nice catch in review." });
     });
 
     // t+5.5s: tekton-1 hits a permission gate and waves at the mailbox...

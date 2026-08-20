@@ -52,6 +52,7 @@ export interface PlanProp {
   glyph: string;
   color?: ColorName; // furniture paint; undefined = uncolored
   bold?: boolean;
+  over?: boolean; // stamp AFTER zone walls (wall-mounted items: windows)
 }
 
 export interface Plan {
@@ -68,6 +69,7 @@ export interface Plan {
     clock: Point; // on the boss-office wall
     overflow: Point; // base spot for "floor-<n>" overflow near the break area
   };
+  nameplate: Point; // top-left of the boss-office nameplate (status text, 10 cols)
   tiny: boolean; // draw the "small terminal" badge
 }
 
@@ -116,7 +118,10 @@ function buildPlan(W: number, H: number): Plan {
   const anchors = new Map<string, Point>();
 
   const tiny = W < 60 || H < 16;
-  const cabinsOn = W >= 96 && H >= 24;
+  // glass cabins survive down to W=72; below W=88 they go compact (~11 wide)
+  // so all three still fit the middle band at the real 84-col shell size
+  const cabinsOn = W >= 72 && H >= 24;
+  const cabinsCompact = W < 88;
   const confOn = W >= 72 && H >= 18;
 
   const topH = clamp(Math.floor((H - 2) * 0.34), 5, 9);
@@ -133,13 +138,27 @@ function buildPlan(W: number, H: number): Plan {
     wall: "-",
     doors: [{side: "s", at: Math.floor(bw / 2), size: 2}],
   });
+  const nameplate: Point = {x: 3, y: 2};
+  // top-wall window, right of the clock, never past the corner (over: stamped
+  // after the zone walls so the drywall doesn't erase it)
+  const winX = Math.min(1 + Math.floor(bw / 2) + 2, bw - 8);
   props.push(
-    {x: 3, y: 2, glyph: "[awaiting]", color: "yellow", bold: true}, // nameplate
+    // nameplate: layout placeholder; floor.tsx re-stamps it with the
+    // boss's live status ("[awaiting]" / "[typing]" / "[meetin]")
+    {x: nameplate.x, y: nameplate.y, glyph: "[awaiting]", color: "yellow", bold: true},
     {x: 3, y: 3, glyph: "[=BOSS=]"}, // boss desk
+    {x: 14, y: 3, glyph: "(~)", color: "white"}, // desk-side mug
+    {x: winX, y: 1, glyph: "[==o==]", color: "cyan", over: true}, // window
     {x: 3, y: 5, glyph: "o", color: "green"}, // guest chair
     {x: 8, y: 5, glyph: "o", color: "green"}, // guest chair
     {x: 10, y: 1, glyph: "[###]", color: "gray"}, // wall calendar
   );
+  if (bw >= 20) {
+    props.push(
+      {x: 13, y: 2, glyph: "[#]", color: "yellow"}, // bookshelf, beside the nameplate
+      {x: 16, y: 2, glyph: "[=]", color: "yellow"}, // books, second shelf cell
+    );
+  }
   anchors.set("manager", {x: 11, y: 3});
   const meet: Point = {x: 5, y: 4};
   const clock: Point = {x: 3, y: 1};
@@ -167,9 +186,13 @@ function buildPlan(W: number, H: number): Plan {
       {x: sx + 1, y: 5, glyph: "[______]"}, // pod 2 desk
     );
   }
-  for (let r = 2; r <= topH - 1; r++) props.push({x: sx + sw - 5, y: r, glyph: "[||]", color: "magenta"});
+  // racks: single-file, one-row spacing, max 2 columns (2nd column staggered)
+  for (let r = 2; r <= topH - 1; r += 2) props.push({x: sx + sw - 5, y: r, glyph: "[||]", color: "magenta"});
   if (sw >= 20)
-    for (let r = 2; r <= topH - 1; r++) props.push({x: sx + sw - 10, y: r, glyph: "[||]", color: "magenta"});
+    for (let r = 3; r <= topH - 1; r += 2) props.push({x: sx + sw - 10, y: r, glyph: "[||]", color: "magenta"});
+  // power box between the desk pod and the rack column
+  if (sw >= 15 && sw < 20) props.push({x: sx + 9, y: 3, glyph: "[ups]", color: "magenta"});
+  else if (sw >= 20) props.push({x: sx + 9, y: 4, glyph: "[ups]", color: "magenta"});
   anchors.set("treadmill-1", {x: sx + 2, y: topH - 2});
 
   // ---- CONFERENCE ROOM (top-center) ----
@@ -186,7 +209,8 @@ function buildPlan(W: number, H: number): Plan {
       doors: [{side: "s", at: Math.floor(fw / 2), size: 2}],
     });
     const ty = 1 + Math.floor(topH / 2);
-    const tlen = clamp(fw - 6, 6, 14);
+    // table leaves the easel its right-hand 8 cols (2-col wall clearance included)
+    const tlen = clamp(fw - 12, 6, 14);
     props.push({x: fx + 3, y: ty, glyph: "=[" + "=".repeat(Math.max(0, tlen - 3)) + "]", color: "yellow"});
     const nchairs = clamp(Math.floor((fw - 8) / 6), 2, 8);
     const up = Math.ceil(nchairs / 2);
@@ -195,18 +219,19 @@ function buildPlan(W: number, H: number): Plan {
     for (let i = 0; i < down; i++) props.push({x: fx + 4 + i * 3, y: ty + 1, glyph: "o", color: "green"});
     props.push(
       {x: fx + 1, y: topH - 1, glyph: "(Y)", color: "green"}, // corner plant
-      {x: fx + fw - 7, y: 2, glyph: "[|> ]", color: "cyan"}, // easel / whiteboard
-      {x: fx + fw - 6, y: 3, glyph: sslash()}, // tiny chart marks
+      {x: fx + fw - 8, y: 2, glyph: "[|> ]", color: "cyan"}, // easel / whiteboard (2-col clearance from the right wall)
+      {x: fx + fw - 7, y: 3, glyph: sslash()}, // tiny chart marks
     );
   }
 
   // ---- GLASS CABINS (middle band) — walls ":", ";", "." ----
   const cabY = 2 + topH;
   const cabIds = ["hr", "cabin-2", "cabin-3"];
+  const cw = cabinsCompact ? 11 : 13; // compact glass cabins keep all 3 at W<88
+  const cstep = cabinsCompact ? 14 : 16;
   if (cabinsOn) {
     for (let i = 0; i < 3; i++) {
-      const cx = 3 + i * 16;
-      const cw = 13;
+      const cx = 3 + i * cstep;
       zones.push({
         id: `cabin-${i + 1}`,
         x: cx,
@@ -256,6 +281,8 @@ function buildPlan(W: number, H: number): Plan {
   });
   props.push(
     {x: bx0 + 2, y: by0 + 1, glyph: "[===]", color: "yellow"}, // fridge
+    {x: bx0 + 8, y: by0 + 1, glyph: "[bin]", color: "gray"}, // recycle bin near the kitchen
+    {x: bx0 - 4, y: by0 + 4, glyph: "brk", color: "gray"}, // door-gap label on the left partition
     {x: bx0 + 2, y: by0 + 2, glyph: "[#####]", color: "yellow"}, // kitchen counter
     {x: bx0 + 8, y: by0 + 2, glyph: "[cof]", color: "yellow"}, // coffee machine on the counter
     bwd >= 20
@@ -293,6 +320,23 @@ function buildPlan(W: number, H: number): Plan {
     else anchors.set(`dev-${++devN}`, {x: px + 2, y: py + 2});
   }
 
+  // ---- MIDDLE-BAND PARTITION STRIP (corridor between cabins and pod rows) ----
+  // low wall fragments flanking a hanging whiteboard + 2 plants; decor only,
+  // no zones/no hotspots, walkers stay unblocked. Drawn only when a free
+  // corridor row exists (>= 1 blank row above the first pod row).
+  const stripY = cabY + 6;
+  if (stripY <= H - 10) {
+    const cabCenter = 3 + Math.floor((2 * cstep + cw) / 2);
+    const wbX = cabCenter - 3; // hanging whiteboard, roughly band-centered
+    props.push(
+      {x: wbX - 11, y: stripY, glyph: "+--- ---+", color: "gray"}, // low wall, left
+      {x: wbX, y: stripY, glyph: "[plan]", color: "yellow"}, // hanging whiteboard
+      {x: wbX + 8, y: stripY, glyph: "+--- ---+", color: "gray"}, // low wall, right
+      {x: cabCenter - 17, y: stripY, glyph: "(Y)", color: "green"}, // plant, left
+      {x: cabCenter + 22, y: stripY, glyph: "(Y)", color: "green"}, // plant, right
+    );
+  }
+
   // ---- SCATTER: plants, bins, water cooler ----
   props.push(
     {x: 2, y: H - 3, glyph: "[h2o]", color: "blue"}, // water cooler
@@ -302,7 +346,7 @@ function buildPlan(W: number, H: number): Plan {
     {x: bx0 - 2, y: H - 2, glyph: "(Y)", color: "green"}, // plant by the break door
   );
 
-  return {width: W, height: H, gen, zones, props, anchors, hotspots: {meet, mail, tea, clock, overflow}, tiny};
+  return {width: W, height: H, gen, zones, props, anchors, hotspots: {meet, mail, tea, clock, overflow}, nameplate, tiny};
 }
 
 /** tiny chart marks under the whiteboard (kept as a fn so the quoting stays obvious). */

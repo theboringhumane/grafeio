@@ -8,9 +8,9 @@
 import React from "react";
 import {Box, Text} from "ink";
 import type {EmployeeRole, OfficeState, SpriteState} from "../state.js";
-import {computePlan, tickClock, type ColorName, type Zone} from "./floorplan.js";
+import {computePlan, tickClock, type ColorName, type Plan, type Zone} from "./floorplan.js";
 import {seatAnchor} from "./roster.js";
-import {ROLE_COLOR, spriteFrame, spritePosition} from "./sprites.js";
+import {ROLE_COLOR, idleBlinkZs, spriteFrame, spritePosition} from "./sprites.js";
 
 export const LEGEND = "M=boss H=hr T=dev S=scout D=rev R=run [tea]=break";
 
@@ -112,6 +112,30 @@ function spriteStyle(role: EmployeeRole, sprite: SpriteState): Style {
 }
 
 const POD_SEAT = /^(?:dev|scout)-\d+$/; // machine-format seat ids, not NL
+const CHAIR_SEAT = /^(?:hr|cabin-\d+|dev-\d+|scout-\d+)$/; // seats whose anchor is a "(_)" chair
+
+/**
+ * Is (x,y) a structural cell: out of grid, the outer border, or a zone wall
+ * (door gaps excluded)? Used to keep floating sleep-z's off buildings —
+ * walls and bubbles are the named blockers; furniture glyphs may be
+ * transiently overlaid by the blink animation (it is gray and 2/16 ticks).
+ */
+function isStructural(plan: Plan, W: number, H: number, x: number, y: number): boolean {
+  if (x < 0 || x >= W || y < 0 || y >= H) return true;
+  if (W >= 2 && H >= 2 && (y === 0 || y === H - 1 || x === 0 || x === W - 1)) return true;
+  for (const z of plan.zones) {
+    if (x < z.x || x >= z.x + z.w || y < z.y || y >= z.y + z.h) continue;
+    const onN = y === z.y;
+    const onS = y === z.y + z.h - 1;
+    const onW = x === z.x;
+    const onE = x === z.x + z.w - 1;
+    const inDoor = (side: "n" | "s" | "e" | "w", i: number): boolean =>
+      z.doors.some((d) => d.side === side && i >= d.at && i < d.at + d.size);
+    if ((onN || onS) && !inDoor(onN ? "n" : "s", x - z.x)) return true;
+    if ((onW || onE) && y > z.y && y < z.y + z.h - 1 && !inDoor(onW ? "w" : "e", y - z.y)) return true;
+  }
+  return false;
+}
 
 /** Merge runs of identically-styled cells into row segments. */
 function mergeRow(row: Cell[]): RowSegments {
@@ -155,10 +179,21 @@ export function buildGridRows(state: OfficeState, width: number, height: number)
     for (let y = 0; y < H; y++) put(g, W, H, 0, y, "-".repeat(W), {color: "gray"});
   }
 
-  // furniture first, walls over any spill, clock on the boss-office wall
-  for (const p of plan.props) put(g, W, H, p.x, p.y, p.glyph, {color: p.color, bold: p.bold});
+  // furniture first, walls over any spill, clock on the boss-office wall;
+  // `over` props (window) go last so the zone walls don't erase them
+  for (const p of plan.props) if (!p.over) put(g, W, H, p.x, p.y, p.glyph, {color: p.color, bold: p.bold});
   for (const z of plan.zones) drawZone(g, W, H, z);
+  for (const p of plan.props) if (p.over) put(g, W, H, p.x, p.y, p.glyph, {color: p.color, bold: p.bold});
   put(g, W, H, plan.hotspots.clock.x, plan.hotspots.clock.y, tickClock(state.tick), {color: "white"});
+
+  // boss nameplate is a STATUS line: typing when a boss chat answer is
+  // pending, meetin while anyone is at the boss desk, awaiting otherwise
+  const plate = state.employees.some((e) => e.sprite === "meeting")
+    ? "[meetin]"
+    : state.chat.some((m) => m.from === "boss" && m.pending)
+      ? "[typing]"
+      : "[awaiting]";
+  put(g, W, H, plan.nameplate.x, plan.nameplate.y, plate.padEnd(10), {color: "yellow", bold: true});
 
   // degrade badge (drawn once, centered)
   if (plan.tiny) {
@@ -167,9 +202,40 @@ export function buildGridRows(state: OfficeState, width: number, height: number)
   }
 
   // animated sprites, stamped over the floor
+  const occupied = new Set<string>(); // sprite cells: "x,y" -> someone sits/stands here
   for (const e of state.employees) {
     const p = spritePosition(e.id) ?? seatAnchor(e.seat);
+    for (let dx = 0; dx < 3; dx++) occupied.add(`${p.x + dx},${p.y}`);
     put(g, W, H, p.x, p.y, spriteFrame(e.role, e.sprite, state.tick), spriteStyle(e.role, e.sprite));
+  }
+
+  // floating sleep-z's: one row above an idling sprite's right shoulder at
+  // (x+2, y-1) — NEVER glued into the sprite's own row (zMz reads as a typo,
+  // not as a sleeping worker). Skipped off-grid, onto a wall, or onto another
+  // sprite; bubbles are drawn later and simply overwrite any z under them.
+  for (const e of state.employees) {
+    const zs = idleBlinkZs(e.sprite, state.tick);
+    if (!zs) continue;
+    const p = spritePosition(e.id) ?? seatAnchor(e.seat);
+    const zx = p.x + 2;
+    const zy = p.y - 1;
+    let blocked = false;
+    for (let i = 0; i < zs.length; i++) {
+      if (isStructural(plan, W, H, zx + i, zy) || occupied.has(`${zx + i},${zy}`)) {
+        blocked = true;
+        break;
+      }
+    }
+    if (!blocked) put(g, W, H, zx, zy, zs, {color: "gray"});
+  }
+
+  // empty seats read EMPTY: a seat-anchored chair stays green only while
+  // some employee's sprite actually covers its anchor cell; otherwise gray+dim
+  for (const [seat, a] of plan.anchors) {
+    if (!CHAIR_SEAT.test(seat)) continue;
+    let free = true;
+    for (let dx = 0; dx < 3 && free; dx++) if (occupied.has(`${a.x + dx},${a.y}`)) free = false;
+    if (free) restyle(g, W, H, a.x, a.y, 3, {color: "gray", dim: true});
   }
 
   // lit screens: a dev pod's monitor glows cyan bold while someone works there
@@ -236,7 +302,7 @@ export function Floor({
         <Text color="green">S=scout </Text>
         <Text color="magenta">D=rev </Text>
         <Text color="blue">R=run </Text>
-        <Text color="brightBlack">[tea]=break</Text>
+        <Text color="gray">[tea]=break</Text>
       </Text>
     </Box>
   );
