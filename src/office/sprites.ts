@@ -4,9 +4,13 @@
  *
  * Positions are tracked per employee id in a module-local map (OfficeState's
  * Employee shape is fixed and cannot carry x/y). The map is pruned on fire,
- * seeded on first sight, and is the only mutable thing here.
+ * seeded on first sight, and is the only mutable thing here. Walkers live
+ * against the CURRENT plan (floorplan.currentPlan): when the plan generation
+ * changes (terminal resized), walkers are clamped back onto the new floor and
+ * re-walk to their (recomputed) targets.
  */
 import type {EmployeeRole, OfficeState, SpriteState} from "../state.js";
+import {currentPlan, type Plan, type Point} from "./floorplan.js";
 import {seatAnchor} from "./roster.js";
 
 export const ROLE_GLYPH: Record<EmployeeRole, string> = {
@@ -18,10 +22,6 @@ export const ROLE_GLYPH: Record<EmployeeRole, string> = {
   runner: "R",
 };
 
-// Standing targets for non-desk states.
-const MEET = {x: 32, y: 4}; // in front of the boss desk
-const MAIL = {x: 42, y: 3}; // at the mail tray, waving
-const TEA = {x: 60, y: 3}; // at the tea machine
 const COFFEE_TICKS = 60; // how long a break lasts
 
 /** Animated 3-char glyph for a role+state at a given tick. */
@@ -50,25 +50,26 @@ interface Walker {
   x: number;
   y: number;
   since: number; // tick when the current parked state started
+  gen: number; // plan generation this position was validated against
 }
 
 const walkers = new Map<string, Walker>();
 
 /** Current pixel position of an employee (undefined until first advance). */
-export function spritePosition(id: string): Walker | undefined {
+export function spritePosition(id: string): Point | undefined {
   return walkers.get(id);
 }
 
-function targetFor(sprite: SpriteState, seat: string): {x: number; y: number} {
+function targetFor(sprite: SpriteState, seat: string, plan: Plan): Point {
   switch (sprite) {
     case "to-manager":
     case "meeting":
-      return MEET;
+      return plan.hotspots.meet;
     case "to-coffee":
     case "coffee":
-      return TEA;
+      return plan.hotspots.tea;
     case "at-mailbox":
-      return MAIL;
+      return plan.hotspots.mail;
     default: // at-desk / working / to-desk head home
       return seatAnchor(seat);
   }
@@ -76,6 +77,7 @@ function targetFor(sprite: SpriteState, seat: string): {x: number; y: number} {
 
 /** Advance every walker by up to 2 cells (dogleg: x first, then y); drive state transitions. */
 export function advanceSprites(state: OfficeState): OfficeState {
+  const plan = currentPlan();
   const live = new Set(state.employees.map((e) => e.id));
   for (const id of [...walkers.keys()]) if (!live.has(id)) walkers.delete(id);
 
@@ -83,10 +85,17 @@ export function advanceSprites(state: OfficeState): OfficeState {
   const employees = state.employees.map((e) => {
     let w = walkers.get(e.id);
     if (!w) {
-      w = {...seatAnchor(e.seat), since: state.tick};
+      const a = seatAnchor(e.seat);
+      w = {x: a.x, y: a.y, since: state.tick, gen: plan.gen};
       walkers.set(e.id, w);
     }
-    const t = targetFor(e.sprite, e.seat);
+    if (w.gen !== plan.gen) {
+      // plan resized: clamp back onto the new floor, then re-walk to target
+      w.x = Math.min(Math.max(1, w.x), plan.width - 2);
+      w.y = Math.min(Math.max(1, w.y), plan.height - 2);
+      w.gen = plan.gen;
+    }
+    const t = targetFor(e.sprite, e.seat, plan);
     if (w.x !== t.x) w.x += Math.sign(t.x - w.x) * Math.min(2, Math.abs(t.x - w.x));
     else if (w.y !== t.y) w.y += Math.sign(t.y - w.y) * Math.min(2, Math.abs(t.y - w.y));
 

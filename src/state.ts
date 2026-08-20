@@ -58,11 +58,20 @@ export interface ChatMsg {
   pending?: boolean; // boss still typing
 }
 
+/** Ambient office chatter, floating above an employee for ttlTicks ticks. */
+export interface SpeechBubble {
+  id: string;
+  employeeId: string;
+  text: string; // short: "big day. lots of meetings."
+  untilTick: number;
+}
+
 export interface OfficeState {
   employees: Employee[]; // manager + hr always present
   tasks: BoardTask[];
   mails: MailItem[];
   chat: ChatMsg[];
+  bubbles: SpeechBubble[]; // ambient chatter balloons on the floor
   mode: "live" | "demo";
   statusLine: string; // health/toast text, e.g. "[grafeio] live — opencode 127.0.0.1:4096"
   tick: number; // animation frame counter (backend-agnostic)
@@ -80,6 +89,7 @@ export type OfficeEvent =
   | { type: "mail"; mail: MailItem } // board/mail sync
   | { type: "chat-user"; msg: ChatMsg }
   | { type: "chat-boss"; msg: ChatMsg }
+  | { type: "bubble"; employeeId: string; text: string; ttl?: number } // ambient speech balloon
   | { type: "status"; text: string }
   | { type: "tick" };
 

@@ -1,63 +1,58 @@
 /**
- * roster.ts — seat assignment + floor coordinates.
- * Pure data + tiny helpers. The ONE source for where seats/desks live.
+ * roster.ts — seat assignment, resolved against the CURRENT floor plan
+ * (geometry moved to floorplan.ts; seats are no longer fixed pixels).
+ *
+ * Seat ids: manager | hr (cabin-1) | cabin-2 | cabin-3 | dev-1..N |
+ * scout-1..2 | treadmill-1 | floor-<n> (overflow standing near the break area).
  */
 import type {EmployeeRole} from "../state.js";
+import {currentPlan, type Plan, type Point} from "./floorplan.js";
 
-export interface SeatDef {
-  anchor: {x: number; y: number}; // where the employee sprite stands when at this seat
-  desk: {x: number; y: number; glyph: string} | null; // desk furniture
-  label: {x: number; y: number} | null; // name label under the desk
+/** Dev seat ids present in the plan, sorted numerically: dev-1, dev-2, ... */
+function devSeats(plan: Plan): string[] {
+  return [...plan.anchors.keys()]
+    .filter((k) => /^dev-\d+$/.test(k)) // machine-format seat ids, not NL
+    .sort((a, b) => Number(a.slice(4)) - Number(b.slice(4)));
 }
 
-const seat = (
-  ax: number,
-  ay: number,
-  dx: number,
-  dy: number,
-  glyph: string,
-  lx: number,
-  ly: number,
-): SeatDef => ({anchor: {x: ax, y: ay}, desk: {x: dx, y: dy, glyph}, label: {x: lx, y: ly}});
-
-export const SEATS: Record<string, SeatDef> = {
-  manager: seat(32, 1, 29, 2, "[=BOSS=]", 30, 3),
-  hr: seat(4, 4, 2, 5, "[=====]", 2, 6),
-  "dev-1": seat(10, 6, 7, 7, "[=====]", 7, 8),
-  "dev-2": seat(22, 6, 19, 7, "[=====]", 19, 8),
-  "dev-3": seat(10, 10, 7, 11, "[=====]", 7, 12),
-  "dev-4": seat(22, 10, 19, 11, "[=====]", 19, 12),
-  "scout-1": seat(40, 6, 37, 7, "[=====]", 37, 8),
-  "scout-2": seat(52, 6, 49, 7, "[=====]", 49, 8),
-  "bench-1": seat(40, 10, 37, 11, "[=====]", 37, 12),
-  "treadmill-1": seat(52, 10, 49, 11, "[o==o]", 49, 12),
-};
-
-const ROLE_SEATS: Record<EmployeeRole, string[]> = {
-  manager: ["manager"],
-  hr: ["hr"],
-  developer: ["dev-1", "dev-2", "dev-3", "dev-4"],
-  scout: ["scout-1", "scout-2"],
-  reviewer: ["bench-1"],
-  runner: ["treadmill-1"],
-};
+/** Seat candidates per role, in fill order, against a plan. */
+export function roleSeats(role: EmployeeRole, plan: Plan = currentPlan()): string[] {
+  switch (role) {
+    case "manager":
+      return ["manager"];
+    case "hr":
+      return ["hr"]; // cabin-1, the HR cabin
+    case "reviewer":
+      return ["cabin-2"]; // dikastes
+    case "runner":
+      return ["treadmill-1"]; // hemerodromos, in the server room
+    case "scout":
+      return ["scout-1", "scout-2"]; // right-side pods of the dev field
+    default:
+      return devSeats(plan); // tekton devs, in pod order
+  }
+}
 
 /** First free seat for the role; overflow -> "floor-<n>" standing spots. */
 export function assignSeat(taken: Iterable<string>, role: EmployeeRole): string {
   const used = new Set(taken);
-  for (const s of ROLE_SEATS[role]) if (!used.has(s)) return s;
+  for (const s of roleSeats(role)) if (!used.has(s)) return s;
   let n = 0;
   while (used.has(`floor-${n}`)) n++;
   return `floor-${n}`;
 }
 
-/** Anchor point of a seat id. Unknown / overflow seats stand along the bottom row. */
-export function seatAnchor(seat: string): {x: number; y: number} {
-  const def = SEATS[seat];
-  if (def) return def.anchor;
+/** Anchor point of a seat id. Unknown / overflow seats stand near the break area. */
+export function seatAnchor(seat: string): Point {
+  const plan = currentPlan();
+  const a = plan.anchors.get(seat);
+  if (a) return a;
   const m = /^floor-(\d+)$/.exec(seat); // machine format, not NL
-  const n = m ? Math.min(Number(m[1]), 8) : 0;
-  return {x: 24 + n * 4, y: 17};
+  const n = m ? Number(m[1]) : 0;
+  const o = plan.hotspots.overflow;
+  const x = Math.min(Math.max(1, o.x - (n % 4) * 3), plan.width - 3);
+  const y = Math.min(Math.max(1, o.y - Math.floor(n / 4) * 2), plan.height - 2);
+  return {x, y};
 }
 
 /** Panel color for an employee/agent name (boss yellow, dev cyan, ...). */

@@ -1,12 +1,14 @@
 /**
  * taskboard.tsx — BOARD: three columns PENDING | DOING | DONE.
+ * Sized for the 36-col sidebar: tight columns, truncated rows,
+ * flex-grows to share space with the mailbox, clips cleanly when short.
  */
 import React from "react";
 import {Box, Text} from "ink";
 import type {BoardTask, TaskStatus} from "../state.js";
 import {nameColor} from "../office/roster.js";
 
-const CAP = 8;
+const CAP = 6;
 
 const COLS: {title: string; status: TaskStatus}[] = [
   {title: "PENDING", status: "pending"},
@@ -20,13 +22,18 @@ function Column({title, status, tasks}: {title: string; status: TaskStatus; task
   const overflow = rows.length - shown.length;
   const done = status === "done";
   return (
-    <Box flexDirection="column" flexGrow={1} flexBasis={0} marginRight={1}>
-      <Text bold underline>
+    <Box flexDirection="column" flexGrow={1} flexBasis={0} overflow="hidden">
+      <Text bold underline wrap="truncate">
         {title}
       </Text>
       {shown.length === 0 ? <Text dimColor>-</Text> : null}
       {shown.map((t) => (
-        <Text key={t.id} wrap="truncate" dimColor={done} color={done ? undefined : nameColor(t.owner ?? "")}>
+        <Text
+          key={t.id}
+          wrap="truncate"
+          dimColor={done}
+          color={done ? undefined : nameColor(t.owner ?? "")}
+        >
           {`${t.title}${t.owner ? ` ${t.owner}` : ""}`}
         </Text>
       ))}
@@ -37,9 +44,17 @@ function Column({title, status, tasks}: {title: string; status: TaskStatus; task
 
 export function Taskboard({tasks}: {tasks: BoardTask[]}) {
   return (
-    <Box borderStyle="round" borderColor="white" flexDirection="column" paddingX={1}>
+    <Box
+      borderStyle="round"
+      borderColor="white"
+      flexDirection="column"
+      paddingX={1}
+      flexGrow={1}
+      flexBasis={0}
+      overflow="hidden"
+    >
       <Text bold>BOARD</Text>
-      <Box flexDirection="row">
+      <Box flexDirection="row" columnGap={1} flexGrow={1} overflow="hidden">
         {COLS.map((c) => (
           <Column key={c.status} title={c.title} status={c.status} tasks={tasks} />
         ))}
