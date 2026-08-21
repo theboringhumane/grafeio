@@ -41,6 +41,18 @@
 // the SAME ID with Pending:false (it stops the stream first). Stop() and
 // session.error flush any still-open stream as Pending:false with a
 // "[grafeio] stream interrupted" note.
+//
+// Office concierge: cfg.Boss.Concierge (default on) adds a second,
+// lightweight root session ("grafeio concierge") so the member never talks
+// to a dark boss while the primary turn is busy. It is created lazily on
+// the FIRST SendConcierge, registered in normCtx as the pseudo-desk
+// "concierge" (its own session's text stream rides EvChatOffice
+// "office-"+messageID bubbles — one lane per message, never EvChatBoss —
+// its tool parts show as inline "concierge" lines, its reasoning is
+// suppressed, and ITS children (its own task-tool dispatches) hire/work/
+// return exactly like the primary's). AbortSessions covers it;
+// ResetPrimary/NewOffice un-seat it (never deleted server-side); the next
+// busy-boss message recreates it lazily.
 package backend
 
 import (
@@ -115,22 +127,34 @@ type liveBackend struct {
 	// aborted turn's own death rattle and is swallowed instead of surfacing
 	// as a "could not read reply" line (see maybeBossCompleted).
 	lastAbortAt int64
+	// Office concierge ("grafeio concierge" side session; see SendConcierge).
+	// conciergeID is "" until the first SendConcierge creates the session
+	// lazily (a quiet boss NEVER spins one up); conciergeBooted latches
+	// once the preamble has ridden the first prompt (subsequent prompts go
+	// out raw); pendingOffice is the FIFO of placeholder bubble ids
+	// ("office-pend-"+N) mirroring pendingBoss; officeCompleted dedupes
+	// completion pins like bossCompleted.
+	conciergeID     string
+	conciergeBooted bool
+	pendingOffice   []string
+	officeCompleted map[string]bool
 }
 
 func newLiveBackend(baseURL, directory string, cfg *config.Config) *liveBackend {
 	return &liveBackend{
-		directory:     directory,
-		optURL:        baseURL,
-		cfg:           cfg,
-		fl:            newFlow(),
-		ctx:           newNormCtx(cfg),
-		bossCompleted: make(map[string]bool),
-		thoughtSlots:  make(map[string]*thoughtSlot),
-		chatSlots:     make(map[string]*thoughtSlot),
-		amTasks:       make(map[string]string),
-		amMails:       make(map[string]bool),
-		client:        &http.Client{Timeout: 15 * time.Second},
-		sseClient:     &http.Client{},
+		directory:       directory,
+		optURL:          baseURL,
+		cfg:             cfg,
+		fl:              newFlow(),
+		ctx:             newNormCtx(cfg),
+		bossCompleted:   make(map[string]bool),
+		officeCompleted: make(map[string]bool),
+		thoughtSlots:    make(map[string]*thoughtSlot),
+		chatSlots:       make(map[string]*thoughtSlot),
+		amTasks:         make(map[string]string),
+		amMails:         make(map[string]bool),
+		client:          &http.Client{Timeout: 15 * time.Second},
+		sseClient:       &http.Client{},
 	}
 }
 
@@ -211,6 +235,10 @@ func (b *liveBackend) Start(emit func(state.Event)) error {
 
 	if b.cfg.Boss.Model != "" {
 		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] boss model override: " + string(b.cfg.Boss.Model)})
+	}
+
+	if !b.cfg.Boss.Concierge {
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] office concierge: off (boss.concierge=false) — busy-boss chat routes to the boss queue"})
 	}
 
 	if b.am.kind == "actions" {
@@ -364,6 +392,165 @@ func (b *liveBackend) SendWith(text string, atts []state.Attachment) error {
 		}})
 	}
 	return nil
+}
+
+// ------------------------------------------------------- office concierge
+
+// conciergePreamble rides the concierge session's FIRST prompt exactly
+// once (fetch-side one-shot; subsequent prompts go out raw). It pins the
+// concierge's contract: answer instantly and short; real work gets a
+// sub-agent dispatch NOW (the task tool), never a queue and never a
+// promise to get back later.
+const conciergePreamble = "You are the office concierge. The boss is busy right now.\n" +
+	"Answer the user in <=3 sentences.\n" +
+	"If the message IS work (create/change/run/research), DO NOT queue: immediately\n" +
+	"dispatch a sub-agent via the task tool for it and reply acknowledging\n" +
+	"the delegation in one line. Never ask the user to wait; never say you'll\n" +
+	"get back later."
+
+// SendConcierge is the live office-concierge seam (state.ConciergeCapable —
+// the app type-asserts it when the boss's turn is occupied; deliberately NOT
+// on state.Backend, mirrors SessionAborter/SendWith).
+//
+// Lifecycle: the concierge session ("grafeio concierge", same serve, same
+// cwd) is created LAZILY on this first call — a quiet boss never pays for
+// one (CONCIERGE-proof: ConciergeID() stays "" until first use). Once made,
+// it registers inside normCtx as the pseudo-desk "concierge"
+// (events.go:registerConcierge): no hire/manager event (the floor keeps one
+// boss), but its tool parts surface as inline "concierge" office lines and
+// its OWN children (task-tool dispatches) hire via the normal parentID
+// chain exactly like the primary's children.
+//
+// Echo + placeholder mirror Send exactly: the chat-user echo fires HERE
+// (backend-owned, same ownership as Send — the app never echoes), then one
+// pending office placeholder ("office-pend-"+N, FIFO) stages the typing
+// bubble. The concierge's assistant replies ride EvChatOffice ONLY —
+// "office-"+messageID bubbles, From/Kind "office", streaming growth at
+// ~7fps + completion pin — never EvChatBoss: exactly one lane fires per
+// message (maybeOfficeCompleted guards SessionID, maybeBossCompleted
+// guards primaryID).
+//
+// Degrade-open rules: boss.concierge=false treats the message as a normal
+// boss Send (the turn queues server-side — nothing is ever dropped); a
+// concierge create/prompt failure lands as an office bubble, not a stuck
+// lane.
+func (b *liveBackend) SendConcierge(text string) error {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" || b.fl.isStopped() {
+		return nil
+	}
+	if !b.cfg.Boss.Concierge {
+		// Feature off: degrade open to the boss lane (prompt_async queues
+		// behind the busy turn server-side, exactly like any Send).
+		return b.Send(trimmed)
+	}
+	b.mu.Lock()
+	now := nowMs()
+	b.chatSeq++
+	userID := "user-" + itoa(b.chatSeq)
+	b.mu.Unlock()
+	b.fl.emit(state.Event{Kind: state.EvChatUser, Msg: state.ChatMsg{
+		ID: userID, From: "user", Text: trimmed, At: now, Kind: "user",
+	}})
+
+	b.mu.Lock()
+	ready := b.baseURL != "" && !b.fl.isStopped()
+	conciergeID := b.conciergeID
+	b.mu.Unlock()
+	if !ready {
+		b.mu.Lock()
+		b.chatSeq++
+		deadID := "office-pend-" + itoa(b.chatSeq)
+		b.mu.Unlock()
+		b.fl.emit(state.Event{Kind: state.EvChatOffice, Msg: state.ChatMsg{
+			ID: deadID, From: "office", Kind: "office", Text: "[grafeio] backend not started", At: nowMs(), Pending: false,
+		}})
+		return nil
+	}
+	if conciergeID == "" {
+		sesh, err := b.createPrimary("grafeio concierge")
+		if err != nil {
+			b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] concierge session create failed: " + shortTitle(err.Error(), 100)})
+			b.mu.Lock()
+			b.chatSeq++
+			deadID := "office-pend-" + itoa(b.chatSeq)
+			b.mu.Unlock()
+			b.fl.emit(state.Event{Kind: state.EvChatOffice, Msg: state.ChatMsg{
+				ID: deadID, From: "office", Kind: "office",
+				Text: "[grafeio] office concierge unavailable: " + shortTitle(err.Error(), 100), At: nowMs(), Pending: false,
+			}})
+			return nil // degrade: do not hard-fail the message
+		}
+		b.mu.Lock()
+		b.conciergeID = sesh.ID
+		b.ctx.registerConcierge(sesh.ID)
+		conciergeID = sesh.ID
+		b.mu.Unlock()
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] office concierge session ready (" + sesh.ID + ")"})
+	}
+	b.mu.Lock()
+	b.chatSeq++
+	pendingID := "office-pend-" + itoa(b.chatSeq)
+	b.pendingOffice = append(b.pendingOffice, pendingID)
+	booted := b.conciergeBooted
+	if !booted {
+		b.conciergeBooted = true
+	}
+	b.mu.Unlock()
+
+	b.fl.emit(state.Event{Kind: state.EvChatOffice, Msg: state.ChatMsg{
+		ID: pendingID, From: "office", Kind: "office", Text: "", At: nowMs(), Pending: true,
+	}})
+
+	prompt := trimmed
+	if !booted {
+		prompt = conciergePreamble + "\n\n" + trimmed
+	}
+	err := b.postPrompt(conciergeID, prompt, nil)
+	if err != nil {
+		b.mu.Lock()
+		for i, id := range b.pendingOffice {
+			if id == pendingID {
+				b.pendingOffice = append(b.pendingOffice[:i], b.pendingOffice[i+1:]...)
+				break
+			}
+		}
+		b.mu.Unlock()
+		b.fl.emit(state.Event{Kind: state.EvChatOffice, Msg: state.ChatMsg{
+			ID:      pendingID,
+			From:    "office",
+			Kind:    "office",
+			Text:    "[grafeio] concierge prompt failed: " + shortTitle(err.Error(), 120),
+			At:      nowMs(),
+			Pending: false,
+		}})
+	}
+	return nil
+}
+
+// ConciergeID returns the concierge session id, "" until first use — the
+// laziness/quiet-boss proof (headless --concierge-probe reads it via the
+// same type-assert pattern as PrimaryID).
+func (b *liveBackend) ConciergeID() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.conciergeID
+}
+
+// forgetConciergeLocked un-seats the concierge (ResetPrimary/NewOffice
+// respawn) and returns the old id, "" when there was none. The server-side
+// session is NEVER deleted — it simply stops being the office's concierge
+// (mirrors the primary's respawn semantics); the next SendConcierge lazily
+// creates and preambles a fresh one. Caller holds b.mu; emission of the
+// status note is the caller's job AFTER unlocking.
+func (b *liveBackend) forgetConciergeLocked() string {
+	concID := b.conciergeID
+	b.conciergeID = ""
+	b.conciergeBooted = false
+	b.pendingOffice = nil
+	b.officeCompleted = make(map[string]bool)
+	b.ctx.dismissConcierge()
+	return concID
 }
 
 // ---------------------------------------------------------------- stop
@@ -684,7 +871,11 @@ func (b *liveBackend) ResetPrimary(forceNew bool) error {
 	b.primaryID = ""
 	b.respawnFresh = forceNew
 	b.respawnOldID = old
+	concID := b.forgetConciergeLocked() // respawn semantics: concierge goes with the office
 	b.mu.Unlock()
+	if concID != "" {
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] office concierge dismissed with the respawn (" + concID + ") — next busy-boss message recreates it lazily"})
+	}
 	b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
 		"[grafeio] primary session reset (forceNew=%v) — next send respawns", forceNew)})
 	return nil
@@ -736,7 +927,11 @@ func (b *liveBackend) NewOffice() (string, error) {
 	b.primaryID = primary.ID
 	b.respawnFresh = false // the fresh-create latch is consumed eagerly here
 	b.respawnOldID = ""
+	concID := b.forgetConciergeLocked() // a fresh office starts fresh-concierge too
 	b.mu.Unlock()
+	if concID != "" {
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] office concierge dismissed with the new office (" + concID + ") — next busy-boss message recreates it lazily"})
+	}
 	if old != "" && old != primary.ID {
 		b.fl.emit(state.Event{Kind: state.EvFire, EmployeeID: old})
 	}
@@ -924,7 +1119,9 @@ func (b *liveBackend) RejectQuestion(requestID string) error {
 // every live child session: an opencode abort ends only its own session's
 // run ("stop any ongoing AI processing or command execution", /doc
 // 1.18.19), so sub-agent work the boss fanned out must be called out
-// session by session. Per-session failures are NON-fatal: each failure is
+// session by session. The OFFICE CONCIERGE (when one is registered — it
+// rides ctx.employees as the pseudo-desk "concierge") is included in the
+// same loop, so a busy boss + busy concierge + fan-out all stop together. Per-session failures are NON-fatal: each failure is
 // noted on the status line, the sessions that DID abort still stop, and
 // the collected errors.Join is the return value.
 //
@@ -984,8 +1181,9 @@ func (b *liveBackend) AbortSessions() error {
 		"[grafeio] turn aborted (%d/%d session(s))", aborted, len(ids))})
 
 	// Flush what the aborted turn leaves behind, then close the running
-	// turn's placeholder: text streams flush interrupted, the FIFO head
-	// gets the stopped marker.
+	// turn's placeholder: text streams flush interrupted (boss lane and
+	// office lane alike — per-stream session routing), the FIFO heads get
+	// the stopped marker.
 	b.mu.Lock()
 	streamEvs := interruptedStreamEvents(b.ctx, "[grafeio] stream interrupted")
 	for id := range b.chatSlots {
@@ -996,6 +1194,11 @@ func (b *liveBackend) AbortSessions() error {
 		headID = b.pendingBoss[0]
 		b.pendingBoss = b.pendingBoss[1:]
 	}
+	var officeHeadID string
+	if aborted > 0 && len(b.pendingOffice) > 0 {
+		officeHeadID = b.pendingOffice[0]
+		b.pendingOffice = b.pendingOffice[1:]
+	}
 	b.mu.Unlock()
 	for _, e := range streamEvs {
 		b.fl.emit(e)
@@ -1004,6 +1207,16 @@ func (b *liveBackend) AbortSessions() error {
 		b.fl.emit(state.Event{Kind: state.EvChatBoss, Msg: state.ChatMsg{
 			ID:      headID,
 			From:    "boss",
+			Text:    "[grafeio] stopped (turn aborted)",
+			At:      nowMs(),
+			Pending: false,
+		}})
+	}
+	if officeHeadID != "" {
+		b.fl.emit(state.Event{Kind: state.EvChatOffice, Msg: state.ChatMsg{
+			ID:      officeHeadID,
+			From:    "office",
+			Kind:    "office",
 			Text:    "[grafeio] stopped (turn aborted)",
 			At:      nowMs(),
 			Pending: false,
@@ -1462,14 +1675,16 @@ func (b *liveBackend) flushChatStream(id string) {
 func (b *liveBackend) onEvent(raw ocSSEEvent) error {
 	b.mu.Lock()
 	primaryID := b.primaryID
+	conciergeID := b.conciergeID
 	// Abort window: the serve reports a member-initiated /stop as
-	// session.error "Aborted" on the primary — protocol noise, since
-	// AbortSessions already emitted the intentional "[grafeio] stopped"
-	// marker. Swallow those while the quiet window is open; every other
-	// error (or any error outside the window) maps normally.
+	// session.error "Aborted" on the primary (and concierge — AbortSessions
+	// aborts the whole family) — protocol noise, since AbortSessions already
+	// emitted the intentional "[grafeio] stopped" marker. Swallow those
+	// while the quiet window is open; every other error (or any error
+	// outside the window) maps normally.
 	if raw.Type == "session.error" && b.lastAbortAt != 0 && nowMs()-b.lastAbortAt < abortQuietMs {
 		var p ocSessionErrorProps
-		if json.Unmarshal(raw.Properties, &p) == nil && p.SessionID == primaryID {
+		if json.Unmarshal(raw.Properties, &p) == nil && (p.SessionID == primaryID || p.SessionID == conciergeID) {
 			msg := "aborted"
 			if p.Error != nil && p.Error.Data.Message != "" {
 				msg = p.Error.Data.Message
@@ -1496,6 +1711,13 @@ func (b *liveBackend) onEvent(raw ocSSEEvent) error {
 			b.emitChatStream(e)
 			continue
 		}
+		// The concierge's streaming office bubbles ride the same gate,
+		// keyed by the disjoint "office-"+messageID prefix (one lane per
+		// message, no identity collision with bossmsg-).
+		if e.Kind == state.EvChatOffice && e.Msg.Pending && strings.HasPrefix(e.Msg.ID, "office-") {
+			b.emitChatStream(e)
+			continue
+		}
 		b.fl.emit(e)
 	}
 
@@ -1518,6 +1740,7 @@ func (b *liveBackend) onEvent(raw ocSSEEvent) error {
 		}
 		if json.Unmarshal(raw.Properties, &p) == nil {
 			b.maybeBossCompleted(p.Info)
+			b.maybeOfficeCompleted(p.Info)
 		}
 	}
 	return nil
@@ -1531,8 +1754,12 @@ func (b *liveBackend) maybeChildReturned(sessionID string) {
 	_, known := b.ctx.employees[sessionID]
 	already := b.ctx.returned[sessionID]
 	started := b.baseURL != ""
+	isConcierge := sessionID != "" && sessionID == b.conciergeID
 	b.mu.Unlock()
-	if !known || already || !started {
+	if !known || already || !started || isConcierge {
+		// isConcierge: the concierge lives in ctx.employees as a pseudo-desk
+		// (So its children hire + its tools attribute) but it is NOT a
+		// brief — idle there is answer-done, never a return/mail/fire.
 		return
 	}
 
@@ -1662,6 +1889,69 @@ func (b *liveBackend) maybeBossCompleted(info ocMessage) {
 
 	b.fl.emit(state.Event{Kind: state.EvChatBoss, Msg: state.ChatMsg{
 		ID: "bossmsg-" + info.ID, From: "boss", Kind: "boss", Text: text, At: nowMs(), Pending: false,
+	}})
+}
+
+// maybeOfficeCompleted: the concierge replied — emit an EvChatOffice bubble
+// pinned to the COMPLETING message's own text. This is the exact mirror of
+// maybeBossCompleted on the office lane: identity "office-"+messageID,
+// From/Kind "office", Pending:false; same one-completion dedupe; same
+// stream handoff (deltas stop, pinned fetch text supersedes); same
+// mid-turn "tool-calls" swallow (its text rides the continuation message);
+// same abort-window quiet for the aborted turn's empty death rattle.
+// Sessions are disjoint — primary completions never reach here and
+// concierge completions never reach maybeBossCompleted — so exactly ONE of
+// EvChatOffice/EvChatBoss fires per assistant message.
+func (b *liveBackend) maybeOfficeCompleted(info ocMessage) {
+	b.mu.Lock()
+	if conciergeID := b.conciergeID; conciergeID == "" ||
+		info.SessionID != conciergeID || info.Role != "assistant" ||
+		info.Time.Completed == 0 || b.officeCompleted[info.ID] {
+		b.mu.Unlock()
+		return
+	}
+	b.officeCompleted[info.ID] = true
+	// Stop the delta stream for this message (same handoff as the boss:
+	// unregister parts, drop any coalesced trailing update still in flight).
+	unregisterTextStream(b.ctx, info.ID)
+	delete(b.chatSlots, "office-"+info.ID)
+	conciergeID := b.conciergeID
+	b.mu.Unlock()
+
+	text, finish, err := b.messageText(conciergeID, info.ID)
+	if err != nil {
+		text = "[grafeio] could not read reply (msg " + info.ID + ")"
+	} else if text == "" {
+		if finish == "tool-calls" {
+			return // mid-turn message; the text rides the continuation message
+		}
+		// Abort window: an EMPTY concierge completion right after
+		// AbortSessions (which aborts the concierge too) is the aborted
+		// turn's death rattle — the member already has the stopped marker.
+		b.mu.Lock()
+		aborted := b.lastAbortAt != 0 && nowMs()-b.lastAbortAt < abortQuietMs
+		b.lastAbortAt = 0
+		if aborted && len(b.pendingOffice) > 0 {
+			b.pendingOffice = b.pendingOffice[1:]
+		}
+		b.mu.Unlock()
+		if aborted {
+			return
+		}
+		text = "[grafeio] could not read reply (msg " + info.ID + ")"
+	}
+	// Concierge edits (it can dispatch AND touch files directly) surface as
+	// diff events on completion, same as the boss lane.
+	b.fetchDiffAndEmit(conciergeID)
+
+	b.mu.Lock()
+	if len(b.pendingOffice) > 0 {
+		b.pendingOffice = b.pendingOffice[1:]
+	}
+	b.mu.Unlock()
+
+	b.fl.emit(state.Event{Kind: state.EvChatOffice, Msg: state.ChatMsg{
+		ID: "office-" + info.ID, From: "office", Kind: "office", Text: text, At: nowMs(), Pending: false,
 	}})
 }
 

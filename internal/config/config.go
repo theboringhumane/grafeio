@@ -36,6 +36,9 @@ type ModelRef string
 type BossConfig struct {
 	Name  string   `json:"name"`  // display name: "boss (oikonomos)"
 	Model ModelRef `json:"model"` // orch/boss model override (prompt-level); empty = server default
+	// Concierge answers instantly when the boss's turn is occupied: its own
+	// lightweight session that answers directly or dispatches its own developers.
+	Concierge bool `json:"concierge"` // default true
 }
 
 type RoleConfig struct {
@@ -71,7 +74,7 @@ type Config struct {
 func Default() *Config {
 	return &Config{
 		Version: 1,
-		Boss:    BossConfig{Name: "boss (oikonomos)", Model: ""},
+		Boss:    BossConfig{Name: "boss (oikonomos)", Model: "", Concierge: true},
 		Roles: map[string]RoleConfig{
 			"developer": {NamePrefix: "tekton"},
 			"scout":     {NamePrefix: "skopos"},

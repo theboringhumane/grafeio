@@ -95,6 +95,21 @@
 //	                            flush) AND no further boss-bubble stream
 //	                            growth beyond a 1.5s in-flight grace. Prints
 //	                            "STOP: OK" (exit 0) or "STOP: FAIL" (exit 1).
+//	grafeio-headless --concierge-probe
+//	                            office concierge / busy-boss probe (forces
+//	                            live): boss send "count from 1 to 300 with one
+//	                            number per line, then stop" (still working),
+//	                            2s later SendConcierge("what is 6x7") — assert
+//	                            a completed office bubble carrying "42" within
+//	                            25s; then SendConcierge("create
+//	                            /tmp/gfx-conc-test.txt with one line: grapes")
+//	                            — assert within 60s a child hire (of the
+//	                            concierge) AND the file on disk AND an office
+//	                            message acknowledging it. A quiet-boss gate
+//	                            asserts the concierge session is created
+//	                            lazily (never by boss traffic). Prints
+//	                            "CONCIERGE: OK" (exit 0) else "CONCIERGE: FAIL"
+//	                            (exit 1).
 //	grafeio-headless --sse-sim
 //	                            SSE reconnect sim (D1): a fake standard-library
 //	                            serve emulates session list/create plus a
@@ -159,6 +174,7 @@ func main() {
 	charterProbe := flag.Bool("charter-probe", false, "manager-charter wiring probe: scratch dir, EnsureCharter twice (bytes identical), spawn a REAL serve rooted in the scratch, ask the boss who it is + the dispatch minimum, assert (manager|oikonomos)+(three|3) — CHARTER-PROBE: ACTIVE (exit 0) else exit 1")
 	abortProbe := flag.Bool("abort-probe", false, "live mode: /stop probe — /doc abort excerpt, send the 2000-word kelp essay, wait 2s, AbortSessions via the state.SessionAborter seam, assert stopped marker + stream growth stops (STOP: OK|FAIL)")
 	sseSim := flag.Bool("sse-sim", false, "SSE reconnect sim (D1): fake flapping serve, assert backoff ladder 1s/2s/5s/10s/30s capped + ladder reset + exactly one closed note + one error-class note + one reconnected note (SSE-SIM: OK|FAIL)")
+	conciergeProbe := flag.Bool("concierge-probe", false, "live mode: office concierge probe — busy boss ('count 1..300') + SendConcierge: assert quiet-boss laziness (no concierge session), a completed office bubble answering 42 within 25s, and (grapes file probe) a concierge-dispatched worker hire + /tmp/gfx-conc-test.txt + an office acknowledgment within 60s (CONCIERGE: OK|FAIL)")
 	flag.Parse()
 
 	// --charter-probe is a standalone probe with its own harness (own
@@ -222,6 +238,15 @@ func main() {
 	// the shared one below is shaped for demo/stale-repro runs).
 	if *abortProbe {
 		os.Exit(runAbortProbe(cfg))
+	}
+	if *conciergeProbe && (*prompt != "" || *prompt2 != "" || *ask || *batchProbe) {
+		fmt.Fprintln(os.Stderr, "--concierge-probe is a standalone probe: do not combine with --prompt/--prompt2/--ask/--batch-probe")
+		os.Exit(2)
+	}
+	// --concierge-probe: office concierge / busy-boss probe with its own
+	// harness (own emit, own live backend — never the demo).
+	if *conciergeProbe {
+		os.Exit(runConciergeProbe(cfg))
 	}
 
 	// 15s TOTAL budget for --ask, measured from before the serve spawn.
@@ -1512,6 +1537,232 @@ func runAbortProbe(cfg *config.Config) int {
 	return 1
 }
 
+// --- office concierge / busy-boss probe ---------------------------------------
+
+// conciergeSeam is the additive office-concierge seam the live backend
+// exposes (state.ConciergeCapable plus the laziness read-out): the probe
+// asserts SendConcierge delivers AND that no concierge session exists
+// before first use (the quiet-boss gate).
+type conciergeSeam interface {
+	state.ConciergeCapable
+	ConciergeID() string
+}
+
+// waitOffice scans the completed-office-bubble log for a bubble satisfying
+// match, polling until timeout. Returns (matched text, true) or ("", false).
+func waitOffice(mu *sync.Mutex, texts *[]string, match func(string) bool, timeout time.Duration) (string, bool) {
+	deadline := time.Now().Add(timeout)
+	for {
+		mu.Lock()
+		for _, t := range *texts {
+			if match(t) {
+				mu.Unlock()
+				return t, true
+			}
+		}
+		mu.Unlock()
+		if time.Now().After(deadline) {
+			return "", false
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// runConciergeProbe — the --concierge-probe harness. Boot the REAL live
+// backend (own emit), then in order:
+//
+//  0. QUIET-BOSS / lazy gate: ConciergeID is printed PROACTIVELY before any
+//     traffic and again 2s into a pure boss send ("count from 1 to 300 with
+//     one number per line, then stop", a turn long enough to still be busy) —
+//     boss traffic must NEVER spin the concierge: the id must still be "".
+//  1. SendConcierge("what is 6x7") while the boss turn is still streaming;
+//     assert a completed EvChatOffice bubble carrying "42" lands within 25s
+//     (boss-stream lines keep landing in parallel — the busy boss is visible
+//     in the transcript the whole time).
+//  2. SendConcierge("create /tmp/gfx-conc-test.txt with one line: grapes");
+//     assert within 60s: (a) a child hire (of the concierge — the boss's
+//     own children would ALSO satisfy it, but the counting boss never
+//     dispatches), (b) the probe file exists on disk with the grapes line,
+//     (c) an office message acknowledges the work (references grape/file).
+//
+// Any permission/question surfacing during the run is auto-answered
+// ("once" / a short affirmative) like an attending member, so a dispatched
+// child never parks on the modal inside a headless harness. Prints the
+// laziness line plus three PASS lines, then "CONCIERGE: OK" (exit 0) or
+// "CONCIERGE: FAIL" (exit 1).
+func runConciergeProbe(cfg *config.Config) int {
+	dir, err := os.Getwd()
+	if err != nil {
+		fmt.Printf("[fatal] getwd: %v\n", err)
+		return 1
+	}
+
+	// Board offline for a deterministic transcript (same posture as the
+	// abort probe).
+	oldAM := os.Getenv("AGENTMEMORY_URL")
+	_ = os.Setenv("AGENTMEMORY_URL", "http://127.0.0.1:9")
+	defer func() {
+		if oldAM == "" {
+			_ = os.Unsetenv("AGENTMEMORY_URL")
+		} else {
+			_ = os.Setenv("AGENTMEMORY_URL", oldAM)
+		}
+	}()
+
+	const probeFile = "/tmp/gfx-conc-test.txt"
+	_ = os.Remove(probeFile) // fresh slate — the probe proves THIS run created it
+
+	var mu sync.Mutex
+	var officeTexts []string // completed office bubbles, in order
+	var hires []string       // "name(id)" of every employee hire beyond the fixed seats
+	b := backend.NewLive("", dir, cfg)
+	emit := func(e state.Event) {
+		printEvent(e)
+		mu.Lock()
+		answeredNow := ""
+		questionNow := ""
+		switch {
+		case e.Kind == state.EvChatOffice && !e.Msg.Pending && strings.HasPrefix(e.Msg.ID, "office-"):
+			officeTexts = append(officeTexts, e.Msg.Text)
+		case e.Kind == state.EvHire && e.Employee.ID != "hr" && e.Employee.Seat != "manager":
+			hires = append(hires, e.Employee.Name+"("+e.Employee.ID+")")
+		case e.Kind == state.EvPermission && e.ToolState == "pending":
+			answeredNow = e.PermissionID
+		case e.Kind == state.EvQuestion && e.ToolState == "pending":
+			questionNow = e.QuestionID
+		}
+		mu.Unlock()
+		// Attending-member auto-answers, OUTSIDE the emit lock (the demo
+		// twin emits synchronously from inside the reply — same deadlock
+		// reasoning as --answer above).
+		if answeredNow != "" {
+			pid := answeredNow
+			time.AfterFunc(100*time.Millisecond, func() {
+				fmt.Printf("[concierge-probe] auto-answer permission %s -> %v\n", pid, b.AnswerPermission(pid, "once"))
+			})
+		}
+		if questionNow != "" {
+			qid := questionNow
+			time.AfterFunc(100*time.Millisecond, func() {
+				fmt.Printf("[concierge-probe] auto-answer question %s -> %v\n", qid, b.AnswerQuestion(qid, []string{"yes, proceed"}))
+			})
+		}
+	}
+
+	fmt.Printf("[mode] %s\n", b.Mode())
+	if err := b.Start(emit); err != nil {
+		fmt.Printf("[fatal] start: %v\n", err)
+		return 1
+	}
+
+	failures := 0
+	check := func(cond bool, label string) {
+		if cond {
+			fmt.Printf("[assert] PASS %s\n", label)
+		} else {
+			failures++
+			fmt.Printf("[assert] FAIL %s\n", label)
+		}
+	}
+
+	cs, ok := b.(conciergeSeam)
+	if !ok {
+		_ = b.Stop()
+		fmt.Println("[concierge-probe] live backend does NOT expose the office-concierge seam (state.ConciergeCapable + ConciergeID)")
+		fmt.Println("CONCIERGE: FAIL (seam missing)")
+		return 1
+	}
+
+	// 0. Quiet-boss / lazy gate: printed proactively BEFORE anything so the
+	// transcript proves the concierge does not exist yet.
+	fmt.Printf("[concierge-probe] status: concierge session before any traffic = %q (must be empty — lazy first-use)\n", cs.ConciergeID())
+	bossPrompt := "count from 1 to 300 with one number per line, then stop"
+	fmt.Printf("[concierge-probe] boss prompt (keeps the turn busy) %q\n", bossPrompt)
+	if err := b.Send(bossPrompt); err != nil {
+		fmt.Printf("[fatal] boss send: %v\n", err)
+		_ = b.Stop()
+		return 1
+	}
+	time.Sleep(2 * time.Second)
+	lazyID := cs.ConciergeID()
+	fmt.Printf("[concierge-probe] status: 2s into the busy boss turn, concierge session = %q (quiet-boss gate: must STILL be empty)\n", lazyID)
+	check(cs.ConciergeID() == "", "quiet-boss: boss traffic left the concierge asleep (lazy first-use — no session created by Send)")
+
+	// 1. The trivial question while the boss is busy.
+	fmt.Println(`[concierge-probe] SendConcierge("what is 6x7") while the boss is still counting`)
+	if err := cs.SendConcierge("what is 6x7"); err != nil {
+		fmt.Printf("[fatal] SendConcierge: %v\n", err)
+		_ = b.Stop()
+		return 1
+	}
+	mathText, mathOK := waitOffice(&mu, &officeTexts, func(t string) bool {
+		return strings.Contains(t, "42")
+	}, 25*time.Second)
+	if mathOK {
+		fmt.Printf("[concierge-probe] office answered: %q\n", trunc(mathText, 120))
+	}
+	check(mathOK, `office bubble answered 6x7 ("42") within 25s while the boss was busy`)
+
+	// 2. The real work: must dispatch a worker, not queue on the boss.
+	fmt.Println(`[concierge-probe] SendConcierge("create /tmp/gfx-conc-test.txt with one line: grapes")`)
+	if err := cs.SendConcierge("create /tmp/gfx-conc-test.txt with one line: grapes"); err != nil {
+		fmt.Printf("[fatal] SendConcierge #2: %v\n", err)
+		_ = b.Stop()
+		return 1
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	var hiredNow, ackText string
+	fileOK := false
+	for time.Now().Before(deadline) && (hiredNow == "" || ackText == "" || !fileOK) {
+		mu.Lock()
+		if len(hires) > 0 {
+			hiredNow = hires[0]
+		}
+		mu.Unlock()
+		if ackText == "" {
+			mu.Lock()
+			for _, t := range officeTexts {
+				l := strings.ToLower(t)
+				if strings.Contains(l, "grape") || strings.Contains(l, "gfx-conc-test") || strings.Contains(l, "file") {
+					ackText = t
+					break
+				}
+			}
+			mu.Unlock()
+		}
+		if data, err := os.ReadFile(probeFile); err == nil && strings.Contains(strings.TrimSpace(string(data)), "grapes") {
+			fileOK = true
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	if data, err := os.ReadFile(probeFile); err == nil {
+		fmt.Printf("[concierge-probe] probe file %s content: %q\n", probeFile, string(data))
+	}
+	mu.Lock()
+	hiresSeen := append([]string(nil), hires...)
+	mu.Unlock()
+	fmt.Printf("[concierge-probe] hires observed: %v\n", hiresSeen)
+	check(hiredNow != "" && fileOK,
+		fmt.Sprintf("concierge dispatched a worker for the real task (hire %q) and %s exists containing 'grapes'", hiredNow, probeFile))
+	if ackText != "" {
+		fmt.Printf("[concierge-probe] office acknowledged: %q\n", trunc(ackText, 120))
+	}
+	check(ackText != "", "an office message acknowledged the work (references grape/file) within the 60s budget")
+
+	if err := b.Stop(); err != nil {
+		fmt.Printf("[fatal] stop: %v\n", err)
+		return 1
+	}
+	fmt.Println("[done] backend stopped")
+
+	if failures == 0 {
+		fmt.Println("CONCIERGE: OK")
+		return 0
+	}
+	fmt.Printf("CONCIERGE: FAIL (%d check(s) failed)\n", failures)
+	return 1
+}
+
 // --- SSE reconnect sim (D1) ---------------------------------------------------
 
 // sseAttempt is one /event attach in the sim ledger: arrival time is the
@@ -1811,6 +2062,8 @@ func printEvent(e state.Event) {
 		fmt.Printf("[chat-user] %s %q\n", e.Msg.ID, e.Msg.Text)
 	case state.EvChatBoss:
 		fmt.Printf("[chat-boss] %s pending=%v %q\n", e.Msg.ID, e.Msg.Pending, trunc(e.Msg.Text, 120))
+	case state.EvChatOffice:
+		fmt.Printf("[chat-office] %s pending=%v %q\n", e.Msg.ID, e.Msg.Pending, trunc(e.Msg.Text, 120))
 	case state.EvBubble:
 		fmt.Printf("[bubble] %s %q\n", e.EmployeeID, e.Text)
 	case state.EvTool:

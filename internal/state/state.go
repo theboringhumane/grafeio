@@ -130,12 +130,20 @@ type MailItem struct {
 
 type ChatMsg struct {
 	ID      string `json:"id"`
-	From    string `json:"from"` // "user" | "boss"
+	From    string `json:"from"` // "user" | "boss" | "office"
 	Text    string `json:"text"`
 	At      int64  `json:"at"`
 	Pending bool   `json:"pending,omitempty"`
-	// Kind — "user" | "boss" | "think" | "tool". Empty "" keeps existing
-	// literals valid (classic user/boss chat).
+	// Kind — "user" | "boss" | "think" | "tool" | "office". Empty "" keeps
+	// existing literals valid (classic user/boss chat).
+	//
+	// "office" (the concierge) follows the EXACT same streaming contract as
+	// "boss": EvChatOffice carries Msg{ID:"office-"+<messageID>, From:
+	// "office", Kind:"office", Pending:true, Text:accumulated-so-far} —
+	// repeated updates of the SAME Msg.ID grow the one bubble; the
+	// completion pin re-emits that ID with Pending:false and the pinned
+	// full text. UI: update-in-place by Msg.ID, never append a streaming
+	// update as a new bubble.
 	//
 	// "boss" STREAMING contract (live text-part deltas): while the boss's
 	// final answer streams in, EvChatBoss carries Msg{ID:"bossmsg-"+<messageID>,
@@ -192,17 +200,25 @@ type OfficeState struct {
 type EventKind string
 
 const (
-	EvHire       EventKind = "hire"
-	EvFire       EventKind = "fire"
-	EvDispatch   EventKind = "dispatch"
-	EvWorking    EventKind = "working"
-	EvReturned   EventKind = "returned"
-	EvIdleDrift  EventKind = "idle-drift"
-	EvBlocked    EventKind = "blocked"
-	EvTask       EventKind = "task"
-	EvMail       EventKind = "mail"
-	EvChatUser   EventKind = "chat-user"
-	EvChatBoss   EventKind = "chat-boss"
+	EvHire      EventKind = "hire"
+	EvFire      EventKind = "fire"
+	EvDispatch  EventKind = "dispatch"
+	EvWorking   EventKind = "working"
+	EvReturned  EventKind = "returned"
+	EvIdleDrift EventKind = "idle-drift"
+	EvBlocked   EventKind = "blocked"
+	EvTask      EventKind = "task"
+	EvMail      EventKind = "mail"
+	EvChatUser  EventKind = "chat-user"
+	EvChatBoss  EventKind = "chat-boss"
+	// EvChatOffice — the office concierge's chat lane (ADDITIVE). When the
+	// boss's turn is occupied the app routes chat through the concierge,
+	// whose replies ride this kind instead of EvChatBoss: exactly ONE of
+	// the two fires per assistant message. Msg carries From "office",
+	// Kind "office", ID "office-"+messageID; the streaming contract
+	// (Pending growth + completion pin, 150ms-coalesced deltas) mirrors
+	// the boss stream (see ChatMsg.Kind).
+	EvChatOffice EventKind = "chat-office"
 	EvThought    EventKind = "thought"
 	EvTool       EventKind = "tool"
 	EvBubble     EventKind = "bubble"
@@ -222,7 +238,7 @@ type Event struct {
 	Task       BoardTask `json:"task,omitempty"`       // dispatch/task + returned.TaskID via Task.ID
 	TaskID     string    `json:"taskId,omitempty"`     // working/returned
 	Mail       MailItem  `json:"mail,omitempty"`       // returned/mail
-	Msg        ChatMsg   `json:"msg,omitempty"`        // chat-user/chat-boss
+	Msg        ChatMsg   `json:"msg,omitempty"`        // chat-user/chat-boss/chat-office
 	Text       string    `json:"text,omitempty"`       // status note / bubble text / thought text
 	TTL        int       `json:"ttl,omitempty"`        // bubble
 	// EmployeeName — human label for the actor. The backend fills it from
@@ -277,6 +293,24 @@ type Backend interface {
 	// reject route: POST /question/{requestID}/reject, /doc 1.18.19).
 	RejectQuestion(requestID string) error
 	Stop() error
+}
+
+// ConciergeCapable — the office-concierge seam (ADDITIVE; deliberately NOT
+// folded into Backend, same convention as the attachment/team/office-session/
+// abort seams — harness stubs stay untouched, the app type-asserts it).
+//
+// The concierge keeps the member answered while the boss's turn is occupied:
+// SendConcierge delivers chat to a lightweight side session ("grafeio
+// concierge", lazily created on FIRST use on the live backend) that answers
+// instantly — directly when the message is trivial, by dispatching its own
+// developer sub-agents (tracked like the boss's children) when it is real
+// work. Replies arrive as EvChatOffice bubbles (From "office"), never
+// EvChatBoss. When the feature is off (config boss.concierge=false) a backend
+// degrades open by treating the message as a normal boss Send. The live
+// backend additionally emits the chat-user echo (same ownership as Send, so
+// the app never echoes twice).
+type ConciergeCapable interface {
+	SendConcierge(text string) error
 }
 
 // SessionAborter — the /stop seam (ADDITIVE; deliberately NOT folded into

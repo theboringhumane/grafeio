@@ -68,6 +68,8 @@ var slashCommands = []slashCommand{
 	{"/wide", "sidebar width (0 = default)", "/wide 26..100"},
 	{"/zen", "fullscreen floor, any key exits", ""},
 	{"/focus", "alias of /zen", "/focus floor"},
+	{"/stop", "abort current work (boss + workers)", ""},
+	{"/new", "fresh office (transcript archived)", ""},
 	{"/quit", "exit grafeio", ""},
 }
 

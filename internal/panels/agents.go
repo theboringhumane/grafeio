@@ -1,6 +1,8 @@
 // agents.go — AGENTS roster tab (port of node-legacy panels/agents.tsx):
 // boss pinned first (brain.json boss.name, default "boss (oikonomos)")
-// yellow bold; one row per employee:
+// yellow bold, then the pinned concierge row — "office (concierge)" with
+// its live status word in INFO ("answering" while an EvChatOffice bubble is
+// pending, else "on call") — then one row per employee:
 //
 //	<name (role color)>  <glyph> <sprite word (semantic color)>   <task, dim, right>
 //
@@ -147,7 +149,13 @@ func (a *Agents) render() string {
 	}
 
 	var b strings.Builder
+	officePinned := false
 	for _, e := range ordered {
+		if e.Role != state.RoleManager && !officePinned {
+			// the concierge row pins directly under the boss block
+			officePinned = true
+			b.WriteString(a.officeRow() + "\n")
+		}
 		isBoss := e.Role == state.RoleManager
 		label := e.Name
 		if isBoss {
@@ -193,5 +201,35 @@ func (a *Agents) render() string {
 		}
 		b.WriteString(line + "\n")
 	}
+	if !officePinned {
+		// boss-less roster (defensive — initialState always seats one)
+		b.WriteString(a.officeRow() + "\n")
+	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// officeRow — the pinned concierge row under the boss: "office (concierge)"
+// with its own live status word in INFO (cyan) — "answering" while any
+// concierge (EvChatOffice) bubble is pending, "on call" the rest of the
+// time. No glyph, no task cell: the concierge lives in the chat lane, not
+// on the floor.
+func (a *Agents) officeRow() string {
+	answering := false
+	for _, m := range a.st.Chat {
+		if m.From == "office" && m.Kind == "office" && m.Pending {
+			answering = true
+			break
+		}
+	}
+	word := "on call"
+	if answering {
+		word = "answering"
+	}
+	left := chrome.Fg(chrome.Info, "office (concierge)") + " " +
+		chrome.Fg(chrome.Info, word)
+	gap := a.w - len("office (concierge) "+word) - 2
+	if gap < 1 {
+		gap = 1
+	}
+	return "  " + left + strings.Repeat(" ", gap)
 }

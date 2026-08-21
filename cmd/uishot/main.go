@@ -102,6 +102,11 @@
 //	                                land immediately (trace: both BEFORE the
 //	                                turn-completed marker), statusline "busy ·
 //	                                2 queued (server)", FIFO drain after)
+//	                    [--concierge] (concierge routing proof: busy sends
+//	                                route to SendConcierge (captured, notice
+//	                                ONCE, office placeholder+bubbles, agents
+//	                                row answering|on call); idle boss picks
+//	                                Send again — zero duplication)
 package main
 
 import (
@@ -724,6 +729,45 @@ func (b *stubBackend) AbortSessions() error {
 	return nil
 }
 
+// --- concierge seam (--concierge) ------------------------------------------
+
+// evChatOffice — the concierge chat event kind (the parallel contract's
+// state.EvChatOffice; aliased for terseness).
+var evChatOffice = state.EvChatOffice
+
+// conciergeStub — the --concierge backend: every stubBackend behavior PLUS
+// the ConciergeCapable seam (SendConcierge). Kept as an embedding wrapper
+// so the PLAIN stub stays concierge-incapable: the existing busy-turn
+// proofs (--stream/--freesend) assert the free-send boss-queue path, which
+// the app must keep using when the seam is absent.
+type conciergeStub struct {
+	*stubBackend
+	conciergeLog []string // every SendConcierge call, verbatim (the proof)
+}
+
+// officeMsg builds one concierge chat message per the parallel contract
+// (From "office", Kind "office", ID "office-<msgID>", replace-in-place).
+func officeMsg(id, text string, pending bool) state.ChatMsg {
+	return state.ChatMsg{ID: id, From: "office", Kind: "office", Text: text,
+		At: time.Now().UnixMilli(), Pending: pending}
+}
+
+// SendConcierge — the routable concierge seam: capture the prompt (the
+// proof), then emit ONLY the empty pending placeholder ("office-<seq>");
+// the DETERMINISTIC harness drives the completion events itself.
+func (s *conciergeStub) SendConcierge(text string) error {
+	s.conciergeLog = append(s.conciergeLog, text)
+	if s.trace != nil {
+		s.trace("[stub] SendConcierge(" + text + ")")
+	}
+	if s.emit != nil {
+		s.sendSeq++
+		s.emit(state.Event{Kind: evChatOffice,
+			Msg: officeMsg(fmt.Sprintf("office-%d", s.sendSeq), "", true)})
+	}
+	return nil
+}
+
 // slashWorkload simulates the user typing a slash command into the chat
 // textarea and hitting Enter — proving slash dispatch never hits the backend
 // and the office notice renders. It types /theme dracula (switch + persist),
@@ -1204,8 +1248,12 @@ func runStopProof() error {
 		return fail("stop: setup frame already shows an aborted marker before /stop")
 	}
 
-	// +1s: the user hits /stop
+	// +1s: the user hits /stop — /stop is a real popover row now, so the
+	// first Enter APPLIES the selection into the draft and the SECOND
+	// Enter sends it (the same two-press dance as every bare popover
+	// command — /question in the ask proofs, /queue in the leg below).
 	typeIn("/stop")
+	drainCmd(d, key(tea.KeyEnter), 0)
 	drainCmd(d, key(tea.KeyEnter), 0)
 
 	st := d.m.State()
@@ -1260,6 +1308,196 @@ func runStopProof() error {
 	fmt.Println(frameQ)
 	fmt.Println("asserts: OK — AbortSessions captured once; boss-2 placeholder → \"stopped by user\"; streamed text kept + \" (stopped)\"; boss + worker tools ✗ aborted; thread (· 2 tool calls ✗ stopped); BossThinking/BossDelegating cleared; queue intact (1 item, badge q1, send next turn)")
 	return nil
+}
+
+// --- concierge routing proof (--concierge) ----------------------------------
+// Synchronous driver (no wall clock), two phases. Phase A: the boss is
+// busy mid-turn (pending placeholder); TWO user sends must BOTH route to
+// the stub's SendConcierge (captured), a dim "office routed: boss busy →
+// concierge" line appears EXACTLY ONCE, the office placeholders read
+// "office is answering…", and the agents roster pins "office (concierge)
+// answering". The completions then pin in place (replace-by-ID) and the
+// roster word settles to "on call". Phase B: after the boss turn completes
+// the next send hits the boss's Send and the concierge is NOT touched
+// (zero duplication — the concierge never answers when the boss is idle).
+
+// driveConciergeCmd executes a cmd chain synchronously: each message's
+// Update can RETURN the next cmd (busySendReqMsg → the concierge send
+// closure → conciergeSentMsg). Timer arms (spinner/tick) are skipped after
+// a short wait — the proof only needs produced messages. The concierge
+// emit lands synchronous events mid-send (stub.emit → d.send).
+func driveConciergeCmd(d *focusDriver, cmd tea.Cmd, depth int) {
+	if cmd == nil || depth > 16 {
+		return
+	}
+	ch := make(chan tea.Msg, 1)
+	go func() { ch <- cmd() }()
+	var msg tea.Msg
+	select {
+	case msg = <-ch:
+	case <-time.After(150 * time.Millisecond):
+		return // a timer arm: not a message the proof needs
+	}
+	if msg == nil {
+		return
+	}
+	if batch, ok := msg.(tea.BatchMsg); ok {
+		for _, c := range batch {
+			driveConciergeCmd(d, c, depth+1)
+		}
+		return
+	}
+	tm, next := d.m.Update(msg)
+	if fm, ok := tm.(app.Model); ok {
+		d.m = fm
+	}
+	driveConciergeCmd(d, next, depth+1)
+}
+
+func runConciergeProof() error {
+	fail := func(format string, args ...any) error { return fmt.Errorf(format, args...) }
+	base := &stubBackend{done: make(chan struct{})}
+	stub := &conciergeStub{stubBackend: base}
+	m := app.New(stub, config.Default())
+	d := &focusDriver{m: m}
+	d.send(tea.WindowSizeMsg{Width: shotCols, Height: shotRows})
+	var trace []string
+	base.trace = func(line string) { trace = append(trace, line) }
+	base.emit = func(ev state.Event) { d.send(ev) }
+	app.QueueDebugf = func(format string, args ...any) {
+		trace = append(trace, "[queue] "+fmt.Sprintf(format, args...))
+	}
+	defer func() { app.QueueDebugf = nil }()
+
+	key := func(code rune) tea.Cmd {
+		tm, c := d.m.Update(tea.KeyPressMsg(tea.Key{Code: code}))
+		if fm, ok := tm.(app.Model); ok {
+			d.m = fm
+		}
+		return c
+	}
+	typeIn := func(s string) {
+		for _, r := range s {
+			tm, _ := d.m.Update(tea.KeyPressMsg(tea.Key{Code: r, Text: string(r)}))
+			if fm, ok := tm.(app.Model); ok {
+				d.m = fm
+			}
+		}
+	}
+
+	// setup: the boss is BUSY mid-turn (send + pending placeholder staged)
+	d.send(state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — concierge stub online"})
+	d.send(state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user", "plan the api", false)})
+	d.send(state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-1", "boss", "", true)})
+
+	// PHASE A — two user sends while the boss is busy: BOTH route to the
+	// concierge; the routing notice prints ONCE.
+	typeIn("what did we decide on storage")
+	driveConciergeCmd(d, key(tea.KeyEnter), 0)
+	typeIn("and on caching")
+	driveConciergeCmd(d, key(tea.KeyEnter), 0)
+
+	fmt.Println("===== UI SHOT · CONCIERGE A — boss busy: both sends ROUTED to the concierge (placeholder ×2, notice ONCE) =====")
+	frameA := d.m.Frame()
+	fmt.Println(frameA)
+	fmt.Println("===== UI SHOT =====")
+
+	if len(stub.conciergeLog) != 2 {
+		return fail("concierge A: expected 2 SendConcierge calls, got %d (%v)", len(stub.conciergeLog), stub.conciergeLog)
+	}
+	if stub.conciergeLog[0] != "what did we decide on storage" || stub.conciergeLog[1] != "and on caching" {
+		return fail("concierge A: routed prompts captured wrong: %v", stub.conciergeLog)
+	}
+	if len(base.sendLog) != 0 {
+		return fail("concierge A: the boss's Send fired while busy+routed (%v) — zero-duplication violated", base.sendLog)
+	}
+	if n := strings.Count(frameA, "office routed: boss busy → concierge"); n != 1 {
+		return fail("concierge A: routing notice appears %d times (want exactly 1 per busy turn)", n)
+	}
+	if !strings.Contains(frameA, "office is answering…") {
+		return fail("concierge A: missing the pending office placeholder \"office is answering…\"")
+	}
+	if !d.m.SelectTab("agents") {
+		return fail("concierge A: agents tab not selectable")
+	}
+	frameAgentsA := d.m.Frame()
+	fmt.Println("===== UI SHOT · CONCIERGE A (agents) — pinned \"office (concierge) answering\" under the boss =====")
+	fmt.Println(frameAgentsA)
+	fmt.Println("===== UI SHOT =====")
+	for _, want := range []string{"office (concierge)", "answering"} {
+		if !strings.Contains(frameAgentsA, want) {
+			return fail("concierge A (agents): frame missing %q", want)
+		}
+	}
+
+	// the concierge's answers pin in place (replace-by-ID, Pending→false)
+	d.send(state.Event{Kind: evChatOffice, Msg: officeMsg("office-1",
+		"storage: **sqlite** — the brief says local-first, zero setup.", false)})
+	d.send(state.Event{Kind: evChatOffice, Msg: officeMsg("office-2",
+		"caching: one in-process map for now — no redis until v3.", false)})
+	if !d.m.SelectTab("chat") {
+		return fail("concierge A: chat tab not selectable")
+	}
+	fmt.Println("===== UI SHOT · CONCIERGE A′ — both office answers PINNED in place (one bubble each, INFO \"office ›\" label) =====")
+	frameA2 := d.m.Frame()
+	fmt.Println(frameA2)
+	fmt.Println("===== UI SHOT =====")
+	if !strings.Contains(frameA2, "sqlite") {
+		return fail("concierge A′: first office answer missing its pinned text")
+	}
+	if !strings.Contains(frameA2, "no redis until v3") && !ansiContains(frameA2, "redis") {
+		return fail("concierge A′: second office answer missing its pinned text")
+	}
+	if !d.m.SelectTab("agents") {
+		return fail("concierge A′: agents tab not selectable")
+	}
+	frameAgentsA2 := d.m.Frame()
+	for _, want := range []string{"office (concierge)", "on call"} {
+		if !strings.Contains(frameAgentsA2, want) {
+			return fail("concierge A′ (agents): frame missing %q (settled roster)", want)
+		}
+	}
+	if strings.Contains(frameAgentsA2, "answering") {
+		return fail("concierge A′ (agents): roster still says \"answering\" after both pins")
+	}
+	if !d.m.SelectTab("chat") {
+		return fail("concierge A′: chat tab not selectable")
+	}
+
+	// PHASE B — the boss turn completes; the next send hits the boss's
+	// Send and the concierge is NOT touched.
+	d.send(state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-1", "boss",
+		"api plan pinned — sqlite plus the in-process cache.", false)})
+	base.emit = nil // the Send leg's 600ms echo would race the frame asserts
+	typeIn("make it so")
+	driveConciergeCmd(d, key(tea.KeyEnter), 0)
+	fmt.Println("===== UI SHOT · CONCIERGE B — boss idle again: the send hits the BOSS, the concierge stays silent (zero duplication) =====")
+	frameB := d.m.Frame()
+	fmt.Println(frameB)
+	fmt.Println("===== UI SHOT =====")
+	if len(base.sendLog) != 1 || base.sendLog[0] != "make it so" {
+		return fail("concierge B: expected exactly 1 boss Send (\"make it so\"), got %v", base.sendLog)
+	}
+	if len(stub.conciergeLog) != 2 {
+		return fail("concierge B: the concierge answered while the boss was idle (%v) — zero-duplication violated", stub.conciergeLog)
+	}
+
+	fmt.Println("--- concierge capture (stub SendConcierge calls) ---")
+	for i, s := range stub.conciergeLog {
+		fmt.Printf("SendConcierge #%d: %q\n", i+1, s)
+	}
+	fmt.Println("--- ordering trace ---")
+	for _, ln := range trace {
+		fmt.Println(ln)
+	}
+	fmt.Println("asserts: OK — boss busy: 2 sends routed to SendConcierge (captured), boss Send never fired, routing notice printed ONCE, office placeholders \"office is answering…\", answers pinned replace-by-ID (INFO \"office ›\" bubbles), agents row \"answering\" → \"on call\"; boss idle: send hit the boss's Send, concierge untouched")
+	return nil
+}
+
+// ansiContains is Contains on the ansi-stripped frame (glamour splits
+// styled text across escape sequences).
+func ansiContains(frame, sub string) bool {
+	return strings.Contains(ansi.Strip(frame), sub)
 }
 
 // printAskCapture prints the stub's captured AnswerQuestion/RejectQuestion
@@ -2728,6 +2966,7 @@ func main() {
 	click := flag.Bool("click", false, "mouse proof: scripted clicks — floor sprite click selects the agent (activity tab + ▸ marker + office notice), double-click toggles its thread + jumps to chat, chat thread-header/summary clicks toggle round-trip, chrome rows ignore clicks")
 	stop := flag.Bool("stop", false, "/stop proof (synchronous): boss mid-stream with tools running + a staged second placeholder + a roadblock-queued item + delegating state; typing /stop must hit stub.AbortSessions and unwind in ONE frame — \"stopped by user\" placeholders, \" (stopped)\" stream appendix, tools ✗ aborted, thread ✗ stopped, BossThinking/Delegating cleared, queue intact; a /queue leg proves the item survived unsent")
 	freesend := flag.Bool("freesend", false, "free-queuing proof: boss busy 200–3000ms; two prompts sent DURING the window must hit backend.Send IMMEDIATELY (both ([stub] Send lines precede the turn-completed marker in the ordering trace) — frame 1 (t=2.2s) shows \"busy · 2 queued (server)\" + the \"turn 2 · your message rides next\" placeholder; frame 2 (t=3.6s) shows the drained FIFO pins + restored status line")
+	concierge := flag.Bool("concierge", false, "concierge routing proof (synchronous, two phases): A) boss busy mid-turn — two sends BOTH route to stub.SendConcierge (capture printed), the \"office routed: boss busy → concierge\" notice prints ONCE, office placeholders read \"office is answering…\", answers pin in place (INFO \"office ›\" bubbles), the agents roster pins \"office (concierge) answering\" → \"on call\"; B) after the boss turn completes, the next send hits the boss's Send and the concierge is NOT called (zero duplication)")
 	flag.Parse()
 
 	if *persist {
@@ -2748,6 +2987,14 @@ func main() {
 
 	if *stop {
 		if err := runStopProof(); err != nil {
+			fmt.Fprintf(os.Stderr, "uishot: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *concierge {
+		if err := runConciergeProof(); err != nil {
 			fmt.Fprintf(os.Stderr, "uishot: %v\n", err)
 			os.Exit(1)
 		}

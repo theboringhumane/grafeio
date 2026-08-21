@@ -83,6 +83,14 @@ const (
 // ANY chat-user echo carrying it into the compact composite bubble.
 const batchMarker = "[BATCH DISPATCH — "
 
+// The concierge contract lives in the state package (asserted here, owned
+// by the backend dev): state.EvChatOffice ("chat-office") carries
+// Msg{From:"office", Kind:"office", ID:"office-<msgID>"} with the boss
+// stream's replace-in-place mechanics; state.ConciergeCapable is the
+// SendConcierge(text) error seam the app type-asserts off backend (the
+// same additive-seam pattern as teamBackend/attachmentBackend — harness
+// stubs that lack it simply degrade to the boss queue).
+
 // teamBackend — the backlog/board seam live and demo backends expose beyond
 // state.Backend (the backend dev's contract; the app type-asserts it).
 // QueueItemStart mirrors one backlog item to the board and returns its id
@@ -263,6 +271,12 @@ type Model struct {
 	busySaved    string // StatusLine saved when the busy compose first painted
 	busyStatus   bool   // the busy compose owns StatusLine right now
 
+	// conciergeNoted — the concierge routing latch: the "office routed:
+	// boss busy → concierge" line (or the unavailable fallback notice)
+	// prints ONCE per busy turn, not per message; resetServerTurn re-arms
+	// it when the turn ends.
+	conciergeNoted bool
+
 	// Permission prompts (boss/primary session only): perm is the OPEN
 	// prompt replacing the textarea; permEscd is the latest esc'd-but-
 	// unanswered prompt /perm can re-open.
@@ -323,9 +337,22 @@ type chatSentMsg struct{ text string }
 
 // busySentMsg fires after a FREE-SEND resolves — a prompt that went
 // straight to the backend while the boss was mid-turn (the serve queues it
-// natively, draining after the current turn). The model tallies it for the
-// busy-status compose.
+// server-side, draining after the current turn). The model tallies it for
+// the busy-status compose.
 type busySentMsg struct{ text string }
+
+// busySendReqMsg is the panel's busy-turn hand-off: Enter landed while the
+// boss was mid-turn, but the ROUTING decision (boss server-queue vs
+// concierge) needs the model's LIVE state, so the send happens in Update —
+// see routeBusySend.
+type busySendReqMsg struct {
+	text string
+	atts []state.Attachment
+}
+
+// conciergeSentMsg fires after backend.SendConcierge resolves — the office
+// placeholder/answer bubbles arrive via the EvChatOffice seam.
+type conciergeSentMsg struct{ text string }
 
 // chatNoticeMsg is the chat panel's office-notice seam (attachment events:
 // cap eviction, backspace removal, image-paste platform gaps).
@@ -447,22 +474,13 @@ func New(b state.Backend, cfg *config.Config) Model {
 	chat.SetEnqueue(func(text string, atts []state.Attachment) tea.Cmd {
 		return func() tea.Msg { return enqueueMsg{text: text, atts: atts} }
 	})
-	// Free-queuing seam: while a boss reply is pending (busy, NOT
-	// roadblocked) the panel routes Enter here instead of the client queue —
-	// the prompt goes STRAIGHT to the backend, which queues it server-side
-	// and drains it after the current turn. Failure handling + attachment
-	// cleanup mirror the plain send path.
+	// Busy-send seam: while a boss reply is pending (busy, NOT roadblocked)
+	// the panel hands Enter here — but WHERE the prompt goes is a live-state
+	// decision (concierge vs the boss's server-side queue), so the closure
+	// only ferries the text into the model and routeBusySend decides in
+	// Update (busySendReqMsg).
 	chat.SetBusySend(func(text string, atts []state.Attachment) tea.Cmd {
-		return func() tea.Msg {
-			if b != nil {
-				if err := sendChat(b, text, atts); err != nil {
-					cleanupAttachments(atts) // nobody will retry this prompt
-					return sendErrMsg{err: err}
-				}
-				cleanupAttachments(atts)
-			}
-			return busySentMsg{text: text}
-		}
+		return func() tea.Msg { return busySendReqMsg{text: text, atts: atts} }
 	})
 	// Attachment notices (cap eviction, chip removal, image-paste platform
 	// gaps) surface as office chat notices like every other local outcome.
@@ -600,6 +618,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case chatSentMsg:
 		// nothing local: backend.Send owns the echo (chat-user + pending boss
 		// bubble) via the event stream — applying them here duplicated the bubbles.
+		m.playSound("send")
+	case busySendReqMsg:
+		// the panel fired while the boss looked busy; route with live state
+		cmds = append(cmds, m.routeBusySend(msg.text, msg.atts))
+	case conciergeSentMsg:
+		// the concierge backend owns the office echo (pending placeholder +
+		// completion bubbles) via the EvChatOffice seam.
 		m.playSound("send")
 	case busySentMsg:
 		// free-queuing: straight to the server mid-turn — tally it so the
@@ -1069,7 +1094,10 @@ func (m *Model) applyEvent(ev state.Event) tea.Cmd {
 	// each would spam the log (the placeholder's "typing…" and the final's
 	// "reply" already bracket the turn). Skip pending-with-text events.
 	isStreamDelta := ev.Kind == state.EvChatBoss && ev.Msg.Pending && ev.Msg.Text != ""
-	if ev.Kind != state.EvTick && !isStreamDelta {
+	// concierge pending deltas are one bubble's growth — the activity tab
+	// gets ONE line per completed office answer, not per stream beat.
+	isOfficeDelta := ev.Kind == state.EvChatOffice && ev.Msg.Pending
+	if ev.Kind != state.EvTick && !isStreamDelta && !isOfficeDelta {
 		m.activity.Add(m.describeEvent(ev))
 		m.activityAdds++
 	}
@@ -1224,12 +1252,61 @@ func (m *Model) clearBusyStatus() {
 
 // resetServerTurn closes the free-queuing tally for the busy turn that just
 // ended (completion / error / /stop): placeholder turn count back to 0, the
-// status compose restored.
+// status compose restored, the concierge routing notice re-armed for the
+// next busy turn.
 func (m *Model) resetServerTurn() {
 	m.serverQueued = 0
+	m.conciergeNoted = false
 	m.clearBusyStatus()
 	if m.chat != nil {
 		m.chat.SetServerTurn(0)
+	}
+}
+
+// --- concierge routing ------------------------------------------------------
+
+// routeBusySend decides where a prompt typed while the boss looked busy
+// actually goes (busySendReqMsg). CONCIERGE ROUTING fires only when the
+// boss is genuinely busy — an outstanding pending placeholder/stream, the
+// delegation quiet state, or a question hold resolved-but-turn-incomplete —
+// AND cfg.Boss.Concierge is on: the concierge must never answer in parallel
+// with an idle boss (zero duplication). The seam is text-only, so an
+// attachment-carrying prompt keeps riding the boss queue (files must never
+// be silently dropped). A backend without the ConciergeCapable seam
+// degrades to the old free-send path with a one-time dim notice. Either
+// routing notice prints at most ONCE per busy turn (conciergeNoted,
+// re-armed by resetServerTurn).
+func (m *Model) routeBusySend(text string, atts []state.Attachment) tea.Cmd {
+	busy := hasPendingBoss(m.st) || m.st.BossDelegating || m.questionParked
+	if busy && m.cfg != nil && m.cfg.Boss.Concierge && len(atts) == 0 {
+		if cb, ok := m.backend.(state.ConciergeCapable); ok {
+			if !m.conciergeNoted {
+				m.conciergeNoted = true
+				m.notice("office routed: boss busy → concierge")
+			}
+			qdebugf("concierge: routed %q (boss busy)", text)
+			return func() tea.Msg {
+				if err := cb.SendConcierge(text); err != nil {
+					return sendErrMsg{err: err}
+				}
+				return conciergeSentMsg{text: text}
+			}
+		}
+		if !m.conciergeNoted {
+			m.conciergeNoted = true
+			m.notice("(concierge unavailable — boss queued it)")
+		}
+	}
+	b := m.backend
+	return func() tea.Msg {
+		if b != nil {
+			if err := sendChat(b, text, atts); err != nil {
+				cleanupAttachments(atts) // nobody will retry this prompt
+				return sendErrMsg{err: err}
+			}
+			cleanupAttachments(atts)
+		}
+		return busySentMsg{text: text}
 	}
 }
 
@@ -1262,10 +1339,27 @@ func (m *Model) stopWork() {
 //	    swings to "✗ aborted" (dim-red at render);
 //	(d) active worker threads collapse with a "✗ stopped" summary;
 //	(e) BossThinking / BossDelegating clear.
+//
+// A pending concierge (office) answer unwinds the same way: an empty
+// placeholder collapses to the "stopped by user" office line; a streaming
+// one keeps its text with the " (stopped)" appendix. AbortSessions covers
+// the concierge session on backends that implement it (a missing seam
+// degrades quietly — the unwind above still runs).
 func (m *Model) unwindStoppedWork() {
 	next := make([]state.ChatMsg, 0, len(m.st.Chat))
 	for _, c := range m.st.Chat {
 		switch {
+		case c.From == "office" && c.Pending && c.Text == "":
+			// concierge placeholder → dim office line, like the boss's
+			next = append(next, state.ChatMsg{
+				ID: c.ID, From: "office", Text: "stopped by user",
+				At: time.Now().UnixMilli(),
+			})
+		case c.From == "office" && c.Pending:
+			// concierge streaming bubble → text kept + stopped appendix
+			c.Pending = false
+			c.Text = strings.TrimSuffix(c.Text, " (stopped)") + " (stopped)"
+			next = append(next, c)
 		case c.From == "boss" && c.Pending && strings.HasPrefix(c.ID, "boss-"):
 			// (a) typing placeholder → dim office line
 			next = append(next, state.ChatMsg{
@@ -1870,6 +1964,28 @@ func reducer(st state.OfficeState, ev state.Event) state.OfficeState {
 			}
 		}
 		st.Chat = capChat(append(rest, msg))
+		return st
+
+	case state.EvChatOffice:
+		// concierge answers — "chat-office" events (the parallel backend
+		// contract): the SAME replace-in-place mechanics as the boss
+		// stream. The pending placeholder ("office-<msgID>") appends once,
+		// streaming growth re-emits the same ID, and the completion pin
+		// swaps Pending→false in place; a duplicated completion is
+		// idempotent. Rides capChat (cap 30) like every chat entry, and
+		// never touches boss typing/delegation state.
+		msg := ev.Msg
+		if msg.ID != "" {
+			for i, c := range st.Chat {
+				if c.ID == msg.ID {
+					next := append([]state.ChatMsg(nil), st.Chat...)
+					next[i] = msg
+					st.Chat = capChat(next)
+					return st
+				}
+			}
+		}
+		st.Chat = capChat(appendChat(st.Chat, msg))
 		return st
 
 	case state.EvThought:
@@ -2492,6 +2608,8 @@ func (m *Model) describeEvent(ev state.Event) string {
 		} else {
 			what = "boss › reply"
 		}
+	case state.EvChatOffice:
+		what = "office › reply"
 	case state.EvBubble:
 		name := ev.EmployeeID
 		if e := findEmployee(m.st, ev.EmployeeID); e != nil {

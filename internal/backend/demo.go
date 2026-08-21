@@ -357,6 +357,32 @@ func (b *demoBackend) SendWith(text string, atts []state.Attachment) error {
 	return nil
 }
 
+// ---------------------------------------------------------------- office concierge
+
+// SendConcierge is the demo twin of the live office-concierge seam
+// (state.ConciergeCapable — the app type-asserts it when the boss's turn is
+// occupied). The demo has no concierge session to spin, so it proves the
+// contract with one pinned office bubble: EvChatOffice, From/Kind "office",
+// Pending:false, nothing else — deliberately LEAN (no scripted spywing;
+// the scripted day's roster stays untouched).
+func (b *demoBackend) SendConcierge(text string) error {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" || b.fl.isStopped() {
+		return nil
+	}
+	b.mu.Lock()
+	b.chatSeq++
+	seq := b.chatSeq
+	b.mu.Unlock()
+	b.fl.emit(state.Event{Kind: state.EvChatOffice, Msg: state.ChatMsg{
+		ID: "office-demo-" + itoa(seq), From: "office", Kind: "office",
+		Text:    "office › (demo) concierge would handle this right away: " + sliceMax(trimmed, 80),
+		At:      nowMs(),
+		Pending: false,
+	}})
+	return nil
+}
+
 // ---------------------------------------------------------------- permission replies
 
 // AnswerPermission resolves a pending demo permission: logs the reply on

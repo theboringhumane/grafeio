@@ -182,10 +182,20 @@ type normCtx struct {
 	reasoningParts   map[string]bool     // part id -> a message.part.updated said "reasoning"
 	reasoningAccum   map[string]string   // part id -> delta-accumulated transcript so far
 	deltaBuffer      map[string]string   // part id -> deltas seen BEFORE the part was classified
-	textParts        map[string]bool     // part id -> message.part.updated classified a STREAMING text part (primary only)
-	textPartMsg      map[string]string   // text part id -> its messageID (deltas key the boss bubble)
+	textParts        map[string]bool     // part id -> message.part.updated classified a STREAMING text part (primary/concierge)
+	textPartMsg      map[string]string   // text part id -> its messageID (deltas key the boss/office bubble)
 	textAccum        map[string]string   // messageID -> delta-accumulated answer text so far
 	textStart        map[string]int64    // messageID -> stream start (ms; Msg.At for every update of the bubble)
+	textSess         map[string]string   // messageID -> owning sessionID (primary vs concierge routing)
+	// conciergeID — the office concierge's session id, set by the live
+	// backend's registerConcierge ("" until the first SendConcierge creates
+	// the session lazily). The concierge is a PSEUDO-DESK: it sits in
+	// employees (named "concierge") so actorFor attributes its tool parts
+	// and its CHILDREN hire via the normal parentID chain, but it is never
+	// EvHire'd, never gets a board task, and its chat lane is EvChatOffice
+	// (Msg From/Kind "office") — never EvChatBoss (see mapTextDelta and
+	// the backend's maybeOfficeCompleted).
+	conciergeID string
 }
 
 // thoughtCapRunes bounds a thought transcript. Raised from the old 400 (a
@@ -213,7 +223,7 @@ func newNormCtx(cfg *config.Config) *normCtx {
 		cfg = config.Default()
 	}
 	return &normCtx{
-		cfg: cfg,
+		cfg:              cfg,
 		employees:        make(map[string]state.Employee),
 		tasks:            make(map[string]state.BoardTask),
 		nameCounts:       make(map[state.EmployeeRole]int),
@@ -230,7 +240,32 @@ func newNormCtx(cfg *config.Config) *normCtx {
 		textPartMsg:      make(map[string]string),
 		textAccum:        make(map[string]string),
 		textStart:        make(map[string]int64),
+		textSess:         make(map[string]string),
 	}
+}
+
+// registerConcierge pins the office concierge session as a pseudo-desk. No
+// hire/dispatch event is ever emitted for it (the floor keeps ONE boss), but
+// the employees row makes actorFor attribute its tool parts as "concierge"
+// inline office lines, and its session becomes a second dispatch root:
+// children (parentID == conciergeID) hire exactly like primary's children.
+func (ctx *normCtx) registerConcierge(sessionID string) {
+	ctx.conciergeID = sessionID
+	ctx.employees[sessionID] = state.Employee{
+		ID: sessionID, Name: "concierge", Role: state.RoleDeveloper,
+		Seat: "concierge", Sprite: state.SpriteAtDesk,
+	}
+}
+
+// dismissConcierge un-seats the pseudo-desk (ResetPrimary/NewOffice respawn):
+// the old session simply stops being the concierge server-side — it is never
+// deleted (mirrors the primary's respawn semantics); the next SendConcierge
+// lazily registers a fresh one.
+func (ctx *normCtx) dismissConcierge() {
+	if ctx.conciergeID != "" {
+		delete(ctx.employees, ctx.conciergeID)
+	}
+	ctx.conciergeID = ""
 }
 
 // Greek-desk naming per role (state canon). brain.json
@@ -366,6 +401,13 @@ func capThought(text string) string {
 // Any deltas that arrived before this classification (deltaBuffer) seed the
 // accumulator. On completion the accumulator is freed.
 func mapReasoningPart(part ocPart, ctx *normCtx, primaryID string) []state.Event {
+	// The concierge's reasoning is suppressed (noise): the office lane shows
+	// its answers and tool runs, not its chain of thought. NOT registering
+	// the part also keeps it out of reasoningParts, so its deltas fall into
+	// the (capped) buffer without ever surfacing a thought.
+	if part.SessionID == ctx.conciergeID {
+		return nil
+	}
 	text := capThought(part.Text)
 	done := part.Time.End != 0
 	if !ctx.reasoningParts[part.ID] {
@@ -420,6 +462,12 @@ func mapReasoningDelta(d ocPartDelta, ctx *normCtx, primaryID string) []state.Ev
 	if d.PartID == "" || d.Field != "text" || d.Delta == "" {
 		return nil
 	}
+	// Concierge reasoning deltas never surface (thought suppression): no
+	// thought, and no buffering either (nothing on the concierge session
+	// will ever classify its reasoning parts).
+	if d.SessionID == ctx.conciergeID {
+		return nil
+	}
 	if !ctx.reasoningParts[d.PartID] {
 		buffered := ctx.deltaBuffer[d.PartID] + d.Delta
 		if len([]rune(buffered)) <= thoughtCapRunes {
@@ -445,14 +493,16 @@ func mapReasoningDelta(d ocPartDelta, ctx *normCtx, primaryID string) []state.Ev
 
 // ---------------- boss text streaming (final-answer deltas) ----------------
 
-// mapTextPart registers a STREAMING text part of the PRIMARY session
-// (message.part.updated, part.type=="text", time.end==0): the boss's
-// final-answer channel opens. Only the primary registers — children keep
-// their part.updated text frames on the throttled-working path. Any deltas
-// that arrived before classification (deltaBuffer) seed the accumulator.
-// Emits nothing itself; the EvChatBoss stream rides the delta frames.
-// A completed part frame (time.end!=0) just unregisters — the pinned text
-// is emitted by the message.updated completion pin, never from here.
+// mapTextPart registers a STREAMING text part of the PRIMARY or CONCIERGE
+// session (message.part.updated, part.type=="text", time.end==0): the
+// final-answer channel opens (boss bubble / office bubble, keyed by the
+// part's session — see mapTextDelta). Only those two register — children
+// keep their part.updated text frames on the throttled-working path. Any
+// deltas that arrived before classification (deltaBuffer) seed the
+// accumulator. Emits nothing itself; the EvChatBoss/EvChatOffice stream
+// rides the delta frames. A completed part frame (time.end!=0) just
+// unregisters — the pinned text is emitted by the message.updated
+// completion pin, never from here.
 func mapTextPart(part ocPart, ctx *normCtx, now int64) []state.Event {
 	if part.Time.End != 0 {
 		delete(ctx.textParts, part.ID)
@@ -465,6 +515,7 @@ func mapTextPart(part ocPart, ctx *normCtx, now int64) []state.Event {
 	if !ctx.textParts[part.ID] {
 		ctx.textParts[part.ID] = true
 		ctx.textPartMsg[part.ID] = part.MessageID
+		ctx.textSess[part.MessageID] = part.SessionID
 		if ctx.textStart[part.MessageID] == 0 {
 			start := part.Time.Start
 			if start == 0 {
@@ -481,10 +532,14 @@ func mapTextPart(part ocPart, ctx *normCtx, now int64) []state.Event {
 }
 
 // mapTextDelta turns one message.part.delta frame on a registered text part
-// into a GROWING EvChatBoss: same Msg.ID ("bossmsg-"+messageID) as the
-// eventual completion bubble, Pending:true, accumulated-so-far text. One
-// bubble identity spans stream + completion; the UI replaces in place.
-// Emission rate is coalesced by the backend (chatSlots gate, 150ms).
+// into a GROWING boss/office bubble: the SAME identity the eventual
+// completion pin reuses, Pending:true, accumulated-so-far text. One bubble
+// identity spans stream + completion; the UI replaces in place. A concierge
+// session's stream takes the office lane — EvChatOffice, Msg.ID
+// "office-"+messageID, From/Kind "office" — so exactly one of
+// EvChatOffice/EvChatBoss ever fires per message (the identity prefix is
+// disjoint). Emission rate is coalesced by the backend (chatSlots gate,
+// 150ms).
 func mapTextDelta(d ocPartDelta, ctx *normCtx) []state.Event {
 	if d.PartID == "" || d.Field != "text" || d.Delta == "" {
 		return nil
@@ -499,10 +554,24 @@ func mapTextDelta(d ocPartDelta, ctx *normCtx) []state.Event {
 		msgID = d.MessageID
 		ctx.textParts[d.PartID] = true
 		ctx.textPartMsg[d.PartID] = msgID
+		ctx.textSess[d.MessageID] = d.SessionID
 	}
 	accumulated := capBossText(ctx.textAccum[msgID] + d.Delta)
 	ctx.textAccum[msgID] = accumulated
 	at := ctx.textStart[msgID]
+	if ctx.conciergeID != "" && d.SessionID == ctx.conciergeID {
+		return []state.Event{{
+			Kind: state.EvChatOffice,
+			Msg: state.ChatMsg{
+				ID:      "office-" + msgID,
+				From:    "office",
+				Kind:    "office",
+				Text:    accumulated,
+				At:      at,
+				Pending: true,
+			},
+		}}
+	}
 	return []state.Event{{
 		Kind: state.EvChatBoss,
 		Msg: state.ChatMsg{
@@ -523,11 +592,13 @@ func capBossText(text string) string {
 	return sliceMax(text, bossTextCapRunes)
 }
 
-// interruptedStreamEvents flushes every open boss text stream as a final
+// interruptedStreamEvents flushes every open text stream as a final
 // Pending=false bubble carrying the accumulated text plus an interruption
-// note (abort/error/stop), then frees ALL stream state. Only the primary
-// session ever registers text streams, so every open stream belongs to the
-// interrupted run. Deltas that stream cleanly into a completion are
+// note (abort/error/stop), then frees ALL stream state. Only the primary and
+// concierge sessions ever register text streams; each message's owning
+// session (textSess) decides the lane — a concierge stream flushes as
+// EvChatOffice ("office-"+messageID), a boss stream as EvChatBoss
+// ("bossmsg-"+messageID). Deltas that stream cleanly into a completion are
 // unaffected: their state was already freed by unregisterTextStream.
 func interruptedStreamEvents(ctx *normCtx, note string) []state.Event {
 	var ids []string
@@ -539,6 +610,17 @@ func interruptedStreamEvents(ctx *normCtx, note string) []state.Event {
 	sort.Strings(ids) // deterministic emit order
 	var evs []state.Event
 	for _, msgID := range ids {
+		if ctx.conciergeID != "" && ctx.textSess[msgID] == ctx.conciergeID {
+			evs = append(evs, state.Event{Kind: state.EvChatOffice, Msg: state.ChatMsg{
+				ID:      "office-" + msgID,
+				From:    "office",
+				Kind:    "office",
+				Text:    ctx.textAccum[msgID] + "\n" + note,
+				At:      ctx.textStart[msgID],
+				Pending: false,
+			}})
+			continue
+		}
 		evs = append(evs, state.Event{Kind: state.EvChatBoss, Msg: state.ChatMsg{
 			ID:      "bossmsg-" + msgID,
 			From:    "boss",
@@ -560,12 +642,17 @@ func interruptedStreamEvents(ctx *normCtx, note string) []state.Event {
 	for msgID := range ctx.textStart {
 		delete(ctx.textStart, msgID)
 	}
+	for msgID := range ctx.textSess {
+		delete(ctx.textSess, msgID)
+	}
 	return evs
 }
 
 // unregisterTextStream stops the delta stream for one message (completion
-// pin): its parts go, the accumulator and start stamp are freed. The pinned
-// completion bubble text supersedes whatever the deltas accumulated.
+// pin): its parts go, the accumulator, start stamp and session tag are
+// freed. The pinned completion bubble text supersedes whatever the deltas
+// accumulated. Works identically for boss and concierge messages (the pin
+// paths re-request each lane by ID prefix).
 func unregisterTextStream(ctx *normCtx, messageID string) {
 	for partID, msgID := range ctx.textPartMsg {
 		if msgID == messageID {
@@ -575,6 +662,7 @@ func unregisterTextStream(ctx *normCtx, messageID string) {
 	}
 	delete(ctx.textAccum, messageID)
 	delete(ctx.textStart, messageID)
+	delete(ctx.textSess, messageID)
 }
 
 // mapToolPart surfaces a ToolPart (read/grep/glob/bash/write/edit/task/...)
@@ -903,6 +991,17 @@ func diffEvent(sessionID, empID, empName string, d ocSnapshotFileDiff, ctx *norm
 //	message.updated (primary, completed)   -> [] here (backend fetches -> chat-boss)
 //	session.error (primary)                -> chat-boss error line
 //	anything else                          -> []
+//
+// Office concierge additions (EvChatOffice lane; "office-"+messageID ids).
+// The concierge is a second dispatch root, NEVER a second boss:
+//
+//	session.created (parentID = concierge)   -> hire + dispatch (same shape
+//		as the primary's children)
+//	message.part.updated (text, concierge, streaming) -> register office stream
+//	message.part.delta (text part, concierge)  -> chat-office, growing bubble
+//	message.part.updated (reasoning, concierge) -> [] (thought suppressed as noise)
+//	message.updated (concierge, completed)   -> [] here (backend fetches -> chat-office)
+//	session.error (concierge)                -> chat-office error line
 func mapOCEvent(raw ocSSEEvent, ctx *normCtx, primaryID string, now int64) []state.Event {
 	switch raw.Type {
 	case "session.created":
@@ -913,7 +1012,12 @@ func mapOCEvent(raw ocSSEEvent, ctx *normCtx, primaryID string, now int64) []sta
 			return nil
 		}
 		info := p.Info
-		if info.ParentID != primaryID {
+		// Two dispatch roots: the primary ("boss") and the office concierge
+		// (ctx.conciergeID, "" until first use). Either root's children
+		// hire via the identical shape; the concierge session itself is a
+		// root session, so its own creation never lands here (and even the
+		// registration carries no hire event — see registerConcierge).
+		if info.ParentID != primaryID && (ctx.conciergeID == "" || info.ParentID != ctx.conciergeID) {
 			return nil
 		}
 		if _, ok := ctx.employees[info.ID]; ok {
@@ -961,9 +1065,12 @@ func mapOCEvent(raw ocSSEEvent, ctx *normCtx, primaryID string, now int64) []sta
 			return mapReasoningPart(part, ctx, primaryID)
 		case "text":
 			// The boss's final answer streams too — register the part so
-			// its deltas grow the "bossmsg-"+messageID chat bubble.
-			// Children stay on the old working-pulse path below.
-			if part.SessionID == primaryID {
+			// its deltas grow the "bossmsg-"+messageID chat bubble;
+			// the CONCIERGE's final answer registers identically, its
+			// deltas growing the EvChatOffice "office-"+messageID bubble
+			// instead (mapTextDelta keys the lane by session). Children
+			// stay on the old working-pulse path below.
+			if part.SessionID == primaryID || part.SessionID == ctx.conciergeID {
 				return mapTextPart(part, ctx, now)
 			}
 		case "tool":
@@ -1076,7 +1183,28 @@ func mapOCEvent(raw ocSSEEvent, ctx *normCtx, primaryID string, now int64) []sta
 			return nil
 		}
 		if p.SessionID != primaryID {
-			return nil
+			// The concierge lane: a concierge session error flushes its open
+			// office streams and surfaces an office error line (never
+			// EvChatBoss — one lane per session).
+			if ctx.conciergeID == "" || p.SessionID != ctx.conciergeID {
+				return nil
+			}
+			message := "unknown error"
+			if p.Error != nil && p.Error.Data.Message != "" {
+				message = p.Error.Data.Message
+			}
+			evs := interruptedStreamEvents(ctx, "[grafeio] stream interrupted")
+			return append(evs, state.Event{
+				Kind: state.EvChatOffice,
+				Msg: state.ChatMsg{
+					ID:      "office-error-" + itoa64(now),
+					From:    "office",
+					Kind:    "office",
+					Text:    "[grafeio] office error: " + shortTitle(message, 120),
+					At:      now,
+					Pending: false,
+				},
+			})
 		}
 		message := "unknown error"
 		if p.Error != nil && p.Error.Data.Message != "" {

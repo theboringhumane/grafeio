@@ -24,8 +24,12 @@
 //		            auto-collapsing to "<agent> · <task> (· N tool calls ✓
 //		            done)" on EvReturned or 120 ticks of quiet, with ctrl+g
 //		            expanding/collapsing all completed threads;
-//		            From "office" entries render as dim local notices (red when
-//		            Meta == "error").
+//		            Kind "office" entries (the concierge's EvChatOffice seam)
+//		            render as INFO-cyan "office ›" markdown bubbles — a real
+//		            turn, streamed replace-by-ID like the boss, with a dim
+//		            "office is answering…" placeholder while pending-empty;
+//		            From "office" entries with no Kind render as dim local
+//		            notices (red when Meta == "error").
 //		divider
 //		spinner   — the typing row, shown for the WHOLE pending period:
 //		            while ANY boss reply is outstanding (" <boss> is
@@ -85,8 +89,9 @@ import (
 )
 
 const (
-	userPrefix = "you › "
-	bossPrefix = "boss › "
+	userPrefix   = "you › "
+	bossPrefix   = "boss › "
+	officePrefix = "office › "
 
 	placeholderIdle = "talk to the boss…"
 	placeholderWait = "boss is waiting for your answer…"
@@ -117,6 +122,12 @@ const (
 	diffKind     = "diff"
 	officeFrom   = "office"
 	errMeta      = "error"
+	// officeKind — concierge chat bubbles (the EvChatOffice seam: From
+	// "office" + Kind "office"). A concierge answer is a REAL conversation
+	// turn — INFO-colored "office ›" label over glamour markdown, same
+	// replace-by-ID streaming mechanics as the boss — NOT a dim notice
+	// (notices keep Kind "" and land in renderNotice).
+	officeKind = "office"
 )
 
 // wtoolStaleTicks — a workers thread auto-collapses after this many ticks
@@ -1327,6 +1338,10 @@ func (c *Chat) renderConversation() string {
 			c.renderQuestion(&b, m)
 		case m.Kind == diffKind:
 			c.renderDiff(&b, m)
+		case m.Kind == officeKind:
+			// concierge (EvChatOffice) — a real turn, not a notice: the
+			// INFO "office ›" case above renderNotice's dim-office line
+			c.renderOffice(&b, m)
 		case m.From == officeFrom:
 			c.renderNotice(&b, m)
 		case m.From == "user":
@@ -2074,6 +2089,28 @@ func clipStyled(style lipgloss.Style, s string, w int) string {
 	return style.Render(clipPlain(s, w))
 }
 
+// renderOffice renders one Kind="office" concierge bubble: an INFO-colored
+// (cyan) "office ›" label over glamour-rendered markdown — visually a
+// peer of the boss's yellow turn, but its own voice. A pending entry with
+// no text yet draws the dim "office is answering…" placeholder; a pending
+// entry WITH text streams in place (glamour re-rendered per accumulated
+// delta, the completion pin settling it — the same replace-by-ID contract
+// as the boss stream, and like the boss stream there is NO caret: the
+// agents roster's "answering" word carries the liveness).
+func (c *Chat) renderOffice(b *strings.Builder, m state.ChatMsg) {
+	prefix := chrome.Fg(chrome.Info, officePrefix)
+	indent := strings.Repeat(" ", cellWidth(officePrefix))
+	if m.Pending && m.Text == "" {
+		b.WriteString(prefix)
+		b.WriteString(chrome.DimText.Render("office is answering…"))
+		b.WriteString("\n")
+		return
+	}
+	lines := cleanMarkdown(c.renderMarkdown(m.Text))
+	lines = foldStyledLines(lines, c.mdWidth)
+	writePrefixed(b, prefix, indent, lines)
+}
+
 // renderNotice renders a local From="office" notice (slash-command output):
 // dim by default, red when Meta == "error".
 func (c *Chat) renderNotice(b *strings.Builder, m state.ChatMsg) {
@@ -2086,7 +2123,7 @@ func (c *Chat) renderNotice(b *strings.Builder, m state.ChatMsg) {
 		lines[i] = style.Render(lines[i])
 	}
 	lines = foldStyledLines(lines, c.mdWidth+1)
-	writePrefixed(b, style.Render("office › "), strings.Repeat(" ", cellWidth("office › ")), lines)
+	writePrefixed(b, style.Render(officePrefix), strings.Repeat(" ", cellWidth(officePrefix)), lines)
 }
 
 // renderMarkdown runs a boss turn through glamour with the sidebar wrap and
