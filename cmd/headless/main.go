@@ -5,8 +5,15 @@
 //	                            print startup events for 3s, stop, exit 0
 //	grafeio-headless --live --prompt "text"
 //	                            send the prompt once the primary session is
-//	                            ready, run 14s so thought/tool events + the
-//	                            boss reply stream through, stop, exit 0
+//	                            ready, wait up to 60s for the completed boss
+//	                            reply, stop, exit 0
+//	grafeio-headless --live --prompt "text" --prompt2 "text2"
+//	                            stale-reply repro: send prompt, wait up to 60s
+//	                            for its completed boss text, send prompt2, wait
+//	                            likewise, then assert the two turns' texts are
+//	                            distinct and operation-appropriate. Prints
+//	                            "STALE-REPRO: FIXED" (exit 0) when all checks
+//	                            pass, "STALE-REPRO: BUG" (exit 1) otherwise.
 //	grafeio-headless --answer   after the first permission event prints,
 //	                            call backend.AnswerPermission(pid, "once") and
 //	                            print the result (demo: clears tekton-1's block)
@@ -19,6 +26,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,9 +37,15 @@ import (
 func main() {
 	demo := flag.Bool("demo", true, "run the scripted demo backend (default)")
 	live := flag.Bool("live", false, "spawn a real opencode serve and run live for 3s")
-	prompt := flag.String("prompt", "", "live mode: send this prompt after the primary session is ready and run 14s")
+	prompt := flag.String("prompt", "", "live mode: send this prompt after the primary session is ready and wait up to 60s for the completion")
+	prompt2 := flag.String("prompt2", "", "live mode: after prompt completes, send this second prompt and run the stale-reply assertions (prints STALE-REPRO: FIXED|BUG)")
 	answer := flag.Bool("answer", false, "auto-answer the first permission prompt with \"once\" and print the result")
 	flag.Parse()
+
+	if *prompt2 != "" && *prompt == "" {
+		fmt.Fprintln(os.Stderr, "--prompt2 requires --prompt")
+		os.Exit(2)
+	}
 
 	var b state.Backend
 	var runFor time.Duration
@@ -42,9 +56,6 @@ func main() {
 		}
 		b = backend.NewLive("", dir)
 		runFor = 3 * time.Second
-		if *prompt != "" {
-			runFor = 14 * time.Second
-		}
 	} else if *demo {
 		b = backend.NewDemo()
 		runFor = 7200 * time.Millisecond
@@ -56,6 +67,9 @@ func main() {
 	var mu sync.Mutex
 	ticks := 0
 	var answerPID string // first PENDING permission id seen, under mu
+	// Every completed (non-pending) chat-boss body, in arrival order — the
+	// stale-repro assertions read this; emit feeds bossCh non-blocking.
+	bossCh := make(chan string, 256)
 	// Per-CallID thought counters make a STREAMING thought obvious: the same
 	// CallID reappears with a growing (accum N chars) figure until done=true.
 	thoughtCounts := make(map[string]int)
@@ -86,6 +100,12 @@ func main() {
 			mu.Unlock()
 			return
 		}
+		if e.Kind == state.EvChatBoss && !e.Msg.Pending {
+			select {
+			case bossCh <- e.Msg.Text:
+			default:
+			}
+		}
 		printEvent(e)
 		mu.Unlock()
 		if answerNow {
@@ -109,7 +129,10 @@ func main() {
 	}
 
 	// --prompt: Start only returns after the primary session exists, so the
-	// prompt is safe to send immediately.
+	// prompt is safe to send immediately. With --prompt2 the run is the
+	// stale-reply repro: each turn waits up to 60s for its completed boss
+	// texts (an 800ms drain collects multi-message turns), then the four
+	// assertions decide STALE-REPRO: FIXED vs BUG.
 	if *prompt != "" {
 		if !*live {
 			fmt.Fprintln(os.Stderr, "--prompt requires --live")
@@ -119,14 +142,130 @@ func main() {
 		if err := b.Send(*prompt); err != nil {
 			fail("send", err)
 		}
+		turn1 := collectTurn(bossCh, 60*time.Second)
+		if *prompt2 == "" {
+			time.Sleep(2 * time.Second) // let trailing tool/diff events print
+		} else {
+			fmt.Printf("[prompt2] %q\n", *prompt2)
+			if err := b.Send(*prompt2); err != nil {
+				fail("send2", err)
+			}
+			turn2 := collectTurn(bossCh, 60*time.Second)
+			fmt.Println("[assert] turn1 completed bubbles:")
+			for i, t := range turn1 {
+				fmt.Printf("[assert]   #%d %q\n", i+1, t)
+			}
+			fmt.Println("[assert] turn2 completed bubbles:")
+			for i, t := range turn2 {
+				fmt.Printf("[assert]   #%d %q\n", i+1, t)
+			}
+			failures := staleReproChecks(turn1, turn2)
+			if failures == 0 {
+				fmt.Println("STALE-REPRO: FIXED")
+			} else {
+				fmt.Printf("STALE-REPRO: BUG (%d check(s) failed)\n", failures)
+			}
+			if err := b.Stop(); err != nil {
+				fail("stop", err)
+			}
+			fmt.Println("[done] backend stopped")
+			if failures > 0 {
+				os.Exit(1)
+			}
+			return
+		}
+	} else {
+		time.Sleep(runFor)
 	}
-
-	time.Sleep(runFor)
 
 	if err := b.Stop(); err != nil {
 		fail("stop", err)
 	}
 	fmt.Println("[done] backend stopped")
+}
+
+// collectTurn waits up to timeout for the FIRST completed boss bubble, then
+// keeps draining further completions until one 4s gap passes with no new
+// completion or the overall timeout expires. A turn is routinely
+// multi-message in opencode: the tool-call assistant message completes
+// (emits nothing — finish=="tool-calls") and the real text arrives in a
+// continuation message seconds later, so an 800ms drain is not a turn.
+// Returns every completed body in order; the turn's text is the LAST one.
+func collectTurn(bossCh <-chan string, timeout time.Duration) []string {
+	var texts []string
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for len(texts) == 0 {
+		select {
+		case t := <-bossCh:
+			texts = append(texts, t)
+		case <-deadline.C:
+			return texts
+		}
+	}
+	quiet := time.NewTimer(4 * time.Second)
+	defer quiet.Stop()
+	for {
+		select {
+		case t := <-bossCh:
+			texts = append(texts, t)
+			if !quiet.Stop() {
+				select {
+				case <-quiet.C:
+				default:
+				}
+			}
+			quiet.Reset(4 * time.Second)
+		case <-quiet.C:
+			return texts
+		case <-deadline.C:
+			return texts
+		}
+	}
+}
+
+// staleReproChecks runs the four stale-reply assertions. Returns the number
+// of failed checks (0 == STALE-REPRO: FIXED):
+//  1. both turns produced completions and their final texts DIFFER
+//  2. turn2's FIRST completed bubble is not a repeat of turn1's final text
+//  3. each turn's final text mentions its own operation (loose grep:
+//     create-ish for turn1, delete-ish for turn2)
+//  4. no completed chat-boss body is byte-identical to an earlier one
+func staleReproChecks(turn1, turn2 []string) int {
+	failures := 0
+	check := func(ok bool, label string) {
+		if ok {
+			fmt.Printf("[assert] PASS %s\n", label)
+		} else {
+			failures++
+			fmt.Printf("[assert] FAIL %s\n", label)
+		}
+	}
+	check(len(turn1) > 0 && len(turn2) > 0, "both turns produced a completed boss bubble")
+	if len(turn1) == 0 || len(turn2) == 0 {
+		return failures
+	}
+	t1final := turn1[len(turn1)-1]
+	t2first := turn2[0]
+	t2final := turn2[len(turn2)-1]
+	check(t1final != t2final, "(1) the two turns' final texts differ")
+	check(t2first != t1final, "(2) turn2's first bubble does not repeat turn1's text")
+	t1l := strings.ToLower(t1final)
+	t2l := strings.ToLower(t2final)
+	check(strings.Contains(t1l, "alpha") || strings.Contains(t1l, "creat"),
+		"(3a) turn1 mentions its own operation (create-ish)")
+	check(strings.Contains(t2l, "delet") || strings.Contains(t2l, "remov"),
+		"(3b) turn2 mentions its own operation (delete-ish)")
+	seen := make(map[string]bool)
+	dups := false
+	for _, t := range append(append([]string(nil), turn1...), turn2...) {
+		if seen[t] {
+			dups = true
+		}
+		seen[t] = true
+	}
+	check(!dups, "(4) no chat-boss body is byte-identical to an earlier one")
+	return failures
 }
 
 func fail(stage string, err error) {

@@ -12,15 +12,17 @@
 //   - subscribe to the SSE event stream (GET /event) and normalize via
 //     events.go (pure), plus the mapping branches that need I/O:
 //     child-idle -> returned+mail+task-done (+best-effort child delete 10s
-//     later), primary-assistant-completed -> chat-boss on the pending id.
+//     later), primary-assistant-completed -> chat-boss pinned to the
+//     completing message's own text.
 //   - sync board + mail from agentmemory every 5s when the probe found it.
 //
 // Chat path: Send drives the same emit callback Start received, so the
 // user message and the pending boss bubble hit state immediately; the
 // prompt POST returns at once and the SSE stream drives the completion.
-// Pending bubbles are a FIFO of ids (boss-N); a completion shifts the
-// oldest id and re-emits it with the real text (same-id swap protocol —
-// the reducer replaces the bubble with the matching id).
+// Pending bubbles are queued (FIFO id boss-N); a completion drains one and
+// emits a "bossmsg-"+<messageID> bubble — the reducer strips the pending
+// placeholder on any EvChatBoss, so the first completed bubble after a
+// Send replaces it and later completions (multi-message turns) append.
 //
 // Note: unlike the demo backend, this backend never emits EvTick — the app
 // owns the animation timer for live mode.
@@ -152,10 +154,11 @@ func (b *liveBackend) Start(emit func(state.Event)) error {
 // ---------------------------------------------------------------- send
 
 // Send pushes user chat to the boss: echo chat-user, stage ONE pending
-// boss bubble (FIFO id boss-N), POST the prompt async. The completion
-// arrives over SSE and re-emits the SAME bubble id with the real text —
-// the swap protocol the reducer relies on. A prompt error also re-emits
-// the same id, with the failure note instead.
+// boss bubble (FIFO id boss-N), POST the prompt async. Completed assistant
+// messages arrive over SSE and emit their own pinned "bossmsg-"+<messageID>
+// bubbles; the FIRST of them strips the pending placeholder (the reducer
+// drops pending bubbles on any EvChatBoss), later ones append. A prompt
+// error re-emits the SAME pending id with the failure note instead.
 func (b *liveBackend) Send(text string) error {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" || b.fl.isStopped() {
@@ -528,6 +531,34 @@ func (b *liveBackend) latestAssistantText(sessionID string) string {
 	return ""
 }
 
+// messageText fetches ONLY the completing message's own parts
+// (GET /session/{id}/message/{messageID} — /doc operationId
+// "session.message") and joins its text parts. The completion is pinned to
+// the message ID that fired message.updated — no session-latest fallback:
+// on a reused session the newest assistant text can be a PREVIOUS turn's
+// (or previous day's) reply, which is exactly the stale-bubble bug. The
+// returned finish stamp ("stop", "tool-calls", ...) lets the caller tell a
+// mid-turn tool-call message (legitimately no text) from a real empty end.
+func (b *liveBackend) messageText(sessionID, messageID string) (text string, finish string, err error) {
+	var row struct {
+		Info  ocMessage `json:"info"`
+		Parts []ocPart  `json:"parts"`
+	}
+	if err := b.doJSON(http.MethodGet, "/session/"+sessionID+"/message/"+messageID, nil, &row); err != nil {
+		return "", "", err
+	}
+	var parts []string
+	for _, part := range row.Parts {
+		if part.Type != "text" {
+			continue
+		}
+		if t := strings.TrimSpace(part.Text); t != "" {
+			parts = append(parts, t)
+		}
+	}
+	return strings.Join(parts, "\n\n"), row.Info.Finish, nil
+}
+
 // deleteChild best-effort deletes a returned child session; success fires
 // the employee unless session.deleted already did.
 func (b *liveBackend) deleteChild(sessionID string) {
@@ -832,8 +863,24 @@ func (b *liveBackend) maybeChildReturned(sessionID string) {
 	b.fl.at(10*time.Second, func() { b.deleteChild(sessionID) })
 }
 
-// maybeBossCompleted: boss replied — swap the oldest pending bubble for
-// the real reply text on the SAME id.
+// maybeBossCompleted: boss replied — emit a chat-boss bubble pinned to the
+// COMPLETING message's own text.
+//
+// Identity + dedupe: bubble ID is "bossmsg-"+<messageID> (deterministic);
+// bossCompleted remembers every completion seen, so a repeated
+// message.updated for the same ID is swallowed before any re-emit (the
+// reducer would otherwise append a second copy). Pending placeholders keep
+// their swap semantics: any EvChatBoss strips the pending bubble, so the
+// first completed bubble after a Send replaces it and later completions of
+// the same turn append as their own distinct bubbles.
+//
+// Text selection: ONLY the completing message's own text parts
+// (messageText), NEVER the session-latest assistant text — on a reused
+// session the newest text-bearing assistant message can be an older turn's
+// reply, which was the stale-repeat bug. A fetch failure, or an empty
+// final message, emits the dim error line instead; a message that finished
+// with "tool-calls" is mid-turn protocol (its text rides the NEXT
+// assistant message) and legitimately emits nothing.
 func (b *liveBackend) maybeBossCompleted(info ocMessage) {
 	b.mu.Lock()
 	if info.SessionID != b.primaryID || info.Role != "assistant" || info.Time.Completed == 0 || b.bossCompleted[info.ID] {
@@ -844,26 +891,26 @@ func (b *liveBackend) maybeBossCompleted(info ocMessage) {
 	primaryID := b.primaryID
 	b.mu.Unlock()
 
-	text := b.latestAssistantText(primaryID)
-	if text == "" {
-		text = "(the boss sent an empty reply)"
+	text, finish, err := b.messageText(primaryID, info.ID)
+	if err != nil {
+		text = "[grafeio] could not read reply (msg " + info.ID + ")"
+	} else if text == "" {
+		if finish == "tool-calls" {
+			return // mid-turn message; the text rides the continuation message
+		}
+		text = "[grafeio] could not read reply (msg " + info.ID + ")"
 	}
 	// Boss edits surface as diff events on message completion.
 	b.fetchDiffAndEmit(primaryID)
 
 	b.mu.Lock()
-	var id string
 	if len(b.pendingBoss) > 0 {
-		id = b.pendingBoss[0]
 		b.pendingBoss = b.pendingBoss[1:]
-	} else {
-		b.chatSeq++
-		id = "boss-" + itoa(b.chatSeq)
 	}
 	b.mu.Unlock()
 
 	b.fl.emit(state.Event{Kind: state.EvChatBoss, Msg: state.ChatMsg{
-		ID: id, From: "boss", Text: text, At: nowMs(), Pending: false,
+		ID: "bossmsg-" + info.ID, From: "boss", Text: text, At: nowMs(), Pending: false,
 	}})
 }
 

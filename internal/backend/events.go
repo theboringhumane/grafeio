@@ -31,7 +31,11 @@ type ocMessage struct {
 	ID        string `json:"id"`
 	SessionID string `json:"sessionID"`
 	Role      string `json:"role"`
-	Time      struct {
+	// Finish is the AssistantMessage stop-reason ("stop", "tool-calls", …);
+	// a completion with finish=="tool-calls" is MID-turn: the message ends
+	// at the tool call and its final text rides the next assistant message.
+	Finish string `json:"finish"`
+	Time   struct {
 		Created   int64 `json:"created"`
 		Completed int64 `json:"completed"`
 	} `json:"time"`
