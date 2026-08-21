@@ -89,7 +89,7 @@ Layout lives in the config *and* in the app:
 ```text
 /compact on|off     narrow sidebar (30) + short tab letters + 2-row input
 /mode normal|compact   same, persisted to brain.json
-/wide <n>           sidebar width 26..60 (0 = default 44), persisted
+/wide <n>           sidebar width 26..80 (0 = default 68), persisted
 /zen                fullscreen floor, minimal chrome — any key exits
 ```
 

@@ -5,7 +5,7 @@
 // Layout: topbar (1) | middle (floor left flex | right sidebar) | statusbar (1).
 // The sidebar holds six tabs — chat | terminal | agents | board | mail |
 // activity — and its width is configurable (brain.json ui.sidebarWidth,
-// 26..60 clamp, 0 = default 44; /compact mode narrows it to 30). /zen is a
+// 26..80 clamp, 0 = default 68; /compact mode narrows it to 30). /zen is a
 // transient fullscreen-floor mode (sidebar hidden, any key exits).
 // Events arrive as state.Event tea.Msgs (backend goroutine → tea.Program.Send);
 // the animation tick is a re-arming tea.Tick loop governed by the brain.json
@@ -38,13 +38,13 @@ const (
 	toolCap      = 20  // tool one-liners kept in chat
 	bubbleCap    = 3   // never more than 3 concurrent balloons (drop oldest)
 
-	// Sidebar sizing: the default is 44 cols; brain.json ui.sidebarWidth is
-	// clamped to 26..60 (explicit config wins over /compact); the compact
+	// Sidebar sizing: the default is 68 cols; brain.json ui.sidebarWidth is
+	// clamped to 26..80 (explicit config wins over /compact); the compact
 	// layout mode (/compact, ui.compact) narrows the default to 30.
-	defaultSidebarW = 44
+	defaultSidebarW = 68
 	compactSidebarW = 30
 	sidebarMin      = 26
-	sidebarMax      = 60
+	sidebarMax      = 80
 
 	degradeCols  = 100 // below this, the sidebar shrinks instead of the floor
 	minCols      = 40
@@ -1126,8 +1126,8 @@ func (m *Model) applyLayout() {
 }
 
 // sidebarBase — the configured sidebar width before the narrow-terminal
-// degrade: ui.sidebarWidth clamped to 26..60 wins outright; else the
-// compact layout takes 30; else the 44-col default.
+// degrade: ui.sidebarWidth clamped to 26..80 wins outright; else the
+// compact layout takes 30; else the 68-col default.
 func (m Model) sidebarBase() int {
 	if n := m.cfg.UI.SidebarWidth; n != 0 {
 		if n < sidebarMin {
@@ -1628,7 +1628,7 @@ const slashHelp = `commands:
   /diffs on|off      expand/collapse file diffs (ctrl+d toggles)
   /compact on|off    compact layout this session (narrow sidebar, short tabs)
   /mode normal|compact  layout mode (persists)
-  /wide <n>          sidebar width 26..60 (0 = default 44, persists)
+  /wide <n>          sidebar width 26..80 (0 = default 68, persists)
   /zen               fullscreen floor, any key exits (transient)
   /focus floor       alias of /zen
   /queue             show the backlog (numbered items batched on flush)
@@ -1745,7 +1745,7 @@ func (m *Model) applySlash(input string) tea.Cmd {
 		}
 		n, err := strconv.Atoi(fields[1])
 		if err != nil {
-			m.noticeErr(fmt.Sprintf("/wide: %q is not a number (26..60, 0 = default)", fields[1]))
+			m.noticeErr(fmt.Sprintf("/wide: %q is not a number (26..80, 0 = default)", fields[1]))
 			return nil
 		}
 		if n < 0 {
