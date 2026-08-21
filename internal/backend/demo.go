@@ -447,6 +447,20 @@ func (b *demoBackend) RejectQuestion(requestID string) error {
 	return nil
 }
 
+// ---------------------------------------------------------------- abort (/stop)
+
+// AbortSessions is the demo twin of the live /stop seam: the scripted day
+// runs on timers, not LLM turns, so there is nothing to cancel server-side
+// — the demo proves the contract with its status line. NOT part of
+// state.Backend: the app type-asserts state.SessionAborter.
+func (b *demoBackend) AbortSessions() error {
+	if b.fl.isStopped() {
+		return errors.New("backend stopped")
+	}
+	b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[demo] abort ok"})
+	return nil
+}
+
 // ---------------------------------------------------------------- queue board + respawn
 
 // QueueItemStart is the demo twin of the live board seam: no agentmemory,

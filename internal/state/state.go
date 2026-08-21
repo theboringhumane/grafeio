@@ -278,3 +278,22 @@ type Backend interface {
 	RejectQuestion(requestID string) error
 	Stop() error
 }
+
+// SessionAborter — the /stop seam (ADDITIVE; deliberately NOT folded into
+// Backend, same convention as the attachment/team/office-session seams —
+// see internal/app sessions.go "backend seams (additive; type-asserted,
+// never added to state.Backend)": harness stubs stay untouched). Backends
+// that can cancel in-flight LLM turns implement it; the app type-asserts
+// it when wiring /stop.
+//
+// AbortSessions cancels the primary ("boss") turn AND every live child
+// session's turn — an opencode abort only ends its own session's run, so
+// sub-agent work the boss fanned out must be called out session by
+// session. Per-session failures are non-fatal: collected into the returned
+// error (errors.Join), the sessions that DID abort still stop. The boss's
+// outstanding typing placeholder closes with a stopped marker so the UI
+// never shows a frozen "typing…" bubble for a dead turn (live backend),
+// and the demo backend emits "[demo] abort ok".
+type SessionAborter interface {
+	AbortSessions() error
+}

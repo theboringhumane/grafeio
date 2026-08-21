@@ -51,11 +51,14 @@ const (
 	minCols     = 40
 	minRows     = 12
 
-	// Message queue — the INTELLIGENT BACKLOG: Enter while a boss reply is
-	// pending enqueues a numbered item; the turn-complete flush sends the
-	// whole backlog as ONE composed [BATCH DISPATCH] prompt (the boss runs
-	// manager dispatch discipline over it — trivial inline, parallel
-	// sub-agents for the rest). Exactly 1 item keeps the plain FIFO send.
+	// Message queue — the INTELLIGENT BACKLOG: Enter while the turn is
+	// ROADBLOCKED (an open permission modal, or a question hold outstanding)
+	// enqueues a numbered item; the turn-complete flush sends the whole
+	// backlog as ONE composed [BATCH DISPATCH] prompt (the boss runs manager
+	// dispatch discipline over it — trivial inline, parallel sub-agents for
+	// the rest). Exactly 1 item keeps the plain FIFO send. A plain busy turn
+	// (boss typing, no roadblock) does NOT enqueue — free-queuing sends such
+	// prompts straight to the backend, which queues them server-side.
 	queueCap = 10
 
 	// batchTitleClip — the QueueItemStart board title is the first 60 chars
@@ -248,6 +251,18 @@ type Model struct {
 	batchSentAt    time.Time
 	respawns       int
 
+	// Free-queuing tally (the anti-stuck flow): a prompt typed while the
+	// boss is busy goes STRAIGHT to the backend (the serve queues it
+	// server-side, draining after the current turn) — no client queue. The
+	// model only COUNTS those in-flight sends so the UI keeps talking:
+	// serverQueued is the running tally for THIS busy turn (drives the
+	// "busy · N queued (server)" status line and, from the second send on,
+	// the chat placeholder's "boss: turn N · your message rides next");
+	// busySaved/busyStatus own the status-line swap+restore.
+	serverQueued int
+	busySaved    string // StatusLine saved when the busy compose first painted
+	busyStatus   bool   // the busy compose owns StatusLine right now
+
 	// Permission prompts (boss/primary session only): perm is the OPEN
 	// prompt replacing the textarea; permEscd is the latest esc'd-but-
 	// unanswered prompt /perm can re-open.
@@ -305,6 +320,12 @@ type questionHold struct {
 // chatSentMsg fires after backend.Send succeeds — the local user bubble and
 // the typing placeholder are appended through the normal reducer path.
 type chatSentMsg struct{ text string }
+
+// busySentMsg fires after a FREE-SEND resolves — a prompt that went
+// straight to the backend while the boss was mid-turn (the serve queues it
+// natively, draining after the current turn). The model tallies it for the
+// busy-status compose.
+type busySentMsg struct{ text string }
 
 // chatNoticeMsg is the chat panel's office-notice seam (attachment events:
 // cap eviction, backspace removal, image-paste platform gaps).
@@ -425,6 +446,23 @@ func New(b state.Backend, cfg *config.Config) Model {
 	// copy in Update stays the single writer.
 	chat.SetEnqueue(func(text string, atts []state.Attachment) tea.Cmd {
 		return func() tea.Msg { return enqueueMsg{text: text, atts: atts} }
+	})
+	// Free-queuing seam: while a boss reply is pending (busy, NOT
+	// roadblocked) the panel routes Enter here instead of the client queue —
+	// the prompt goes STRAIGHT to the backend, which queues it server-side
+	// and drains it after the current turn. Failure handling + attachment
+	// cleanup mirror the plain send path.
+	chat.SetBusySend(func(text string, atts []state.Attachment) tea.Cmd {
+		return func() tea.Msg {
+			if b != nil {
+				if err := sendChat(b, text, atts); err != nil {
+					cleanupAttachments(atts) // nobody will retry this prompt
+					return sendErrMsg{err: err}
+				}
+				cleanupAttachments(atts)
+			}
+			return busySentMsg{text: text}
+		}
 	})
 	// Attachment notices (cap eviction, chip removal, image-paste platform
 	// gaps) surface as office chat notices like every other local outcome.
@@ -563,6 +601,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// nothing local: backend.Send owns the echo (chat-user + pending boss
 		// bubble) via the event stream — applying them here duplicated the bubbles.
 		m.playSound("send")
+	case busySentMsg:
+		// free-queuing: straight to the server mid-turn — tally it so the
+		// status compose + placeholder turn count keep the UI alive (the
+		// client queue stays untouched).
+		m.playSound("send")
+		m.serverQueued++
+		if m.chat != nil {
+			m.chat.SetServerTurn(m.serverQueued)
+		}
+		m.applyBusyStatus()
+		qdebugf("free-send: prompt went straight to the server (server-queued #%d this turn)", m.serverQueued)
 	case chatNoticeMsg:
 		// the chat panel's attachment notices join the office notice feed
 		m.notice(msg.text)
@@ -1058,7 +1107,9 @@ func (m *Model) applyEvent(ev state.Event) tea.Cmd {
 	// While a question hold is outstanding the turn is PARKED at the
 	// question reply API — not completed — so the queue must NOT flush.
 	if prevPending && !hasPendingBoss(m.st) && !m.questionParked {
-		// the boss reply landed (or errored out) — turn completed
+		// the boss reply landed (or errored out) — turn completed; close
+		// the free-queuing tally with it
+		m.resetServerTurn()
 		if respawn {
 			// session.error inside the window: fresh session + the SAME
 			// batch, once. The rows stay open for the retry's turn.
@@ -1141,6 +1192,120 @@ func (m *Model) team() (teamBackend, bool) {
 	}
 	tb, ok := m.backend.(teamBackend)
 	return tb, ok
+}
+
+// --- free-queuing status compose -------------------------------------------
+
+// applyBusyStatus paints the free-queuing compose onto the status line
+// ("busy · N queued (server)"), saving the prior line once so the turn
+// completion (or /stop) can restore it.
+func (m *Model) applyBusyStatus() {
+	if m.serverQueued <= 0 {
+		return
+	}
+	if !m.busyStatus {
+		m.busySaved = m.st.StatusLine
+		m.busyStatus = true
+	}
+	m.st.StatusLine = fmt.Sprintf("busy · %d queued (server)", m.serverQueued)
+	m.tabs.SetState(m.st)
+}
+
+// clearBusyStatus restores the pre-busy status line when the busy compose
+// owns it.
+func (m *Model) clearBusyStatus() {
+	if !m.busyStatus {
+		return
+	}
+	m.st.StatusLine = m.busySaved
+	m.busySaved = ""
+	m.busyStatus = false
+}
+
+// resetServerTurn closes the free-queuing tally for the busy turn that just
+// ended (completion / error / /stop): placeholder turn count back to 0, the
+// status compose restored.
+func (m *Model) resetServerTurn() {
+	m.serverQueued = 0
+	m.clearBusyStatus()
+	if m.chat != nil {
+		m.chat.SetServerTurn(0)
+	}
+}
+
+// --- /stop (abort + clean unwind) -------------------------------------------
+
+// stopWork is /stop: abort the primary AND every live child session, then
+// unwind the in-flight UI cleanly. The client queue is NOT touched (queued
+// items send on the next turn), permission/question roadblocks stay put,
+// and the whole thing plays no sound — a stop is not an error.
+func (m *Model) stopWork() {
+	if ab, ok := m.backend.(state.SessionAborter); ok {
+		if err := ab.AbortSessions(); err != nil {
+			m.noticeErr(fmt.Sprintf("/stop: abort failed: %v", err))
+			return
+		}
+	}
+	m.unwindStoppedWork()
+	m.resetServerTurn()
+	m.st.StatusLine = fmt.Sprintf("stopped current work — queue intact (%d items)", len(m.queue))
+	m.tabs.SetState(m.st)
+}
+
+// unwindStoppedWork is the /stop clean unwind (this wave's CX):
+//
+//	(a) every pending boss typing placeholder collapses to a dim
+//	    "stopped by user" line;
+//	(b) a STREAMING boss bubble keeps its text with a " (stopped)"
+//	    appendix;
+//	(c) every still-running tool entry (boss inline or worker-thread)
+//	    swings to "✗ aborted" (dim-red at render);
+//	(d) active worker threads collapse with a "✗ stopped" summary;
+//	(e) BossThinking / BossDelegating clear.
+func (m *Model) unwindStoppedWork() {
+	next := make([]state.ChatMsg, 0, len(m.st.Chat))
+	for _, c := range m.st.Chat {
+		switch {
+		case c.From == "boss" && c.Pending && strings.HasPrefix(c.ID, "boss-"):
+			// (a) typing placeholder → dim office line
+			next = append(next, state.ChatMsg{
+				ID: c.ID, From: "office", Text: "stopped by user",
+				At: time.Now().UnixMilli(),
+			})
+		case c.From == "boss" && c.Pending:
+			// (b) streaming bubble → text preserved + stopped appendix
+			c.Pending = false
+			c.Text = strings.TrimSuffix(c.Text, " (stopped)") + " (stopped)"
+			next = append(next, c)
+		case c.Kind == "tool" && c.Meta == "running":
+			// (c) boss inline tool: running → aborted
+			c.Meta = "aborted"
+			next = append(next, c)
+		case (c.Kind == "wtool" || c.Kind == "wthink") &&
+			strings.HasPrefix(c.Meta, "running"):
+			// (c) worker-thread tool/think: running → aborted
+			// (Meta carrier: state ␟ tick — keep the tick half)
+			c.Meta = "aborted" + strings.TrimPrefix(c.Meta, "running")
+			next = append(next, c)
+		default:
+			next = append(next, c)
+		}
+	}
+	m.st.Chat = next
+	m.st.BossThinking = false
+	m.st.BossDelegating = false
+	if m.chat != nil {
+		// (d) the roster's busy sprites are the active worker set
+		for _, e := range m.st.Employees {
+			if e.Role == state.RoleManager {
+				continue
+			}
+			switch e.Sprite {
+			case state.SpriteWorking, state.SpriteToManager, state.SpriteMeeting:
+				m.chat.MarkThreadStopped(e.Name)
+			}
+		}
+	}
 }
 
 // composeBatch builds the ONE batch-dispatch prompt the boss session
@@ -1966,6 +2131,7 @@ const slashHelp = `commands:
   /queue             show the backlog (numbered items batched on flush)
   /queue clear       drop all queued backlog items
   /route             force-dispatch the backlog now (bypasses the busy gate)
+  /stop              abort current work (boss + workers); queue sends next turn
   @<file>            attach file (popover picker) · cmd+v pastes images (ctrl+v too)
   /perm              re-open an esc'd permission prompt
   /question          re-open a deferred boss question
@@ -2161,6 +2327,11 @@ func (m *Model) applySlash(input string) tea.Cmd {
 			return nil
 		}
 		return m.dispatchQueued(true)
+	case "/stop":
+		// abort the primary + every live child session, then unwind the
+		// in-flight UI (placeholders collapse, tools ✗ aborted, threads ✗
+		// stopped). The queue is untouched — it sends on the next turn.
+		m.stopWork()
 	case "/perm":
 		if m.permEscd == nil {
 			m.notice("no pending permission (/perm re-opens an esc'd prompt)")

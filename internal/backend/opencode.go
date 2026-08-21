@@ -106,6 +106,15 @@ type liveBackend struct {
 	// field). From then on prompts go out without the override — degrade
 	// open, never fake success.
 	promptModelRejected bool
+	// sseNoteSig is the SSE status-note dedupe latch (D1): the last failure
+	// class reported by pump, "" when the stream is healthy/recovered. See
+	// sseNote/sseRecovered.
+	sseNoteSig string
+	// lastAbortAt stamps the most recent AbortSessions round (ms): an
+	// empty completion landing inside the quiet window after it is the
+	// aborted turn's own death rattle and is swallowed instead of surfacing
+	// as a "could not read reply" line (see maybeBossCompleted).
+	lastAbortAt int64
 }
 
 func newLiveBackend(baseURL, directory string, cfg *config.Config) *liveBackend {
@@ -218,6 +227,15 @@ func (b *liveBackend) Start(emit func(state.Event)) error {
 // Send pushes user chat to the boss. It is the plain-text state.Backend
 // contract; chat-input attachments ride the optional SendWith seam below
 // (the app type-asserts it — see attachmentBackend in internal/app).
+//
+// NO IDLE GATE (D2): Send NEVER holds the message waiting for the boss to
+// be free, and never checks the session's busy state. The prompt POSTs to
+// the serve immediately, every time; opencode serve itself queues a prompt
+// that lands mid-turn behind the running turn and drains it when the turn
+// settles (prompt_async semantics — proven wave-6+: a prompt during a
+// parked question persists server-side). Any client-side "wait for idle"
+// behavior lives in the APP layer (internal/app model.go's queue), NOT
+// here — this backend's Send is always the immediate-send path.
 func (b *liveBackend) Send(text string) error {
 	return b.SendWith(text, nil)
 }
@@ -227,11 +245,13 @@ func (b *liveBackend) Send(text string) error {
 // the chat panel renders the dim " · 📎 N" suffix from it) and the prompt
 // posts one file part per readable attachment (parts.go). Semantics of
 // the plain Send otherwise: echo chat-user, stage ONE pending boss bubble
-// (FIFO id boss-N), POST the prompt async. Completed assistant messages
-// arrive over SSE and emit their own pinned "bossmsg-"+<messageID>
-// bubbles; the FIRST of them strips the pending placeholder (the reducer
-// drops pending bubbles on any EvChatBoss), later ones append. A prompt
-// error re-emits the SAME pending id with the failure note instead.
+// (FIFO id boss-N), POST the prompt async (immediately — there is no
+// busy/idle gate in this backend by design; see Send). Completed assistant
+// messages arrive over SSE and emit their own pinned
+// "bossmsg-"+<messageID> bubbles; the FIRST of them strips the pending
+// placeholder (the reducer drops pending bubbles on any EvChatBoss), later
+// ones append. A prompt error re-emits the SAME pending id with the
+// failure note instead.
 func (b *liveBackend) SendWith(text string, atts []state.Attachment) error {
 	trimmed := strings.TrimSpace(text)
 	if (trimmed == "" && len(atts) == 0) || b.fl.isStopped() {
@@ -896,6 +916,115 @@ func (b *liveBackend) RejectQuestion(requestID string) error {
 	return b.doJSON(http.MethodPost, "/api/session/"+hold.SessionID+"/question/"+requestID+"/reject", nil, nil)
 }
 
+// ---------------------------------------------------------------- abort (/stop)
+
+// AbortSessions is the live /stop contract (state.SessionAborter — the app
+// type-asserts it; deliberately NOT in state.Backend so harness stubs are
+// untouched). It POSTs /session/{id}/abort against the primary session AND
+// every live child session: an opencode abort ends only its own session's
+// run ("stop any ongoing AI processing or command execution", /doc
+// 1.18.19), so sub-agent work the boss fanned out must be called out
+// session by session. Per-session failures are NON-fatal: each failure is
+// noted on the status line, the sessions that DID abort still stop, and
+// the collected errors.Join is the return value.
+//
+// Post-abort tidy: any boss text stream still mid-delta is flushed as a
+// final "[grafeio] stream interrupted" bubble (same shape as Stop's
+// graceful shutdown), and the OLDEST outstanding pending placeholder (the
+// FIFO head — the RUNNING turn's bubble) closes with a "[grafeio] stopped"
+// note so the UI never shows a frozen typing bubble for a dead turn when
+// the serve drops the aborted turn without a completion pin. Placeholders
+// BEHIND the head belong to queued prompts the serve still owns and will
+// run next; they stay pending and complete when the server-side queue
+// drains. lastAbortAt opens a short quiet window so the aborted turn's
+// own empty completion (if the serve emits one) is swallowed instead of
+// printing a "could not read reply" error for a turn the user killed on
+// purpose.
+func (b *liveBackend) AbortSessions() error {
+	if b.fl.isStopped() {
+		return errors.New("backend stopped")
+	}
+	b.mu.Lock()
+	base := b.baseURL
+	primaryID := b.primaryID
+	var ids []string
+	if primaryID != "" {
+		ids = append(ids, primaryID)
+	}
+	for id := range b.ctx.employees {
+		if !b.ctx.fired[id] && !b.ctx.returned[id] {
+			ids = append(ids, id)
+		}
+	}
+	b.mu.Unlock()
+	if base == "" {
+		return errors.New("backend not started")
+	}
+	if len(ids) == 0 {
+		return nil // nothing running; not an error
+	}
+	// Open the quiet window BEFORE the first POST: the serve reports the
+	// abort as session.error "Aborted" on SSE the instant it processes the
+	// request, which races our return path — the latch must already be armed
+	// when that echo lands (see onEvent / maybeBossCompleted).
+	b.mu.Lock()
+	b.lastAbortAt = nowMs()
+	b.mu.Unlock()
+	var errs []error
+	aborted := 0
+	for _, id := range ids {
+		if err := b.abortSession(id); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", id, err))
+			b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] abort failed for session " + id + ": " + shortTitle(err.Error(), 100)})
+			continue
+		}
+		aborted++
+	}
+	b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
+		"[grafeio] turn aborted (%d/%d session(s))", aborted, len(ids))})
+
+	// Flush what the aborted turn leaves behind, then close the running
+	// turn's placeholder: text streams flush interrupted, the FIFO head
+	// gets the stopped marker.
+	b.mu.Lock()
+	streamEvs := interruptedStreamEvents(b.ctx, "[grafeio] stream interrupted")
+	for id := range b.chatSlots {
+		delete(b.chatSlots, id)
+	}
+	var headID string
+	if aborted > 0 && len(b.pendingBoss) > 0 {
+		headID = b.pendingBoss[0]
+		b.pendingBoss = b.pendingBoss[1:]
+	}
+	b.mu.Unlock()
+	for _, e := range streamEvs {
+		b.fl.emit(e)
+	}
+	if headID != "" {
+		b.fl.emit(state.Event{Kind: state.EvChatBoss, Msg: state.ChatMsg{
+			ID:      headID,
+			From:    "boss",
+			Text:    "[grafeio] stopped (turn aborted)",
+			At:      nowMs(),
+			Pending: false,
+		}})
+	}
+	return errors.Join(errs...)
+}
+
+// abortQuietMs is how long after AbortSessions an EMPTY primary completion
+// is treated as the aborted turn's death rattle and swallowed (one
+// completion only — the latch is single-shot in maybeBossCompleted).
+const abortQuietMs = 15000
+
+// abortSession cancels one session's in-flight turn: POST
+// /session/{sessionID}/abort (opencode serve /doc, operationId
+// session.abort, -> 200 "Aborted session"). Errors surface to the caller
+// so the batch can note them per-id without sinking the whole round.
+func (b *liveBackend) abortSession(sessionID string) error {
+	return b.doJSON(http.MethodPost, "/session/"+sessionID+"/abort", nil, nil)
+}
+
 // ---------------------------------------------------------------- diffs
 
 // fetchDiffAndEmit pulls GET /session/{id}/diff on completion paths that may
@@ -1009,33 +1138,114 @@ func (b *liveBackend) deleteChild(sessionID string) {
 
 // ---------------------------------------------------------------- SSE
 
+// sseBackoffSteps is the reconnect ladder after a stream pass ends without
+// delivering a single frame: 1s, then 2s, 5s, 10s, then 30s forever
+// (capped). The FIRST frame read off a stream resets the ladder to 1s —
+// a connection that was healthy earns the fast retry again. This replaces
+// the fixed 1s reconnect that flooded the status line every second while a
+// serve was down (D1).
+var sseBackoffSteps = []time.Duration{
+	1 * time.Second, 2 * time.Second, 5 * time.Second, 10 * time.Second, 30 * time.Second,
+}
+
 // pump owns the SSE connection for the backend's lifetime: connect, scan
-// `data:` frames, dispatch; reconnect with a 1s backoff on EOF/error until
-// Stop cancels the SSE context.
+// `data:` frames, dispatch; reconnect on EOF/error until Stop cancels the
+// SSE context, waiting out the sseBackoffSteps ladder between passes.
+//
+// Status notes are deduped per failure class (sseNote): an outage reports
+// ONCE when it starts, once more only if the failure CLASS changes (e.g.
+// clean close -> HTTP 500), stays silent through every ladder retry, and
+// reports recovery with exactly one "[grafeio] event stream: reconnected"
+// line (sseRecovered, fired by streamOnce's first frame). Never one status
+// line per second while the server is down.
 func (b *liveBackend) pump() {
+	fails := 0 // consecutive passes that delivered no frame
 	for {
 		if b.fl.isStopped() {
 			return
 		}
-		err := b.streamOnce()
+		progressed, err := b.streamOnce()
 		if b.fl.isStopped() {
 			return
 		}
-		if err == nil {
-			b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] event stream closed (board/mail continue; re-attaching)"})
+		if progressed {
+			fails = 0
 		} else {
-			b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] event stream error: " + shortTitle(err.Error(), 100)})
+			fails++
+		}
+		step := fails - 1 // the pass that just ended healthy retries fast
+		if step < 0 {
+			step = 0
+		}
+		if step >= len(sseBackoffSteps) {
+			step = len(sseBackoffSteps) - 1
+		}
+		wait := sseBackoffSteps[step]
+		if err == nil {
+			b.sseNote("closed", "[grafeio] event stream closed (board/mail continue; re-attaching in "+shortDur(wait)+")")
+		} else {
+			b.sseNote(sseErrClass(err), "[grafeio] event stream error: "+shortTitle(err.Error(), 100)+
+				" (re-attaching in "+shortDur(wait)+")")
 		}
 		select {
 		case <-b.fl.done:
 			return
-		case <-time.After(1 * time.Second):
+		case <-time.After(wait):
 		}
 	}
 }
 
-// streamOnce runs one SSE connection to its EOF or error.
-func (b *liveBackend) streamOnce() error {
+// sseNote emits an SSE status note at most ONCE per failure-class change:
+// the same outage retrying through the backoff ladder is silent after its
+// first report. The latch clears on recovery (sseRecovered), so the next
+// outage reports fresh.
+func (b *liveBackend) sseNote(sig, text string) {
+	b.mu.Lock()
+	fresh := sig != b.sseNoteSig
+	if fresh {
+		b.sseNoteSig = sig
+	}
+	b.mu.Unlock()
+	if fresh {
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: text})
+	}
+}
+
+// sseRecovered is streamOnce's first-frame hook: when the stream yields
+// data after a reported outage or close, the ONE recovery line goes out
+// and the dedupe latch clears so a later outage reports fresh.
+func (b *liveBackend) sseRecovered() {
+	b.mu.Lock()
+	had := b.sseNoteSig
+	b.sseNoteSig = ""
+	b.mu.Unlock()
+	if had != "" {
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] event stream: reconnected"})
+	}
+}
+
+// sseErrClass buckets an SSE failure for the dedupe latch: the same outage
+// (a dead serve refusing dials over and over) reads as ONE class no matter
+// how many times the pump retries. Transport trouble collapses to the
+// request op ("request Get") so a changing host:port in the error text
+// can't defeat the latch; HTTP-status and other failures key on their
+// flattened message, which is already class-shaped ("event subscribe: HTTP
+// 500").
+func sseErrClass(err error) string {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		return "request " + uerr.Op
+	}
+	return shortTitle(err.Error(), 80)
+}
+
+// streamOnce runs one SSE connection to its EOF or error. progressed
+// reports whether at least one data frame was read off the stream — the
+// pump uses it to reset the reconnect ladder (a stream that read frames
+// was healthy and earns the fast 1s retry; a pass that failed before its
+// first frame climbs the ladder). The FIRST frame after a reported outage
+// also fires the one-shot recovery note (sseRecovered).
+func (b *liveBackend) streamOnce() (bool, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	b.mu.Lock()
 	b.sseCancel = cancel
@@ -1045,24 +1255,25 @@ func (b *liveBackend) streamOnce() error {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/event?directory="+url.QueryEscape(b.directory), nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("x-opencode-directory", url.QueryEscape(b.directory))
 	res, err := b.sseClient.Do(req)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		return fmt.Errorf("event subscribe: HTTP %d", res.StatusCode)
+		return false, fmt.Errorf("event subscribe: HTTP %d", res.StatusCode)
 	}
 
+	progressed := false
 	sc := bufio.NewScanner(res.Body)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for sc.Scan() {
 		if b.fl.isStopped() {
-			return nil
+			return progressed, nil
 		}
 		line := sc.Text()
 		if !strings.HasPrefix(line, "data:") {
@@ -1071,6 +1282,10 @@ func (b *liveBackend) streamOnce() error {
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "" {
 			continue
+		}
+		if !progressed {
+			progressed = true
+			b.sseRecovered()
 		}
 		var raw ocSSEEvent
 		if err := json.Unmarshal([]byte(payload), &raw); err != nil {
@@ -1105,7 +1320,7 @@ func (b *liveBackend) streamOnce() error {
 			b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] event handling failed (" + raw.Type + "): " + shortTitle(err.Error(), 100)})
 		}
 	}
-	return sc.Err()
+	return progressed, sc.Err()
 }
 
 // ---------------------------------------------------------------- thought gate
@@ -1247,6 +1462,27 @@ func (b *liveBackend) flushChatStream(id string) {
 func (b *liveBackend) onEvent(raw ocSSEEvent) error {
 	b.mu.Lock()
 	primaryID := b.primaryID
+	// Abort window: the serve reports a member-initiated /stop as
+	// session.error "Aborted" on the primary — protocol noise, since
+	// AbortSessions already emitted the intentional "[grafeio] stopped"
+	// marker. Swallow those while the quiet window is open; every other
+	// error (or any error outside the window) maps normally.
+	if raw.Type == "session.error" && b.lastAbortAt != 0 && nowMs()-b.lastAbortAt < abortQuietMs {
+		var p ocSessionErrorProps
+		if json.Unmarshal(raw.Properties, &p) == nil && p.SessionID == primaryID {
+			msg := "aborted"
+			if p.Error != nil && p.Error.Data.Message != "" {
+				msg = p.Error.Data.Message
+			}
+			b.mu.Unlock()
+			if strings.Contains(strings.ToLower(msg), "abort") {
+				return nil
+			}
+			// A REAL error in the window still surfaces: feed it through the
+			// normal mapping below.
+			b.mu.Lock()
+		}
+	}
 	events := mapOCEvent(raw, b.ctx, primaryID, nowMs())
 	b.mu.Unlock()
 	for _, e := range events {
@@ -1395,6 +1631,23 @@ func (b *liveBackend) maybeBossCompleted(info ocMessage) {
 	} else if text == "" {
 		if finish == "tool-calls" {
 			return // mid-turn message; the text rides the continuation message
+		}
+		// Abort window: an EMPTY completion right after AbortSessions is the
+		// aborted turn's death rattle — the user already got the "[grafeio]
+		// stopped" marker, so swallow it (one completion only; the aborted
+		// placeholder was already popped by AbortSessions, hence the extra
+		// pendingBoss pop below keeps the FIFO balanced). A completion
+		// carrying actual partial text pins normally — what the model wrote
+		// before the stop is worth showing.
+		b.mu.Lock()
+		aborted := b.lastAbortAt != 0 && nowMs()-b.lastAbortAt < abortQuietMs
+		b.lastAbortAt = 0
+		if aborted && len(b.pendingBoss) > 0 {
+			b.pendingBoss = b.pendingBoss[1:]
+		}
+		b.mu.Unlock()
+		if aborted {
+			return
 		}
 		text = "[grafeio] could not read reply (msg " + info.ID + ")"
 	}

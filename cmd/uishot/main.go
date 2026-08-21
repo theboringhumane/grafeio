@@ -29,9 +29,11 @@
 //	                                the viewport, typing row below the divider)
 //	                                and after done (one single settled bubble —
 //	                                replace-in-place, no dup).
-//	                                A message is typed mid-stream to prove the
-//	                                queue holds until the final bubble; the
-//	                                ordering trace prints enqueue/done/flush.)
+//	                                A message is typed mid-stream to prove
+//	                                FREE-QUEUING: it goes straight to the
+//	                                backend while the stream is live — the
+//	                                ordering trace prints Send/done + the
+//	                                "busy · N queued (server)" compose.)
 //	                    [--ask-answer] (question-hold proof: boss EvQuestion q-1
 //	                                opens the answer modal at 1.5s (parked turn —
 //	                                typing placeholder removed); typing "the
@@ -90,6 +92,16 @@
 //	                                the "terminal" tab lazy-spawns it, typed
 //	                                keys route into the shell surface, and
 //	                                CloseTerminal kills it — frame + asserts)
+//	                    [--stop]    (/stop proof: typed mid-stream — captures
+//	                                AbortSessions, then ONE unwound frame:
+//	                                "stopped by user" placeholder, " (stopped)"
+//	                                stream appendix, tools ✗ aborted, thread
+//	                                (· N tool calls ✗ stopped), queue intact)
+//	                    [--freesend] (free-queuing proof: boss busy 3s, two
+//	                                prompts sent DURING — both Send() calls
+//	                                land immediately (trace: both BEFORE the
+//	                                turn-completed marker), statusline "busy ·
+//	                                2 queued (server)", FIFO drain after)
 package main
 
 import (
@@ -216,6 +228,10 @@ type stubBackend struct {
 	sendLog         []string // every Send call, verbatim (the proof)
 	teamLog         []string // QueueItemStart/Done + ResetPrimary calls (the proof)
 
+	freeMode bool // --freesend: boss busy ~3s, two sends land mid-turn
+
+	abortLog []string // AbortSessions capture (the --stop proof)
+
 	powerDemo bool // --power: minimal quiet script for the slash/name legs
 }
 
@@ -254,6 +270,10 @@ func (b *stubBackend) script() {
 	}
 	if b.batchMode {
 		b.scriptBatch(at)
+		return
+	}
+	if b.freeMode {
+		b.scriptFree(at)
 		return
 	}
 	if b.powerDemo {
@@ -479,18 +499,54 @@ func (b *stubBackend) scriptStream(at func(ms int, ev state.Event)) {
 	trace("[stream] done: bossmsg-m1 → pending=false")
 }
 
-// scriptBatch (--batch / --batch-respawn) — the intelligent-backlog proof:
-// the boss is busy from 200ms to 3000ms; the workload types three messages
-// into the backlog in that window (#1 #2 #3); the turn-complete flush at
-// ~3s must go out as ONE composed [BATCH DISPATCH] send.
+// scriptBatch (--batch / --batch-respawn) — the intelligent-backlog proof
+// under FREE-QUEUING: the client backlog now fills only behind a
+// ROADBLOCK, so this script parks the turn at a boss question (500ms —
+// the modal opens, the typing placeholder is removed). The workload
+// defers the modal, types three messages while the hold is outstanding
+// (each ENQUEUES as backlog #1 #2 #3), then re-opens and answers the
+// question: resolved + the completed boss reply flushes the backlog as
+// ONE composed [BATCH DISPATCH] send — the batch-dispatch contract is
+// unchanged, only the roadblock fills the queue now.
 func (b *stubBackend) scriptBatch(at func(ms int, ev state.Event)) {
 	at(50, state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — backlog-batch stub online"})
 	at(150, state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
 		"start the standup notes", false)})
 	at(200, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-1", "boss", "", true)})
-	// busy until ~3s — everything the workload types ENQUEUES in this window
-	at(3000, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("b1", "boss",
-		"standup notes are in drafts — checking the backlog.", false)})
+	// the ROADBLOCK: the boss parks the turn at the question reply API —
+	// a plain Send would deadlock the parked loop, so typed prompts keep
+	// ENQUEUEING until the hold resolves (the deferred-modal path is what
+	// assembles the batch)
+	at(500, state.Event{Kind: state.EvQuestion, EmployeeName: "boss", QuestionID: "q-1",
+		Text:        "Where should the standup notes live?",
+		ToolSummary: "sqlite | postgres | in memory"})
+}
+
+// scriptFree (--freesend) — the free-queuing / anti-stuck proof: the boss
+// is busy from 200ms to 3000ms; the workload sends two prompts DURING the
+// busy window (each goes STRAIGHT to backend.Send — the serve queues
+// them natively). The busy turn completes at 3s, then the staged
+// placeholders pin in place FIFO as the server drains its queue.
+func (b *stubBackend) scriptFree(at func(ms int, ev state.Event)) {
+	trace := func(line string) {
+		if b.trace != nil {
+			b.trace(line)
+		}
+	}
+	at(50, state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — free-queuing stub online"})
+	at(150, state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
+		"start the standup notes", false)})
+	at(200, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-1", "boss", "", true)})
+	// busy until 3s — both workload sends ride the server queue in this window
+	at(3000, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-1", "boss",
+		"first turn done — standup notes are in drafts.", false)})
+	trace("[freesend] turn completed: busy turn drained (server queue starts draining)")
+	// the server-drained queue: ONE placeholder per send, pinned in place
+	// (replace-by-ID keeps the FIFO slots in the transcript)
+	at(3150, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-free-1", "boss",
+		"footer in — aligned with the header.", false)})
+	at(3300, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-free-2", "boss",
+		"two tests land in the next pass.", false)})
 }
 
 // Send answers any interactive prompt deterministically (600ms ack). Reply
@@ -516,6 +572,20 @@ func (b *stubBackend) Send(text string) error {
 			b.trace("[stub] Send REJECTED — stubbed dead boss session (one-shot)")
 		}
 		return fmt.Errorf("stub: boss session dead")
+	}
+	if b.emit != nil && b.freeMode {
+		// free-queuing leg: every Send echoes immediately and stages ONE
+		// placeholder per send — the FIFO bubble mapping of the real serve
+		// queue. The script pins each placeholder in place by ID as the
+		// server drains it after the busy turn.
+		b.sendSeq++
+		seq := b.sendSeq
+		emit := b.emit
+		emit(state.Event{Kind: state.EvChatUser, Msg: chatMsg(
+			fmt.Sprintf("ue-%d", seq), "user", text, false)})
+		emit(state.Event{Kind: state.EvChatBoss, Msg: chatMsg(
+			fmt.Sprintf("boss-free-%d", seq), "boss", "", true)})
+		return nil
 	}
 	if b.emit != nil {
 		if b.batchMode {
@@ -643,6 +713,17 @@ func (b *stubBackend) RejectQuestion(requestID string) error {
 
 func (b *stubBackend) Stop() error { return nil }
 
+// AbortSessions is the /stop seam (the parallel backend contract: abort
+// the primary session AND every live child session). The stub only records
+// the call — the --stop frame proves the unwind.
+func (b *stubBackend) AbortSessions() error {
+	b.abortLog = append(b.abortLog, "AbortSessions()")
+	if b.trace != nil {
+		b.trace("[stub] AbortSessions()")
+	}
+	return nil
+}
+
 // slashWorkload simulates the user typing a slash command into the chat
 // textarea and hitting Enter — proving slash dispatch never hits the backend
 // and the office notice renders. It types /theme dracula (switch + persist),
@@ -728,6 +809,7 @@ func askEscWorkload(p *tea.Program) {
 	askEsc(p)
 	time.Sleep(500 * time.Millisecond)
 	askTypeLine(p, "/question")
+	askBareSlashSend(p) // the popover's "/question" row APPLIES; Enter again sends
 	time.Sleep(300 * time.Millisecond)
 	askTypeLine(p, "the toggle one")
 }
@@ -743,8 +825,20 @@ func askQueueWorkload(p *tea.Program) {
 	askTypeLine(p, "fix the badge too") // enqueued — turn is parked
 	time.Sleep(600 * time.Millisecond)
 	askTypeLine(p, "/question") // re-open the deferred hold
+	askBareSlashSend(p)
 	time.Sleep(300 * time.Millisecond)
 	askTypeLine(p, "the toggle one") // AnswerQuestion → resume → flush
+}
+
+// askBareSlashSend presses Enter when a JUST-TYPED bare slash command is
+// sitting in the draft as a popover selection: the first Enter (inside
+// askTypeLine/typeLine) only APPLIES the popover row into the draft, so a
+// second Enter is what actually sends it. (Zero-match commands fall
+// through on the first Enter — see the chat panel's slashOpen arm.)
+func askBareSlashSend(p *tea.Program) {
+	time.Sleep(120 * time.Millisecond)
+	p.Send(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	time.Sleep(120 * time.Millisecond)
 }
 
 // runThinkShot runs one fresh app+program against a think-mode stub for
@@ -783,9 +877,10 @@ func runThinkShot(tab string, dur time.Duration) (string, error) {
 
 // streamWorkload (--stream) types ONE message and hits Enter mid-stream —
 // the deltas run 500–1700ms and the placeholder went pending at 200ms, so
-// Enter lands while the boss reply is outstanding: it must ENQUEUE, and the
-// flush must fire only after the done bubble (2000ms). The trace lines
-// (enqueued / done / flush, all timestamped) prove the order.
+// Enter lands while the boss reply is outstanding: under FREE-QUEUING it
+// goes STRAIGHT to backend.Send (the serve queues it natively — no client
+// queue), and its reply lands while the stream is still live. The trace
+// lines ([stub] Send / done, all timestamped) prove the order.
 func streamWorkload(p *tea.Program) {
 	typeLine := func(s string) {
 		for _, r := range s {
@@ -798,9 +893,11 @@ func streamWorkload(p *tea.Program) {
 	typeLine("how do bees make it")
 }
 
-// batchWorkload (--batch / --batch-respawn): three messages typed while
-// the boss turn is pending (200–3000ms) — each ENQUEUES as a numbered
-// backlog item; the flush at the turn-complete sends them as ONE batch.
+// batchWorkload (--batch / --batch-respawn): the boss question modal opens
+// at 500ms — the user DEFERS it (esc, 1.1s), then types three messages
+// while the hold stays outstanding: each ENQUEUES as a numbered backlog
+// item. Re-opening the hold and answering it (3.4s+) resumes the turn —
+// resolved + the completed boss reply flushes the backlog as ONE batch.
 func batchWorkload(p *tea.Program) {
 	typeLine := func(s string) {
 		for _, r := range s {
@@ -809,12 +906,40 @@ func batchWorkload(p *tea.Program) {
 		}
 		p.Send(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
 	}
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(1100 * time.Millisecond)
+	p.Send(tea.KeyPressMsg(tea.Key{Code: tea.KeyEscape})) // defer the hold
+	time.Sleep(400 * time.Millisecond)
 	typeLine("fix the badge")
 	time.Sleep(400 * time.Millisecond)
 	typeLine("ship v2")
 	time.Sleep(400 * time.Millisecond)
 	typeLine("write the release notes")
+	time.Sleep(500 * time.Millisecond)
+	typeLine("/question") // re-open the deferred hold…
+	time.Sleep(200 * time.Millisecond)
+	// …the slash popover matches its own "/question" row, so the typed
+	// Enter only APPLIES it into the draft; a second Enter sends the
+	// command itself (same two-press dance as any bare popover command).
+	p.Send(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	time.Sleep(400 * time.Millisecond)
+	typeLine("sqlite") // …and answer it → resolve → turn complete → flush
+}
+
+// freeWorkload (--freesend) sends two prompts while the boss turn is busy
+// (200–3000ms). Under free-queuing each goes STRAIGHT to backend.Send —
+// the ordering trace shows both before the turn completes.
+func freeWorkload(p *tea.Program) {
+	typeLine := func(s string) {
+		for _, r := range s {
+			p.Send(tea.KeyPressMsg(tea.Key{Code: r, Text: string(r)}))
+			time.Sleep(8 * time.Millisecond)
+		}
+		p.Send(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	}
+	time.Sleep(700 * time.Millisecond)
+	typeLine("add the footer")
+	time.Sleep(500 * time.Millisecond)
+	typeLine("and two tests")
 }
 
 // traceLog collects timestamped ordering lines for the --stream proof
@@ -967,6 +1092,174 @@ func runBatchShot(respawn bool, dur time.Duration) (string, []string, []string, 
 	lines := append([]string(nil), tl.lines...)
 	tl.mu.Unlock()
 	return fm.Frame(), lines, backend.sendLog, backend.teamLog, nil
+}
+
+// runFreeShot runs one fresh app+program against a free-mode stub for
+// `dur`, typing two prompts during the busy window, then returns the
+// final frame plus the ordering trace. Two calls with different durations
+// = the busy and the drained pair (--freesend's frames).
+func runFreeShot(dur time.Duration) (string, []string, error) {
+	tl := &traceLog{start: time.Now()}
+	backend := &stubBackend{done: make(chan struct{}), freeMode: true, trace: tl.add}
+	m := app.New(backend, config.Default())
+	if !m.SelectTab("chat") {
+		return "", nil, fmt.Errorf("unknown tab %q", "chat")
+	}
+	p := tea.NewProgram(m,
+		tea.WithWindowSize(shotCols, shotRows),
+		tea.WithoutRenderer(),
+		tea.WithInput(nil),
+		tea.WithOutput(io.Discard),
+	)
+	app.QueueDebugf = func(format string, args ...any) {
+		tl.add("[queue] " + fmt.Sprintf(format, args...))
+	}
+	emit := func(ev state.Event) { p.Send(ev) }
+	if err := backend.Start(emit); err != nil {
+		return "", nil, err
+	}
+	go freeWorkload(p)
+	go func() {
+		time.Sleep(dur)
+		p.Quit()
+	}()
+	final, err := p.Run()
+	if err != nil {
+		return "", nil, err
+	}
+	fm, ok := final.(app.Model)
+	if !ok {
+		return "", nil, fmt.Errorf("unexpected final model type %T", final)
+	}
+	app.QueueDebugf = nil
+	tl.mu.Lock()
+	lines := append([]string(nil), tl.lines...)
+	tl.mu.Unlock()
+	return fm.Frame(), lines, nil
+}
+
+// --- /stop proof (--stop) ---------------------------------------------------
+// Synchronous driver (no wall clock): the boss is mid-stream with its own
+// tool running, tekton-1 is at work with one tool still running, a second
+// prompt has staged its own placeholder, a permission roadblock holds one
+// client item, and the boss has gone quiet (delegating). Typing /stop must
+// (1) hit stub.AbortSessions, (2) unwind everything in ONE frame.
+
+func runStopProof() error {
+	fail := func(format string, args ...any) error { return fmt.Errorf(format, args...) }
+	stub := &stubBackend{done: make(chan struct{})}
+	m := app.New(stub, config.Default())
+	d := &focusDriver{m: m}
+	d.send(tea.WindowSizeMsg{Width: shotCols, Height: shotRows})
+
+	key := func(code rune) tea.Cmd {
+		tm, c := d.m.Update(tea.KeyPressMsg(tea.Key{Code: code}))
+		if fm, ok := tm.(app.Model); ok {
+			d.m = fm
+		}
+		return c
+	}
+	typeIn := func(s string) {
+		for _, r := range s {
+			tm, _ := d.m.Update(tea.KeyPressMsg(tea.Key{Code: r, Text: string(r)}))
+			if fm, ok := tm.(app.Model); ok {
+				d.m = fm
+			}
+		}
+	}
+
+	d.send(state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — stop stub online"})
+	d.send(state.Event{Kind: state.EvHire, Employee: state.Employee{
+		ID: "dev-1", Name: "tekton-1", Role: state.RoleDeveloper, Sprite: state.SpriteAtDesk}})
+	d.send(state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
+		"wire the sse stream", false)})
+	d.send(state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-1", "boss", "", true)})
+	d.send(focusTool("boss", "boss", "call-1", "write", "handler.go", "running"))
+	d.send(state.Event{Kind: state.EvDispatch, EmployeeID: "dev-1",
+		Task: state.BoardTask{ID: "t1", Title: "Wire the SSE stream", At: time.Now().UnixMilli()}})
+	d.send(state.Event{Kind: state.EvWorking, EmployeeID: "dev-1", TaskID: "t1"})
+	d.send(focusTool("dev-1", "tekton-1", "call-t1", "read", "internal/room/manager.go", "running"))
+	d.send(focusTool("dev-1", "tekton-1", "call-t2", "edit", "internal/room/handler.go", "done"))
+	// mid-stream: the accumulated bubble grows (boss-1's empty placeholder
+	// is replaced by the real stream ID)
+	d.send(state.Event{Kind: state.EvChatBoss, Msg: chatMsg("bossmsg-m1", "boss",
+		"Wiring the handler — the **SSE stream** fans out to both workers now,", true)})
+	// a second prompt staged during the busy turn gets its OWN placeholder
+	d.send(state.Event{Kind: state.EvChatUser, Msg: chatMsg("u2", "user",
+		"and the retry backoff", false)})
+	d.send(state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-2", "boss", "", true)})
+	// a ROADBLOCK-held client item: the permission modal opens; a typed
+	// prompt enqueues behind it (text avoids y/a/n — the modal's answer
+	// keys)
+	d.send(state.Event{Kind: state.EvPermission, EmployeeName: "boss", PermissionID: "perm-1",
+		ToolName: "write", ToolSummary: "main.go", ToolState: ""})
+	typeIn("keep me plz")
+	drainCmd(d, key(tea.KeyEnter), 0)
+	d.pump(8) // boss quiet at its placeholder with a busy worker → delegating
+	preFrame := d.m.Frame()
+	if !strings.Contains(preFrame, "delegating · 1 busy") {
+		return fail("stop: setup frame missing the delegating row (boss quiet, tekton-1 busy)")
+	}
+	if strings.Contains(preFrame, "✗") {
+		return fail("stop: setup frame already shows an aborted marker before /stop")
+	}
+
+	// +1s: the user hits /stop
+	typeIn("/stop")
+	drainCmd(d, key(tea.KeyEnter), 0)
+
+	st := d.m.State()
+	fmt.Println("===== UI SHOT · STOP A — after /stop: placeholders collapsed, stream kept + (stopped), tools ✗ aborted, thread ✗ stopped, queue intact =====")
+	frameA := d.m.Frame()
+	fmt.Println(frameA)
+	fmt.Println("===== UI SHOT =====")
+	fmt.Println("--- stub capture (AbortSessions) ---")
+	for _, ln := range stub.abortLog {
+		fmt.Println(ln)
+	}
+	if len(stub.abortLog) != 1 {
+		return fail("expected exactly 1 AbortSessions call, got %d", len(stub.abortLog))
+	}
+	for _, want := range []string{
+		"stopped by user",             // (a) the staged boss-2 placeholder collapsed
+		"SSE stream",                  // (b) the streamed text survived…
+		"(stopped)",                   // …with the appendix
+		"[tool] write · handler.go ✗ aborted", // (c) boss inline tool swung
+		"tekton-1 · Wire the SSE stream (· 2 tool calls ✗ stopped)", // (d) thread collapsed stopped
+		"stopped current work — queue intact", // (e) statusband notice (the "(N items)" tail can clip under the bar's right segments)
+		"q1", // the client queue badge survived
+	} {
+		if !strings.Contains(frameA, want) {
+			return fail("stop A: frame missing %q", want)
+		}
+	}
+	if want := "stopped current work — queue intact (1 items)"; st.StatusLine != want {
+		return fail("stop A: StatusLine = %q, want %q", st.StatusLine, want)
+	}
+	if st.BossThinking || st.BossDelegating {
+		return fail("stop A: BossThinking=%v BossDelegating=%v after /stop (both must clear)", st.BossThinking, st.BossDelegating)
+	}
+	if strings.Contains(frameA, "… running") {
+		return fail("stop A: a tool still renders \"… running\" after /stop")
+	}
+	// the queued item survived verbatim: /queue lists it (the first Enter
+	// applies the popover row, the second sends the command)
+	typeIn("/queue")
+	drainCmd(d, key(tea.KeyEnter), 0)
+	drainCmd(d, key(tea.KeyEnter), 0)
+	frameQ := d.m.Frame()
+	for _, want := range []string{"1 queued", "1. keep me plz"} {
+		if !strings.Contains(frameQ, want) {
+			return fail("stop B: /queue listing missing %q — the queued item was lost", want)
+		}
+	}
+	if stub.sendLog != nil {
+		return fail("stop: the queued item must NOT have been sent, got sends: %v", stub.sendLog)
+	}
+	fmt.Println("--- /queue leg (after /stop): the roadblock item survived verbatim, NOT sent ---")
+	fmt.Println(frameQ)
+	fmt.Println("asserts: OK — AbortSessions captured once; boss-2 placeholder → \"stopped by user\"; streamed text kept + \" (stopped)\"; boss + worker tools ✗ aborted; thread (· 2 tool calls ✗ stopped); BossThinking/BossDelegating cleared; queue intact (1 item, badge q1, send next turn)")
+	return nil
 }
 
 // printAskCapture prints the stub's captured AnswerQuestion/RejectQuestion
@@ -2418,7 +2711,7 @@ func main() {
 	debug := flag.Bool("debug", false, "queue flush proof: resolves the pending boss so the queue drains; prints [queue] trace lines")
 	think := flag.Bool("think", false, "think-stream proof: one CallID streamed in accumulated updates, prints BOTH frames (t=2.0s mid-stream expanded, t=3.2s collapsed after Done)")
 	thinkStop := flag.String("think-stop", "", "with --think: print ONE frame only (mid = t=2.0s streaming, done = t=3.2s collapsed) for the gallery shot")
-	stream := flag.Bool("stream", false, "chat-stream proof: one \"bossmsg-m1\" reply streamed as 5 accumulated pending updates then pinned; prints frame mid-stream (bubble growing in the viewport, typing row live below the divider) and after done (single settled bubble) plus the enqueue/done/flush ordering trace")
+	stream := flag.Bool("stream", false, "chat-stream proof: one \"bossmsg-m1\" reply streamed as 5 accumulated pending updates then pinned; prints frame mid-stream (bubble growing in the viewport, typing row live below the divider) and after done (single settled bubble) plus the Send/done ordering trace — the message typed mid-stream FREE-SENDS straight to the backend now (the busy compose \"busy · 1 queued (server)\" paints until the pin)")
 	askAnswer := flag.Bool("ask-answer", false, "question-hold proof: boss EvQuestion opens the answer modal (typing placeholder removed, park status line); typing + enter routes through AnswerQuestion — prints BOTH frames (modal open / after answered) + the stub capture log")
 	askEsc := flag.Bool("ask-esc", false, "question-hold proof: esc defers the modal (notice), /question re-opens it, the answer still routes through AnswerQuestion")
 	askQueue := flag.Bool("ask-queue", false, "queue-hold proof: a message typed while the question hold is outstanding must ENQUEUE; AnswerQuestion → resolved → completed boss reply → flush, ordering trace printed")
@@ -2433,6 +2726,8 @@ func main() {
 	slashpop := flag.Bool("slashpop", false, "slash-popover proof: type \"/th\" → filtered menu (/theme /themes /thinking), Enter pre-fills \"/theme \" → theme picker, arrows preview LIVE (two states printed), esc cancels back, Enter commits + persists via the plain slash path")
 	threadsThink := flag.Bool("threads-think", false, "employee-thinking-in-threads proof: tekton-1 EvThought merges per CallID into its work thread (live \"thinking · N lines\" row), collapsed summary keeps the count (\"· 1 think\"), ctrl+g expands tools + thoughts — boss path byte-identical")
 	click := flag.Bool("click", false, "mouse proof: scripted clicks — floor sprite click selects the agent (activity tab + ▸ marker + office notice), double-click toggles its thread + jumps to chat, chat thread-header/summary clicks toggle round-trip, chrome rows ignore clicks")
+	stop := flag.Bool("stop", false, "/stop proof (synchronous): boss mid-stream with tools running + a staged second placeholder + a roadblock-queued item + delegating state; typing /stop must hit stub.AbortSessions and unwind in ONE frame — \"stopped by user\" placeholders, \" (stopped)\" stream appendix, tools ✗ aborted, thread ✗ stopped, BossThinking/Delegating cleared, queue intact; a /queue leg proves the item survived unsent")
+	freesend := flag.Bool("freesend", false, "free-queuing proof: boss busy 200–3000ms; two prompts sent DURING the window must hit backend.Send IMMEDIATELY (both ([stub] Send lines precede the turn-completed marker in the ordering trace) — frame 1 (t=2.2s) shows \"busy · 2 queued (server)\" + the \"turn 2 · your message rides next\" placeholder; frame 2 (t=3.6s) shows the drained FIFO pins + restored status line")
 	flag.Parse()
 
 	if *persist {
@@ -2448,6 +2743,95 @@ func main() {
 			fmt.Fprintf(os.Stderr, "uishot: %v\n", err)
 			os.Exit(1)
 		}
+		return
+	}
+
+	if *stop {
+		if err := runStopProof(); err != nil {
+			fmt.Fprintf(os.Stderr, "uishot: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *freesend {
+		fail := func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, "uishot: "+format+"\n", args...)
+			os.Exit(1)
+		}
+		stops := []struct {
+			at    time.Duration
+			label string
+		}{
+			{2200 * time.Millisecond, "frame 1 — t=2.2s (BUSY: two prompts sent straight to the server mid-turn — status \"busy · 2 queued (server)\", placeholder \"turn 2 · your message rides next\")"},
+			{3600 * time.Millisecond, "frame 2 — t=3.6s (DRAINED: busy turn completed, both server-queued sends pinned in place FIFO, busy compose restored)"},
+		}
+		var lastTrace []string
+		for i, s := range stops {
+			frame, trace, err := runFreeShot(s.at)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "uishot: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("===== UI SHOT · --freesend %s =====\n", s.label)
+			fmt.Println(frame)
+			fmt.Println("===== UI SHOT =====")
+			lastTrace = trace
+			if i == 0 {
+				// the busy-frame contract: the compose + the turn text
+				for _, want := range []string{"busy · 2 queued (server)", "turn 2 · your message rides next", "is typing…"} {
+					if !strings.Contains(frame, want) {
+						fail("freesend frame 1 missing %q", want)
+					}
+				}
+			}
+			if i == 1 {
+				// the drained frame: all three replies pinned (glamour
+				// wraps to the sidebar — assert the stable first-line
+				// prefixes), compose gone
+				for _, want := range []string{
+					"first turn done — standup notes are in", "drafts.",
+					"footer in — aligned with the", "header.",
+					"two tests land in the next", "pass.",
+					"free-queuing stub online",
+				} {
+					if !strings.Contains(frame, want) {
+						fail("freesend frame 2 missing %q", want)
+					}
+				}
+				if strings.Contains(frame, "busy · 2 queued (server)") {
+					fail("freesend frame 2 still shows the busy compose after the drain")
+				}
+			}
+		}
+		fmt.Println("--- ordering trace (frame-2 run, covers the drain) ---")
+		for _, ln := range lastTrace {
+			fmt.Println(ln)
+		}
+		// the anti-stuck contract: BOTH Send() calls land immediately —
+		// before the busy turn completes (nothing hides in a client queue).
+		sendIdx, doneIdx, enqIdx := 0, -1, -1
+		for i, ln := range lastTrace {
+			if strings.Contains(ln, "[stub] Send(") {
+				sendIdx++
+			}
+			if strings.Contains(ln, "turn completed") && doneIdx < 0 {
+				doneIdx = i
+			}
+			if strings.Contains(ln, "enqueued") && enqIdx < 0 {
+				enqIdx = i
+			}
+		}
+		if sendIdx != 2 {
+			fail("expected exactly 2 immediate Send calls during the busy window, got %d", sendIdx)
+		}
+		if enqIdx >= 0 {
+			fail("a prompt ENQUEUED during the busy window (line %d) — free-queuing must send direct", enqIdx)
+		}
+		if doneIdx < 0 {
+			fail("trace missing the turn-completed marker")
+		}
+		fmt.Println("asserts: OK — both Send() calls immediate (before \"turn completed\"), zero client-queue enqueues, busy compose + \"turn 2 · your message rides next\" live mid-turn, FIFO pins drained in place, status line restored")
 		return
 	}
 
@@ -2671,8 +3055,8 @@ func main() {
 			at    time.Duration
 			label string
 		}{
-			{1250 * time.Millisecond, "frame 1 — t=1.25s (MID-STREAM: grown bubble, typing row below the divider, one message enqueued)"},
-			{2800 * time.Millisecond, "frame 2 — t=2.8s (AFTER DONE: one settled bubble — replace-in-place, no dup — queue flushed)"},
+			{1250 * time.Millisecond, "frame 1 — t=1.25s (MID-STREAM: grown bubble, typing row below the divider, one message free-sent straight to the server — \"busy · 1 queued (server)\")"},
+			{2800 * time.Millisecond, "frame 2 — t=2.8s (AFTER DONE: one settled bubble — replace-in-place, no dup; the free-sent reply landed as its own bubble; busy compose restored)"},
 		}
 		for _, s := range stops {
 			frame, trace, err := runStreamShot(s.at)
@@ -2724,7 +3108,8 @@ func main() {
 		go diffsWorkload(p)
 	}
 	// queue typing always runs — on the agents tab the keys are absorbed by
-	// the (non-text) panel; on chat they enqueue.
+	// the (non-text) panel; on chat they FREE-SEND (boss busy at 3050ms,
+	// no roadblock) — the busy compose paints on the status line.
 	go queueWorkload(p)
 	go func() {
 		if *debug {

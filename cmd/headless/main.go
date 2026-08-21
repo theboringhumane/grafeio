@@ -82,6 +82,31 @@
 //	                            the dispatch minimum, assert the reply names
 //	                            (manager|oikonomos) AND (three|3). Prints
 //	                            CHARTER-PROBE: ACTIVE (exit 0) else exit 1.
+//	grafeio-headless --abort-probe
+//	                            /stop probe (forces live): print the opencode
+//	                            serve /doc abort route excerpt, then send the
+//	                            long-running prompt "write a 2000-word essay
+//	                            about kelp", wait 2s plus (up to 10s) until the
+//	                            essay is visibly streaming so the abort bites
+//	                            DURING generation, call the backend's
+//	                            AbortSessions (state.SessionAborter seam), and
+//	                            assert within a 6s watch: a stopped marker
+//	                            (placeholder close or interrupted-stream
+//	                            flush) AND no further boss-bubble stream
+//	                            growth beyond a 1.5s in-flight grace. Prints
+//	                            "STOP: OK" (exit 0) or "STOP: FAIL" (exit 1).
+//	grafeio-headless --sse-sim
+//	                            SSE reconnect sim (D1): a fake standard-library
+//	                            serve emulates session list/create plus a
+//	                            scripted /event flap profile (clean closes,
+//	                            then HTTP 500s, then revival); the live
+//	                            backend's full Start runs against it. Asserts
+//	                            the reconnect ladder reads 1s,2s,5s,10s,30s,30s
+//	                            (capped) measured server-side, resets to 1s
+//	                            after revival, and the outage emits exactly
+//	                            one closed note + one error-class note + one
+//	                            "event stream: reconnected". Prints
+//	                            "SSE-SIM: OK" (exit 0) else exit 1.
 //
 // The plain demo run also auto-answers its scripted boss question
 // (que-demo-1, 800ms after it surfaces) so the registration + resolved
@@ -98,12 +123,15 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -129,6 +157,8 @@ func main() {
 	persistRestore := flag.Bool("persist-restore", false, "office-session persist proof run 2 (live): restore boot — restore notice + SAME primary id reused (PERSIST: RESTORED)")
 	persistNew := flag.Bool("persist-new", false, "office-session persist proof run 3 (live): /new — fresh primary id != saved id + /new notice + latest-wins overwrite proof (PERSIST: NEW)")
 	charterProbe := flag.Bool("charter-probe", false, "manager-charter wiring probe: scratch dir, EnsureCharter twice (bytes identical), spawn a REAL serve rooted in the scratch, ask the boss who it is + the dispatch minimum, assert (manager|oikonomos)+(three|3) — CHARTER-PROBE: ACTIVE (exit 0) else exit 1")
+	abortProbe := flag.Bool("abort-probe", false, "live mode: /stop probe — /doc abort excerpt, send the 2000-word kelp essay, wait 2s, AbortSessions via the state.SessionAborter seam, assert stopped marker + stream growth stops (STOP: OK|FAIL)")
+	sseSim := flag.Bool("sse-sim", false, "SSE reconnect sim (D1): fake flapping serve, assert backoff ladder 1s/2s/5s/10s/30s capped + ladder reset + exactly one closed note + one error-class note + one reconnected note (SSE-SIM: OK|FAIL)")
 	flag.Parse()
 
 	// --charter-probe is a standalone probe with its own harness (own
@@ -174,10 +204,26 @@ func main() {
 		fmt.Fprintln(os.Stderr, "--batch-probe is a standalone probe: do not combine with --prompt/--prompt2/--ask")
 		os.Exit(2)
 	}
+	// --sse-sim is a fully standalone probe (own fake serve, own harness,
+	// no brain.json knobs worth reading) — it runs before any live wiring.
+	if *sseSim {
+		os.Exit(runSSESim())
+	}
+	if *abortProbe && (*prompt != "" || *prompt2 != "" || *ask || *batchProbe) {
+		fmt.Fprintln(os.Stderr, "--abort-probe is a standalone probe: do not combine with --prompt/--prompt2/--ask/--batch-probe")
+		os.Exit(2)
+	}
 	if *ask || *batchProbe {
 		*live = true
 		*demo = false
 	}
+
+	// --abort-probe: /stop regression probe with its own harness (own emit;
+	// the shared one below is shaped for demo/stale-repro runs).
+	if *abortProbe {
+		os.Exit(runAbortProbe(cfg))
+	}
+
 	// 15s TOTAL budget for --ask, measured from before the serve spawn.
 	askDeadline := time.Now().Add(15 * time.Second)
 
@@ -1216,6 +1262,503 @@ func charterProbeMain() int {
 		return 0
 	}
 	fmt.Printf("CHARTER-PROBE: FAIL (%d check(s) failed)\n", failures)
+	return 1
+}
+
+// --- /stop abort probe --------------------------------------------------------
+
+// runDocAbortExcerpt spawns a short-lived probe serve, fetches its /doc, and
+// prints the abort route excerpt (the route AbortSessions is about to call —
+// proof it exists on THIS opencode build before the probe relies on it).
+func runDocAbortExcerpt(dir string) {
+	fmt.Println("[doc] probing spawned opencode serve /doc for the abort route ...")
+	baseURL, proc, err := spawnServeForProbe(dir)
+	if err != nil {
+		fmt.Printf("[doc] WARN: serve spawn failed: %v (skipping /doc excerpt)\n", err)
+		return
+	}
+	defer func() {
+		if proc.Process != nil {
+			_ = proc.Process.Kill()
+			_ = proc.Wait()
+		}
+	}()
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/doc", nil)
+	if err != nil {
+		fmt.Printf("[doc] WARN: /doc request: %v\n", err)
+		return
+	}
+	res, err := probeHTTPClient.Do(req)
+	if err != nil {
+		fmt.Printf("[doc] WARN: /doc fetch: %v\n", err)
+		return
+	}
+	defer res.Body.Close()
+	data, err := io.ReadAll(res.Body)
+	if err != nil {
+		fmt.Printf("[doc] WARN: /doc read: %v\n", err)
+		return
+	}
+	var doc struct {
+		Paths map[string]map[string]struct {
+			OperationID string `json:"operationId"`
+			Summary     string `json:"summary"`
+			Description string `json:"description"`
+			Responses   map[string]struct {
+				Description string `json:"description"`
+			} `json:"responses"`
+		} `json:"paths"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		fmt.Printf("[doc] WARN: /doc parse: %v\n", err)
+		return
+	}
+	fmt.Println("[doc] --- abort route excerpt (spawned opencode serve /doc) ---")
+	found := false
+	var paths []string
+	for path := range doc.Paths {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		var methods []string
+		for m := range doc.Paths[path] {
+			methods = append(methods, m)
+		}
+		sort.Strings(methods)
+		for _, m := range methods {
+			op := doc.Paths[path][m]
+			if !strings.Contains(strings.ToLower(path+" "+op.OperationID), "abort") {
+				continue
+			}
+			found = true
+			fmt.Printf("[doc] %s %s  operationId=%s\n", strings.ToUpper(m), path, op.OperationID)
+			fmt.Printf("[doc]   summary:     %s\n", op.Summary)
+			fmt.Printf("[doc]   description: %s\n", op.Description)
+			var codes []string
+			for c := range op.Responses {
+				codes = append(codes, c)
+			}
+			sort.Strings(codes)
+			for _, c := range codes {
+				fmt.Printf("[doc]   response %s: %s\n", c, op.Responses[c].Description)
+			}
+		}
+	}
+	if !found {
+		fmt.Println("[doc] WARN: NO abort route found in /doc — the AbortSessions seam cannot work against this build")
+	}
+	fmt.Println("[doc] --- end /doc excerpt ---")
+}
+
+// runAbortProbe — the --abort-probe harness. Boot the REAL live backend
+// (own emit so the run is self-contained), send a prompt whose turn
+// outlives the watch window, wait 2s for the turn to engage, call
+// AbortSessions via the additive state.SessionAborter seam, then watch 6s.
+// PASS requires: the seam exists, the abort round-trip returned nil, a
+// stopped marker landed (the "[grafeio] stopped (turn aborted)" placeholder
+// close or an interrupted-stream flush — the serve does NOT forward
+// primary session.idle as a state.Event, so the marker is the
+// app-observable abort proof), and no boss-bubble stream growth past a
+// 1.5s in-flight delta grace.
+func runAbortProbe(cfg *config.Config) int {
+	dir, err := os.Getwd()
+	if err != nil {
+		fmt.Printf("[fatal] getwd: %v\n", err)
+		return 1
+	}
+
+	// /doc excerpt first: the route the seam calls, printed by the build
+	// under test.
+	runDocAbortExcerpt(dir)
+
+	// Board offline for a deterministic transcript.
+	oldAM := os.Getenv("AGENTMEMORY_URL")
+	_ = os.Setenv("AGENTMEMORY_URL", "http://127.0.0.1:9")
+	defer func() {
+		if oldAM == "" {
+			_ = os.Unsetenv("AGENTMEMORY_URL")
+		} else {
+			_ = os.Setenv("AGENTMEMORY_URL", oldAM)
+		}
+	}()
+
+	var mu sync.Mutex
+	var (
+		abortAt     time.Time
+		marker      string    // first stopped/interrupted marker text seen post-abort
+		growthAfter []float64 // seconds-since-abort of every boss-stream growth update
+		streamed    bool      // any boss-stream growth at all (sanity: the essay streams)
+		errLines    []string  // post-abort "boss error" bubbles (the serve's "Aborted" echo must be suppressed)
+	)
+	b := backend.NewLive("", dir, cfg)
+	emit := func(e state.Event) {
+		mu.Lock()
+		switch {
+		case e.Kind == state.EvChatBoss && e.Msg.Pending && strings.HasPrefix(e.Msg.ID, "bossmsg-"):
+			streamed = true
+			if !abortAt.IsZero() {
+				growthAfter = append(growthAfter, time.Since(abortAt).Seconds())
+			}
+		case e.Kind == state.EvChatBoss && !e.Msg.Pending && !abortAt.IsZero():
+			if strings.Contains(e.Msg.Text, "[grafeio] stopped") || strings.Contains(e.Msg.Text, "[grafeio] stream interrupted") {
+				if marker == "" {
+					marker = e.Msg.Text
+				}
+			}
+			if strings.Contains(e.Msg.Text, "boss error:") {
+				errLines = append(errLines, e.Msg.Text)
+			}
+		}
+		mu.Unlock()
+		printEvent(e)
+	}
+
+	fmt.Printf("[mode] %s\n", b.Mode())
+	if err := b.Start(emit); err != nil {
+		fmt.Printf("[fatal] start: %v\n", err)
+		return 1
+	}
+	prompt := "write a 2000-word essay about kelp"
+	fmt.Printf("[abort-probe] prompt %q\n", prompt)
+	if err := b.Send(prompt); err != nil {
+		_ = b.Stop()
+		fmt.Printf("[fatal] send: %v\n", err)
+		return 1
+	}
+	sentAt := time.Now()
+	// Wait 2s (the spec), then — so the abort provably bites DURING
+	// generation rather than during the model's quiet preamble — up to 10s
+	// more for the first boss-stream delta; abort as soon as the essay is
+	// visibly streaming. A model that never streams aborts at 12s anyway.
+	time.Sleep(2 * time.Second)
+	streamWait := time.Now().Add(10 * time.Second)
+	for time.Now().Before(streamWait) {
+		mu.Lock()
+		s := streamed
+		mu.Unlock()
+		if s {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	mu.Lock()
+	streamedPre := streamed
+	mu.Unlock()
+	fmt.Printf("[abort-probe] boss-stream active pre-abort: %v (%.1fs after send)\n", streamedPre, time.Since(sentAt).Seconds())
+
+	ab, ok := b.(state.SessionAborter)
+	abortErr := error(nil)
+	if ok {
+		mu.Lock()
+		abortAt = time.Now()
+		mu.Unlock()
+		fmt.Println("[abort-probe] calling AbortSessions() ...")
+		abortErr = ab.AbortSessions()
+		fmt.Printf("[abort-probe] AbortSessions() -> %v\n", abortErr)
+	} else {
+		fmt.Println("[abort-probe] live backend does NOT expose state.SessionAborter")
+	}
+	// The 6s watch: markers and trailing growth stamps land via emit.
+	time.Sleep(6 * time.Second)
+	if err := b.Stop(); err != nil {
+		fmt.Printf("[fatal] stop: %v\n", err)
+		return 1
+	}
+	fmt.Println("[done] backend stopped")
+
+	mu.Lock()
+	mk := marker
+	growth := append([]float64(nil), growthAfter...)
+	str := streamed
+	errs := append([]string(nil), errLines...)
+	mu.Unlock()
+	fmt.Printf("[abort-probe] stream growth stamps after abort (s): %v (streamed pre-abort: %v)\n", growth, str)
+	if mk != "" {
+		fmt.Printf("[abort-probe] stopped marker: %q\n", trunc(mk, 120))
+	}
+
+	failures := 0
+	check := func(cond bool, label string) {
+		if cond {
+			fmt.Printf("[assert] PASS %s\n", label)
+		} else {
+			failures++
+			fmt.Printf("[assert] FAIL %s\n", label)
+		}
+	}
+	check(ok, "live backend exposes the state.SessionAborter seam")
+	if ok {
+		check(abortErr == nil, "AbortSessions round-trip returned nil (all sessions aborted)")
+	}
+	check(mk != "", "stopped marker within the watch window ([grafeio] stopped / stream interrupted)")
+	late := 0
+	for _, g := range growth {
+		if g > 1.5 { // in-flight delta grace: a delta already on the wire may land
+			late++
+		}
+	}
+	check(late == 0, fmt.Sprintf("no boss-bubble stream growth beyond the 1.5s grace (%d late update(s))", late))
+	for _, e := range errs {
+		fmt.Printf("[abort-probe] post-abort error bubble: %q\n", trunc(e, 120))
+	}
+	check(len(errs) == 0, fmt.Sprintf("serve's session.error \"Aborted\" echo suppressed — no 'boss error' bubble post-abort (%d seen)", len(errs)))
+
+	if failures == 0 {
+		fmt.Println("STOP: OK")
+		return 0
+	}
+	fmt.Printf("STOP: FAIL (%d check(s) failed)\n", failures)
+	return 1
+}
+
+// --- SSE reconnect sim (D1) ---------------------------------------------------
+
+// sseAttempt is one /event attach in the sim ledger: arrival time is the
+// backoff-cadence evidence, release the moment the handler finished with
+// the connection (the post-revival reset is measured release -> arrival).
+type sseAttempt struct {
+	n       int
+	arrival time.Time
+	release time.Time
+	profile string
+}
+
+// sseSimServer emulates just enough opencode serve for the live backend's
+// full Start over plain net/http: GET /session (empty), POST /session
+// (create), and GET /event with a scripted flap profile:
+//
+//	attempts 1-2   200 with an empty body (clean EOF before any frame —
+//	               class "closed"; twice, to prove same-class dedupe)
+//	attempts 3-7   HTTP 500 (error class change -> ONE error note, then
+//	               silent retries through the ladder)
+//	attempt 8      one heartbeat frame, then close (revival: recovery note
+//	               + ladder reset)
+//	attempt 9+     stay open (post-reset attach)
+//
+// The attempts ledger IS the ladder measurement: consecutive gaps must
+// read 1s, 2s, 5s, 10s, 30s, 30s (capped), and gap(attempt8.release ->
+// attempt9.arrival) must read ~1s (reset on first frame).
+type sseSimServer struct {
+	baseURL  string
+	srv      *http.Server
+	mu       sync.Mutex
+	attempts []sseAttempt
+}
+
+func newSSESimServer() *sseSimServer {
+	sim := &sseSimServer{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/event", sim.handleEvent)
+	mux.HandleFunc("/session", sim.handleSession)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	sim.baseURL = "http://" + ln.Addr().String()
+	sim.srv = &http.Server{Handler: mux}
+	go func() { _ = sim.srv.Serve(ln) }()
+	return sim
+}
+
+func (s *sseSimServer) close() { _ = s.srv.Close() }
+
+func (s *sseSimServer) handleSession(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodPost {
+		_, _ = io.WriteString(w, `{"id":"ses-sim","parentID":"","title":"sse-sim","time":{"created":1,"updated":1}}`)
+		return
+	}
+	_, _ = io.WriteString(w, `[]`)
+}
+
+func (s *sseSimServer) handleEvent(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	n := len(s.attempts) + 1
+	att := sseAttempt{n: n, arrival: time.Now()}
+	if n > 1 {
+		fmt.Printf("[sse-sim] /event attempt #%d (gap %.2fs since #%d)\n",
+			n, att.arrival.Sub(s.attempts[n-2].arrival).Seconds(), n-1)
+	} else {
+		fmt.Printf("[sse-sim] /event attempt #%d (first attach)\n", n)
+	}
+	s.attempts = append(s.attempts, att)
+	s.mu.Unlock()
+
+	markRelease := func(profile string) {
+		s.mu.Lock()
+		s.attempts[n-1].release = time.Now()
+		s.attempts[n-1].profile = profile
+		s.mu.Unlock()
+		fmt.Printf("[sse-sim] /event attempt #%d profile=%s\n", n, profile)
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	flusher, _ := w.(http.Flusher)
+	switch {
+	case n <= 2:
+		markRelease("close-clean") // 200, empty body: EOF before any frame
+	case n <= 7:
+		w.WriteHeader(http.StatusInternalServerError)
+		markRelease("http-500")
+	case n == 8:
+		fmt.Fprintf(w, "data: {\"type\":\"server.heartbeat\",\"properties\":{}}\n\n")
+		flusher.Flush()
+		time.Sleep(300 * time.Millisecond)
+		markRelease("revive-then-close")
+	default:
+		fmt.Fprintf(w, "data: {\"type\":\"server.heartbeat\",\"properties\":{}}\n\n")
+		flusher.Flush()
+		<-r.Context().Done()
+		markRelease("stay-open")
+	}
+}
+
+// runSSESim — the --sse-sim harness. Attaches the REAL live backend to the
+// fake flapping serve (the full Start path: charter, primary resolve, SSE
+// pump), lets the outage play out, and asserts the backoff ladder, the
+// post-revival ladder reset, and the deduped status-note contract.
+func runSSESim() int {
+	sim := newSSESimServer()
+	defer sim.close()
+	scratch, err := os.MkdirTemp("", "grafeio-sse-sim")
+	if err != nil {
+		fmt.Printf("[fatal] scratch dir: %v\n", err)
+		return 1
+	}
+	defer os.RemoveAll(scratch)
+
+	// Board offline for a deterministic transcript.
+	oldAM := os.Getenv("AGENTMEMORY_URL")
+	_ = os.Setenv("AGENTMEMORY_URL", "http://127.0.0.1:9")
+	defer func() {
+		if oldAM == "" {
+			_ = os.Unsetenv("AGENTMEMORY_URL")
+		} else {
+			_ = os.Setenv("AGENTMEMORY_URL", oldAM)
+		}
+	}()
+
+	var mu sync.Mutex
+	var streamNotes []string // EvStatus texts mentioning "event stream", in order
+	reconnectSeen := false
+	emit := func(e state.Event) {
+		printEvent(e)
+		if e.Kind == state.EvStatus && strings.Contains(e.Text, "event stream") {
+			mu.Lock()
+			streamNotes = append(streamNotes, e.Text)
+			if strings.Contains(e.Text, "reconnected") {
+				reconnectSeen = true
+			}
+			mu.Unlock()
+		}
+	}
+
+	cfg := config.Default()
+	cfg.Backend.AgentmemoryURL = "http://127.0.0.1:9"
+	b := backend.NewLive(sim.baseURL, scratch, cfg)
+	fmt.Printf("[mode] %s\n", b.Mode())
+	if err := b.Start(emit); err != nil {
+		fmt.Printf("[fatal] start: %v\n", err)
+		return 1
+	}
+	fmt.Printf("[sse-sim] live backend attached to fake serve %s (scratch %s)\n", sim.baseURL, scratch)
+	fmt.Println("[sse-sim] outage profile: 2 close-clean, 5x HTTP 500, revive at attempt 8, reset probe at attempt 9")
+
+	// Watch until the revival note landed and the post-reset attach (attempt
+	// 9) arrived, or the budget dies.
+	deadline := time.Now().Add(150 * time.Second)
+	for time.Now().Before(deadline) {
+		sim.mu.Lock()
+		n := len(sim.attempts)
+		sim.mu.Unlock()
+		mu.Lock()
+		rec := reconnectSeen
+		mu.Unlock()
+		if n >= 9 && rec {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if err := b.Stop(); err != nil {
+		fmt.Printf("[fatal] stop: %v\n", err)
+		return 1
+	}
+	fmt.Println("[done] backend stopped")
+
+	mu.Lock()
+	notes := append([]string(nil), streamNotes...)
+	mu.Unlock()
+	return sim.evaluate(notes)
+}
+
+// evaluate scores the attempt ledger + the status-note transcript.
+func (s *sseSimServer) evaluate(streamNotes []string) int {
+	s.mu.Lock()
+	atts := append([]sseAttempt(nil), s.attempts...)
+	s.mu.Unlock()
+
+	failures := 0
+	check := func(cond bool, label string) {
+		if cond {
+			fmt.Printf("[assert] PASS %s\n", label)
+		} else {
+			failures++
+			fmt.Printf("[assert] FAIL %s\n", label)
+		}
+	}
+
+	fmt.Println("[sse-sim] --- attempt ledger ---")
+	for _, a := range atts {
+		fmt.Printf("[sse-sim]   attempt #%d  arrival=+%.2fs  profile=%s\n",
+			a.n, a.arrival.Sub(atts[0].arrival).Seconds(), a.profile)
+	}
+
+	wantGaps := []float64{1, 2, 5, 10, 30, 30}
+	check(len(atts) >= 9, fmt.Sprintf("at least 9 /event attempts observed (got %d)", len(atts)))
+	for i, want := range wantGaps {
+		if i+1 >= len(atts) {
+			break
+		}
+		gap := atts[i+1].arrival.Sub(atts[i].arrival).Seconds()
+		check(math.Abs(gap-want) <= 0.8,
+			fmt.Sprintf("ladder gap #%d->#%d ≈ %gs (got %.2fs)", i+1, i+2, want, gap))
+	}
+	if len(atts) >= 9 {
+		gap := atts[8].arrival.Sub(atts[7].release).Seconds()
+		check(math.Abs(gap-1) <= 0.9,
+			fmt.Sprintf("post-revival ladder reset: attempt 9 arrives ~1s after attempt 8 closed (got %.2fs)", gap))
+	}
+
+	fmt.Println("[sse-sim] --- event-stream status notes (in order) ---")
+	for i, n := range streamNotes {
+		fmt.Printf("[sse-sim]   note #%d %q\n", i+1, n)
+	}
+	recIdx := -1
+	for i, n := range streamNotes {
+		if strings.Contains(n, "reconnected") {
+			recIdx = i
+			break
+		}
+	}
+	check(recIdx >= 0, "recovery note '[grafeio] event stream: reconnected' emitted")
+	if recIdx >= 0 {
+		before := streamNotes[:recIdx]
+		check(len(before) == 2,
+			fmt.Sprintf("exactly 2 event-stream notes during the whole outage, retries silent (got %d)", len(before)))
+		if len(before) >= 2 {
+			check(strings.Contains(before[0], "event stream closed"),
+				"outage note #1 is the clean-close class")
+			check(strings.Contains(before[1], "HTTP 500"),
+				"outage note #2 is the error-class change (HTTP 500)")
+		}
+	}
+
+	if failures == 0 {
+		fmt.Println("SSE-SIM: OK")
+		return 0
+	}
+	fmt.Printf("SSE-SIM: FAIL (%d check(s) failed)\n", failures)
 	return 1
 }
 

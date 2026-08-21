@@ -39,11 +39,17 @@
 //		            N busy" — no spinner.
 //		textarea  — multiline input; Enter sends, Shift+Enter (or Ctrl+J) is a
 //		            newline, placeholder "talk to the boss…". NEVER locked: while
-//		            the boss is typing, Enter ENQUEUES (the app owns the queue)
-//	           and the placeholder reads "<boss> is typing… · N queued".
-//		            While a permission prompt is open, the prompt MODAL replaces
-//		            this region: y/a/n answers, esc defers; every other key still
-//		            types into the (hidden) textarea.
+//		            the boss is busy, Enter FREE-SENDS (the app routes the prompt
+//		            straight to the backend, which queues it server-side and
+//		            drains it after the current turn — no client queue, nothing
+//		            hides); the placeholder reads "<boss> is typing…", and from
+//		            the second direct send on "<boss>: turn N · your message
+//		            rides next" while the status line carries "busy · N queued
+//		            (server)". A client-side backlog item is created ONLY for
+//		            roadblocks: a permission prompt or a question hold
+//		            outstanding. While a permission prompt is open, the prompt
+//		            MODAL replaces this region: y/a/n answers, esc defers; every
+//		            other key still types into the (hidden) textarea.
 //		question  — while a boss question hold is open, the QUESTION MODAL
 //		            replaces this region: a free-text input (enter submits via
 //		            AnswerQuestion, esc defers → /question re-opens); the
@@ -154,8 +160,14 @@ type Chat struct {
 	sp     spinner.Model
 	onSend func(text string, atts []state.Attachment) tea.Cmd
 
-	// Queue + permission + question seams (set by the app at build time).
-	onEnqueue    func(text string, atts []state.Attachment) tea.Cmd // Enter while boss pending / question parked
+	// Queue + permission + question + free-send seams (set by the app at
+	// build time). onEnqueue is for ROADBLOCKS only: Enter while a question
+	// hold is outstanding / a permission modal is open enqueues (the turn
+	// is parked at the reply API — a chat prompt would not resume it).
+	// onBusySend is FREE-QUEUING: Enter while the boss is merely busy goes
+	// straight to the backend, which queues the prompt server-side.
+	onEnqueue    func(text string, atts []state.Attachment) tea.Cmd
+	onBusySend   func(text string, atts []state.Attachment) tea.Cmd
 	onPermAnswer func(response string) tea.Cmd
 	onPermLater  func() tea.Cmd // esc defers the prompt
 	perm         *PermissionView
@@ -206,6 +218,12 @@ type Chat struct {
 	delegating  bool
 	delegatingN int
 
+	// serverTurn — the app's free-queuing tally: prompts sent DIRECT to the
+	// backend during the current busy turn (the serve queues them
+	// natively). 0 = none this turn. From the second send on the busy
+	// placeholder reads "<boss>: turn N · your message rides next".
+	serverTurn int
+
 	// streamingThink — CallIDs with an OPEN boss EvThought stream (set by
 	// the app from its model-owned active set). Streaming blocks always
 	// render expanded (live transcript) regardless of ctrl+t; when the
@@ -248,8 +266,12 @@ type Chat struct {
 	// agent on the floor / click a thread header — a set entry wins over
 	// the live+ctrl+g default); threadRows maps rendered content line →
 	// agent name for the expanded-thread "┌" headers (mouse hit lookup).
+	// threadStop holds the /stop markers: a stopped thread force-collapses
+	// and its summary reads "✗ stopped" until an explicit expand re-opens
+	// the rows.
 	threadExpand map[string]bool
 	threadRows   map[int]string
+	threadStop   map[string]bool
 
 	diffCache map[string]diffCacheEntry // parsed+hilighted diff rows by msg ID
 }
@@ -407,10 +429,42 @@ func (c *Chat) SetDiffsExpanded(on bool) {
 // DiffsExpanded reports whether diff entries render expanded.
 func (c *Chat) DiffsExpanded() bool { return c.diffExpanded }
 
-// SetEnqueue wires the app's enqueue callback (Enter while a boss reply is
-// pending enqueues instead of sending). Staged attachments ride along so a
-// queued prompt keeps its files.
+// SetEnqueue wires the app's enqueue callback — for ROADBLOCKS only (Enter
+// while a question hold is outstanding / a permission modal is open). A
+// plain busy turn does NOT enqueue: it free-sends via onBusySend. Staged
+// attachments ride along so a queued prompt keeps its files.
 func (c *Chat) SetEnqueue(fn func(text string, atts []state.Attachment) tea.Cmd) { c.onEnqueue = fn }
+
+// SetBusySend wires the app's FREE-SEND callback (free-queuing / the
+// anti-stuck flow): Enter while a boss reply is pending sends DIRECTLY to
+// the backend — the serve queues the prompt server-side and drains it
+// after the current turn, so the prompt never hides in a client queue.
+func (c *Chat) SetBusySend(fn func(text string, atts []state.Attachment) tea.Cmd) { c.onBusySend = fn }
+
+// SetServerTurn hands the panel the app's free-queuing tally for the
+// current busy turn (0 = none / idle again). The busy placeholder reflects
+// it (from the second send on: "<boss>: turn N · your message rides next").
+func (c *Chat) SetServerTurn(n int) {
+	if c.serverTurn == n {
+		return
+	}
+	c.serverTurn = n
+	c.refreshPlaceholder()
+}
+
+// MarkThreadStopped force-collapses one agent's worker thread (the /stop
+// unwind): its summary reads "✗ stopped" until an explicit per-agent
+// expand (mouse click / double-click) re-opens the rows.
+func (c *Chat) MarkThreadStopped(name string) {
+	if c.threadStop == nil {
+		c.threadStop = map[string]bool{}
+	}
+	if c.threadStop[name] {
+		return
+	}
+	c.threadStop[name] = true
+	c.forceRender()
+}
 
 // SetPermissionHandlers wires the app's permission answer/defer callbacks
 // for the y/a/n/esc keys captured while a prompt is open.
@@ -495,9 +549,22 @@ func (c *Chat) delegatingText() string {
 	return name + ": delegating · " + itoa(c.delegatingN) + " busy"
 }
 
+// turnText — the busy placeholder's free-queuing wording once a second
+// prompt is already queued server-side this turn ("boss: turn 2 · your
+// message rides next").
+func (c *Chat) turnText() string {
+	name := c.bossShort
+	if name == "" {
+		name = defaultBossShort
+	}
+	return name + ": turn " + itoa(c.serverTurn) + " · your message rides next"
+}
+
 // refreshPlaceholder recomputes the textarea placeholder from pending +
-// queue + question-hold state. A parked question turn (WAITING, not
-// typing) wins over the typing text in both wording and queue badge.
+// queue + question-hold + server-turn state. A parked question turn
+// (WAITING, not typing) wins over the typing text in both wording and
+// queue badge; the free-queuing turn text wins over the plain typing text
+// from the second direct send on.
 func (c *Chat) refreshPlaceholder() {
 	base := ""
 	switch {
@@ -505,6 +572,9 @@ func (c *Chat) refreshPlaceholder() {
 		base = placeholderWait
 	case c.pending:
 		base = c.typingText()
+		if c.serverTurn >= 2 {
+			base = c.turnText()
+		}
 	default:
 		c.ta.Placeholder = placeholderIdle
 		return
@@ -862,6 +932,15 @@ func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 				c.slashMove(1)
 				return nil
 			case "enter", "tab":
+				// a zero-match cmd-mode filter means the typed tail is a
+				// command the popover does not KNOW (its menu is a curated
+				// subset of applySlash's grammar): close the box and let
+				// Enter fall through to the normal send path — sinking the
+				// first Enter here would force a re-press.
+				if msg.String() == "enter" && c.slashMode == slashModeCmd && c.slashCount() == 0 {
+					c.closeSlashPicker(false)
+					break
+				}
 				return c.slashPicked()
 			case "esc":
 				c.closeSlashPicker(true) // keeps the fragment; unwinds a preview
@@ -939,8 +1018,18 @@ func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 				return nil
 			}
 			atts := c.drainAttachments()
-			if (c.pending || c.questionWaiting) && c.onEnqueue != nil {
+			// The client queue is ONLY for roadblocks: an outstanding
+			// question hold (a plain Send would park the opencode loop at
+			// the question reply API — the reported deadlock) or an open
+			// permission modal. Everything else sends DIRECTLY — free-
+			// queuing: while the boss is busy the prompt goes straight to
+			// the backend, which queues it server-side and drains it after
+			// the current turn (no hide, no client-side flush cadence).
+			if (c.questionWaiting || c.perm != nil) && c.onEnqueue != nil {
 				return c.onEnqueue(text, atts)
+			}
+			if c.pending && c.onBusySend != nil {
+				return c.onBusySend(text, atts)
 			}
 			if c.onSend != nil {
 				return c.onSend(text, atts)
@@ -1300,7 +1389,7 @@ func parseWtoolMeta(meta string) (toolState string, tick int) {
 }
 
 // workerToolLine renders one merged employee tool entry, same shape as
-// the boss's inline one-liner ("[tool] read · x ✓/✗/… running").
+// the boss's inline one-liner ("[tool] read · x ✓/✗/✗ aborted/… running").
 func workerToolLine(m state.ChatMsg) string {
 	toolState, _ := parseWtoolMeta(m.Meta)
 	line := "[tool] " + m.Text
@@ -1309,6 +1398,8 @@ func workerToolLine(m state.ChatMsg) string {
 		return line + " ✓"
 	case "error":
 		return line + " ✗"
+	case "aborted": // /stop unwind swung a running call here
+		return line + " ✗ aborted"
 	default: // running (or anything unexpected)
 		return line + " … running"
 	}
@@ -1340,12 +1431,19 @@ func (c *Chat) renderWorkers(b *strings.Builder, groups []workerGroup) {
 		// whether think entries show their BODIES (ctrl+g / a full mouse
 		// expand). A set per-agent override wins OUTRIGHT over the
 		// live/ctrl+g default (a mouse-collapsed live thread stays
-		// collapsed until re-clicked).
+		// collapsed until re-clicked). A /stop stopped thread
+		// force-collapses — only an explicit per-agent gesture re-opens it.
+		stopped := c.threadStop[g.name]
 		expanded := (active && c.tick-g.lastTick <= wtoolStaleTicks) || c.threadsExpanded
 		full := c.threadsExpanded
 		if v, ok := c.threadExpand[g.name]; ok {
 			expanded = v
 			full = v
+		}
+		if stopped {
+			if _, ok := c.threadExpand[g.name]; !ok {
+				expanded = false
+			}
 		}
 		head := g.name
 		if task != "" {
@@ -1398,7 +1496,15 @@ func (c *Chat) renderWorkers(b *strings.Builder, groups []workerGroup) {
 			// a summary without thoughts renders byte-identical to before
 			summary += " · " + itoa(thinks) + " think"
 		}
-		summary += " ✓ done)"
+		summaryStyle := chrome.DimText
+		if stopped {
+			// /stop unwind: the thread collapsed because the sessions were
+			// aborted, not because the work returned
+			summary += " ✗ stopped)"
+			summaryStyle = chrome.ErrText.Faint(true)
+		} else {
+			summary += " ✓ done)"
+		}
 		if c.threadRows != nil {
 			// the collapsed summary IS the thread's header — clickable too
 			// (click a collapsed thread to re-expand it)
@@ -1406,9 +1512,9 @@ func (c *Chat) renderWorkers(b *strings.Builder, groups []workerGroup) {
 		}
 		for j, ln := range foldStyledRows(summary, c.w, c.w-2) {
 			if j == 0 {
-				b.WriteString("\n" + chrome.DimText.Render(ln))
+				b.WriteString("\n" + summaryStyle.Render(ln))
 			} else {
-				b.WriteString("\n" + chrome.DimText.Render("  "+ln))
+				b.WriteString("\n" + summaryStyle.Render("  "+ln))
 			}
 		}
 	}
@@ -1514,10 +1620,10 @@ func itoa(n int) string {
 const toolWrapPrefix = "[tool] "
 
 // renderTool renders one Kind="tool" one-liner, merged by CallID upstream:
-// "[tool] read · src/main.go ✓" (done) / "… running" / red "✗" (error).
-// The whole line comes out as ONE styled blob; the call site folds it with
-// foldStyledRows — escape sequences are consumed atomically there, so a
-// fold boundary never shreds one.
+// "[tool] read · src/main.go ✓" (done) / "… running" / red "✗" (error) /
+// dim-red "✗ aborted" (/stop). The whole line comes out as ONE styled
+// blob; the call site folds it with foldStyledRows — escape sequences are
+// consumed atomically there, so a fold boundary never shreds one.
 func renderTool(m state.ChatMsg) string {
 	line := toolWrapPrefix + m.Text
 	switch m.Meta {
@@ -1525,6 +1631,8 @@ func renderTool(m state.ChatMsg) string {
 		return chrome.ToolStyle.Render(line + " ✓")
 	case "error":
 		return chrome.ErrText.Faint(true).Render(line + " ✗")
+	case "aborted": // /stop unwind swung a running call here
+		return chrome.ErrText.Faint(true).Render(line + " ✗ aborted")
 	default: // running (or anything unexpected)
 		return chrome.ToolStyle.Render(line + " … running")
 	}
