@@ -103,10 +103,12 @@ func main() {
 
 	if _, err := p.Run(); err != nil {
 		model.CloseTerminal() // external p.Quit() bypasses Update — reap the PTY
+		model.PersistSession()
 		fmt.Fprintf(os.Stderr, "[grafeio] fatal: %v\n", err)
 		os.Exit(1)
 	}
 	model.CloseTerminal()
+	model.PersistSession()
 	_ = b.Stop()
 }
 

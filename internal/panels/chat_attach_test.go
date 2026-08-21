@@ -6,6 +6,9 @@ package panels
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -178,13 +181,162 @@ func TestChatAttachKeyflow(t *testing.T) {
 // TestPasteMsgReachesTextarea pins the R1 regression fix: a bracketed
 // paste (tea.PasteMsg) lands in the textarea, and the textarea's OWN
 // clipboard answer (its unexported pasteMsg rides through the same
-// default arm as a plain string) lands too.
+// default arm as a plain string) lands too. ("bracketed paste" is plain
+// prose — it must survive the smart-paste classifier as TEXT.)
 func TestPasteMsgReachesTextarea(t *testing.T) {
 	c := NewChat(nil)
 	c.SetSize(60, 30)
 	c.Update(tea.PasteMsg{Content: "bracketed paste"})
 	if got := c.ta.Value(); got != "bracketed paste" {
 		t.Fatalf("tea.PasteMsg must insert into the textarea, got %q", got)
+	}
+}
+
+// TestPasteFilePaths pins the Finder-copy classifier: ok ONLY when every
+// token unquotes/unescapes to an existing REGULAR file — prose, missing
+// paths, mixed hits, directories and empty pastes all classify as TEXT.
+func TestPasteFilePaths(t *testing.T) {
+	dir := t.TempDir()
+	f1 := filepath.Join(dir, "shot.png")
+	f2 := filepath.Join(dir, "notes.txt")
+	fSpace := filepath.Join(dir, "my file.png")
+	for _, p := range []string{f1, f2, fSpace} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	escape := func(p string) string { return strings.ReplaceAll(p, " ", `\ `) }
+
+	cases := []struct {
+		name    string
+		content string
+		want    []string
+		wantOK  bool
+	}{
+		{"one existing file", f1, []string{f1}, true},
+		{"two files space-separated", f1 + " " + f2, []string{f1, f2}, true},
+		{"escaped space (Paste Escaped Text)", escape(fSpace), []string{fSpace}, true},
+		{"surrounding double quotes", `"` + fSpace + `"`, []string{fSpace}, true},
+		{"surrounding single quotes", `'` + fSpace + `'`, []string{fSpace}, true},
+		{"leading/trailing whitespace", "  " + f1 + "\n", []string{f1}, true},
+		{"prose is not a path", "hello world", nil, false},
+		{"nonexistent path", "/definitely/not/here.png", nil, false},
+		{"one real file + one ghost", f1 + " /definitely/not/here.png", nil, false},
+		{"a directory is not a chip", dir, nil, false},
+		{"empty paste", "", nil, false},
+		{"whitespace-only paste", "   ", nil, false},
+	}
+	for _, tc := range cases {
+		got, ok := pasteFilePaths(tc.content)
+		if ok != tc.wantOK {
+			t.Errorf("%s: pasteFilePaths(%q) ok=%v, want %v", tc.name, tc.content, ok, tc.wantOK)
+			continue
+		}
+		if ok && strings.Join(got, "|") != strings.Join(tc.want, "|") {
+			t.Errorf("%s: pasteFilePaths(%q) = %v, want %v", tc.name, tc.content, got, tc.want)
+		}
+	}
+}
+
+// TestPasteMsgAttachesFinderCopy drives the smart arm end-to-end: a
+// Finder-copied file arrives as tea.PasteMsg path text and must stage a
+// chip (basename + resolved MIME) while the textarea stays EMPTY.
+func TestPasteMsgAttachesFinderCopy(t *testing.T) {
+	dir := t.TempDir()
+	png := filepath.Join(dir, "shot.png")
+	if err := os.WriteFile(png, []byte("not-really-a-png"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := NewChat(nil)
+	c.SetSize(60, 30)
+	c.Update(tea.PasteMsg{Content: png})
+	if len(c.atts) != 1 {
+		t.Fatalf("a Finder-copy paste must stage exactly one chip, got %d", len(c.atts))
+	}
+	if c.atts[0].name != filepath.Base(png) || c.atts[0].path != png {
+		t.Fatalf("the chip names the basename and keeps the path, got %+v", c.atts[0])
+	}
+	if got := c.ta.Value(); got != "" {
+		t.Fatalf("a Finder-copy paste must NOT type into the textarea, got %q", got)
+	}
+	fmt.Println("---- FINDER-COPY PASTE (60 cols, ansi-stripped) ----")
+	fmt.Print(ansi.Strip(c.View()))
+	fmt.Println("---- END PANEL ----")
+	if view := ansi.Strip(c.View()); !strings.Contains(view, "📎 shot.png (image/png)") {
+		t.Fatalf("the staged chip must render on the chips row:\n%s", view)
+	}
+}
+
+// TestImagePasteKeyTriggers: ctrl+v AND super+v (cmd+v as kitty-protocol
+// terminals report it) fire the same image probe and close an open @
+// picker. The returned cmds are NEVER executed — they shell out.
+func TestImagePasteKeyTriggers(t *testing.T) {
+	superV := tea.KeyPressMsg(tea.Key{Code: 'v', Mod: tea.ModSuper})
+	if got := superV.String(); got != "super+v" {
+		t.Fatalf("the cmd modifier must render as \"super+v\", got %q", got)
+	}
+	for _, msg := range []tea.KeyPressMsg{
+		tea.KeyPressMsg(tea.Key{Code: 'v', Mod: tea.ModCtrl}),
+		superV,
+	} {
+		c := NewChat(nil)
+		c.SetSize(60, 30)
+		c.atOpen = true
+		cmd := c.Update(msg)
+		if cmd == nil {
+			t.Fatalf("%s must fire the image probe (non-nil cmd)", msg.String())
+		}
+		if c.atOpen {
+			t.Fatalf("%s must close an open @ picker", msg.String())
+		}
+	}
+}
+
+// TestPasteMsgEmptyImageProbe: an empty/whitespace bracketed paste is
+// darwin's cmd+v-with-an-image-clipboard signal (the terminal has no
+// bytes to send) — it must fire the probe and NOT touch the textarea.
+// Elsewhere it inserts harmlessly like any plain paste.
+func TestPasteMsgEmptyImageProbe(t *testing.T) {
+	for _, content := range []string{"", "  "} {
+		c := NewChat(nil)
+		c.SetSize(60, 30)
+		cmd := c.Update(tea.PasteMsg{Content: content})
+		if runtime.GOOS == "darwin" {
+			if cmd == nil {
+				t.Fatalf("an empty/whitespace paste (%q) on darwin must fire the image probe", content)
+			}
+			if got := c.ta.Value(); got != "" {
+				t.Fatalf("the probe trigger must NOT touch the textarea, got %q", got)
+			}
+			// DO NOT execute cmd — it shells out (pngpaste/osascript).
+		} else {
+			if got := c.ta.Value(); got != content {
+				t.Fatalf("a whitespace-only paste (%q) just inserts on %s, got %q", content, runtime.GOOS, got)
+			}
+		}
+	}
+}
+
+// TestClipPasteReprobeRefeeds: a reprobe MISS re-feeds the original
+// bracketed-paste bytes straight into the textarea (NOT the OSC52
+// clipboard replay) — and the platform notices stay silent on the
+// paste-triggered path. Pure: clipPasteMsg is constructed directly.
+func TestClipPasteReprobeRefeeds(t *testing.T) {
+	c := NewChat(nil)
+	c.SetSize(60, 30)
+	c.Update(clipPasteMsg{noImage: true, reprobe: true, reinsert: "  "})
+	if got := c.ta.Value(); got != "  " {
+		t.Fatalf("a reprobe miss must re-feed the original paste bytes, got %q", got)
+	}
+
+	c2 := NewChat(nil)
+	c2.SetSize(60, 30)
+	c2.Update(clipPasteMsg{unsupported: true, reprobe: true, reinsert: "x"})
+	if got := c2.ta.Value(); got != "x" {
+		t.Fatalf("an unsupported reprobe must still land the bytes, got %q", got)
+	}
+	if c2.pasteUnsupported {
+		t.Fatal("bracketed-paste probes never fire the unsupported notice")
 	}
 }
 

@@ -1,10 +1,11 @@
 // digest.go — the render-skip seam: Frame() hashes everything its pixels
 // depend on into one cheap digest; an unchanged digest returns the cached
 // frame string verbatim, no render cost. st.Tick is always in the digest
-// (sprite beats, wall clock, blink-z's, stream carets animate with it);
-// panel ephemera the state can't see (textarea draft, scroll offsets,
-// spinner frames) are covered by m.frameNonce, bumped on every message
-// that routes keys/mouse/spinner into the tabs or mutates panels directly.
+// (sprite beats, wall clock, blink-z's, the typing row and think-frame /
+// tool spinners animate with it); panel ephemera the state can't see
+// (textarea draft, scroll offsets, spinner frames) are covered by
+// m.frameNonce, bumped on every message that routes keys/mouse/spinner
+// into the tabs or mutates panels directly.
 package app
 
 import (

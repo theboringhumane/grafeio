@@ -95,6 +95,12 @@ type liveBackend struct {
 	lastUserAt    int64
 	respawnFresh  bool   // ResetPrimary(true) latched: next Send respawns a fresh session once
 	respawnOldID  string // primary id ResetPrimary dropped, so Send can un-seat it
+	// primaryOverride — the office-session resume pin (internal/app
+	// sessions.go) set BEFORE Start when a saved session.json for this
+	// directory exists. Start prefers it over find-or-create; a server-side
+	// 404/fetch failure degrades to the normal ensurePrimary path (degrade
+	// open — a stale file must never hard-fail a boot).
+	primaryOverride string
 	// promptModelRejected latches when a serve rejects the per-prompt model
 	// override with a 400 (an older/foreign server without the /doc model
 	// field). From then on prompts go out without the override — degrade
@@ -144,7 +150,7 @@ func (b *liveBackend) Start(emit func(state.Event)) error {
 	b.baseURL = u
 	b.mu.Unlock()
 
-	primary, err := b.ensurePrimary()
+	primary, err := b.resolvePrimary()
 	if err != nil {
 		return err
 	}
@@ -550,6 +556,28 @@ func (b *liveBackend) ensurePrimary() (ocSession, error) {
 	return b.createPrimary(b.bossName())
 }
 
+// resolvePrimary is Start's boss-session choice: when a PrimaryOverride is
+// latched (the app restored an office session for this directory) the saved
+// session wins — BUT ONLY if the server still has it (a 404/fetch failure,
+// e.g. the member hand-deleted it server-side, falls back to the normal
+// find-or-create: degrade open, never hard fail the boot on a stale file).
+// Without an override this IS ensurePrimary.
+func (b *liveBackend) resolvePrimary() (ocSession, error) {
+	b.mu.Lock()
+	override := b.primaryOverride
+	b.mu.Unlock()
+	if override != "" {
+		var s ocSession
+		if err := b.doJSON(http.MethodGet, "/session/"+override, nil, &s); err == nil && s.ID != "" {
+			b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
+				"[grafeio] primary session: restored %s (office session on disk)", s.ID)})
+			return s, nil
+		}
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] saved office session's primary " + override + " is gone server-side — normal find-or-create instead"})
+	}
+	return b.ensurePrimary()
+}
+
 // createPrimary makes a brand-new root session with the given title.
 func (b *liveBackend) createPrimary(title string) (ocSession, error) {
 	var created ocSession
@@ -619,6 +647,63 @@ func (b *liveBackend) ResetPrimary(forceNew bool) error {
 	b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
 		"[grafeio] primary session reset (forceNew=%v) — next send respawns", forceNew)})
 	return nil
+}
+
+// ---------------------------------------------------------------- office session seams (ADDITIVE)
+
+// PrimaryOverride pins the boss-session id Start should resume (the app
+// calls it BEFORE Start, after restoring a saved office session for this
+// directory — see internal/app/sessions.go). resolvePrimary verifies the
+// session still exists server-side; anything else falls back to
+// find-or-create.
+//
+// NOT part of state.Backend: the app type-asserts this seam (same pattern
+// as teamBackend/attachmentBackend); harness stubs never implement it.
+func (b *liveBackend) PrimaryOverride(id string) {
+	b.mu.Lock()
+	b.primaryOverride = id
+	b.mu.Unlock()
+}
+
+// PrimaryID returns the current primary ("boss") session id, "" until
+// Start resolves one. The office-session persist loop snapshots it. The
+// id moves when the session is respawned (ResetPrimary/next-send) or
+// replaced (/new → NewOffice) — reader-snapshot on demand, no caching.
+func (b *liveBackend) PrimaryID() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.primaryID
+}
+
+// NewOffice — the /new command's backend leg: ResetPrimary(true) semantics
+// (the old primary is un-seated, seconds-old respawn latch consumed, the
+// server-side session itself NEVER deleted), then create a BRAND-NEW
+// primary titled "grafeio office" (bossName()) NOW — not lazily on the
+// next send — and re-seat the floor boss on it (fire the old hire row,
+// hire the new one). Returns the new session id so the persist loop
+// threads it into the next snapshot. Requires a started backend.
+func (b *liveBackend) NewOffice() (string, error) {
+	primary, err := b.createPrimary(b.bossName())
+	if err != nil {
+		return "", err
+	}
+	b.mu.Lock()
+	old := b.respawnOldID
+	if old == "" {
+		old = b.primaryID // no latch pending (e.g. direct call) — un-seat the live one
+	}
+	b.primaryID = primary.ID
+	b.respawnFresh = false // the fresh-create latch is consumed eagerly here
+	b.respawnOldID = ""
+	b.mu.Unlock()
+	if old != "" && old != primary.ID {
+		b.fl.emit(state.Event{Kind: state.EvFire, EmployeeID: old})
+	}
+	b.fl.emit(state.Event{Kind: state.EvHire, Employee: state.Employee{
+		ID: primary.ID, Name: "manager", Role: state.RoleManager, Seat: "manager", Sprite: state.SpriteAtDesk,
+	}})
+	b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] new office session fresh (" + primary.ID + ")"})
+	return primary.ID, nil
 }
 
 // postPrompt is promptAsync: POST /session/{id}/prompt_async (204 on ok).

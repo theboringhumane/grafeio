@@ -59,7 +59,7 @@ func runMsg(t *testing.T, m Model, msg tea.Msg) Model {
 		case tea.BatchMsg:
 			queue = append(queue, out...)
 		case spinner.TickMsg:
-			// the blinking caret's self-re-arm — ignore
+			// the typing-row spinner's self-re-arm — ignore
 		default:
 			nm, next := m.Update(out)
 			m = nm.(Model)

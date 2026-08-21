@@ -49,6 +49,29 @@
 //	                            answer. Prints "QUESTION-LOOP: FIXED" (exit 0) or
 //	                            "QUESTION-LOOP: STUCK" (exit 1).
 //
+//	grafeio-headless --persist-demo
+//	                            office-session persist proof, run 1 (forces
+//	                            live): scratch GRAFEIO_HOME (created when
+//	                            unset, path printed as [persist-home]), Start,
+//	                            send "say pineapple", wait up to 60s for the
+//	                            completed boss bubble, persist the office
+//	                            session, print session.json verbatim. Prints
+//	                            "PERSIST: SAVED" (exit 0) or exits 1.
+//	grafeio-headless --persist-restore
+//	                            office-session persist proof, run 2 (forces
+//	                            live; requires the SAME GRAFEIO_HOME + cwd as
+//	                            run 1): LoadSession + PrimaryOverride + Start,
+//	                            asserts the restore notice line AND that the
+//	                            SAME primary id got reused (session under the
+//	                            50-msg stale guard). Prints "PERSIST: RESTORED".
+//	grafeio-headless --persist-new
+//	                            office-session persist proof, run 3 (forces
+//	                            live; same GRAFEIO_HOME + cwd): /new leg —
+//	                            NewOffice() must mint a FRESH primary id (!=
+//	                            the saved one), print the /new notice, and
+//	                            prove the overwrite keeps the latest primary
+//	                            in session.json. Prints "PERSIST: NEW".
+//
 // The plain demo run also auto-answers its scripted boss question
 // (que-demo-1, 800ms after it surfaces) so the registration + resolved
 // lines always show.
@@ -66,6 +89,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/theboringhumane/grafeio/internal/app"
 	"github.com/theboringhumane/grafeio/internal/backend"
 	"github.com/theboringhumane/grafeio/internal/config"
 	"github.com/theboringhumane/grafeio/internal/state"
@@ -81,10 +105,22 @@ func main() {
 	batchProbe := flag.Bool("batch-probe", false, "live mode: queue-flush batch probe — board-mirror 2 queue items, send one composed batch, assert the boss covers both (BATCH-PROBE: OK|FAIL)")
 	cfgPath := flag.String("cfg", "", "path to a brain.json for this run (else config.Load() honors GRAFEIO_HOME)")
 	efficiency := flag.Bool("efficiency", false, "simulate 11 board-poll cadence decisions (8 unchanged syncs, then a change) and print the exponential backoff, then exit")
+	persistDemo := flag.Bool("persist-demo", false, "office-session persist proof run 1 (live): send 'say pineapple', wait for the completed bubble, persist the office session, print session.json (PERSIST: SAVED)")
+	persistRestore := flag.Bool("persist-restore", false, "office-session persist proof run 2 (live): restore boot — restore notice + SAME primary id reused (PERSIST: RESTORED)")
+	persistNew := flag.Bool("persist-new", false, "office-session persist proof run 3 (live): /new — fresh primary id != saved id + /new notice + latest-wins overwrite proof (PERSIST: NEW)")
 	flag.Parse()
 
 	if *efficiency {
 		runEfficiencySim()
+		return
+	}
+
+	// Office-session persist probes run in their own harness (own emit,
+	// own chat capture) and resolve GRAFEIO_HOME BEFORE loadConfig — run 1
+	// with an unset env creates the scratch home first, so the brain.json
+	// first-boot write lands in the scratch, never in the real home.
+	if *persistDemo || *persistRestore || *persistNew {
+		runPersistProbe(*cfgPath, *persistDemo, *persistRestore, *persistNew)
 		return
 	}
 
@@ -580,6 +616,298 @@ func runEfficiencySim() {
 		}
 	}
 	fmt.Println("EFFICIENCY: OK")
+}
+
+// --- office-session persist probes -------------------------------------------
+
+// persistSeam is the office-session seam the live backend exposes
+// (type-asserted; internal/backend PrimaryOverride/PrimaryID +
+// internal/app sessions.go). officeSpawnSeam is the /new leg.
+type persistSeam interface {
+	PrimaryOverride(id string)
+	PrimaryID() string
+}
+type officeSpawnSeam interface {
+	NewOffice() (string, error)
+}
+
+// runPersistProbe drives the three-run office-session proof:
+//
+//	run 1 --persist-demo    (own GRAFEIO_HOME): boot live, send "say
+//	                        pineapple", wait for the completed bubble,
+//	                        persist the office session, print session.json.
+//	                        Verdict: PERSIST: SAVED.
+//	run 2 --persist-restore (SAME GRAFEIO_HOME + cwd as run 1): rebuild the
+//	                        boot exactly as app.New does — LoadSession,
+//	                        PrimaryOverride before Start — then assert the
+//	                        restore notice line and that the SAME primary id
+//	                        got reused (the saved session sits far under the
+//	                        50-msg stale guard). Verdict: PERSIST: RESTORED.
+//	run 3 --persist-new     (same home + cwd): the /new leg — NewOffice()
+//	                        must mint a FRESH primary (!= the saved one),
+//	                        print the /new notice, and prove that a persist
+//	                        overwrite keeps the LATEST id in session.json
+//	                        (always-latest-wins). Verdict: PERSIST: NEW.
+func runPersistProbe(cfgPath string, demo, restore, fresh bool) {
+	count := 0
+	for _, on := range []bool{demo, restore, fresh} {
+		if on {
+			count++
+		}
+	}
+	if count != 1 {
+		fmt.Fprintln(os.Stderr, "exactly one of --persist-demo / --persist-restore / --persist-new")
+		os.Exit(2)
+	}
+
+	// Scratch home: run 1 creates one when GRAFEIO_HOME is unset (and
+	// prints it — runs 2/3 MUST be invoked with that same home exported);
+	// runs 2/3 hard-require it so a stray run cannot read/write the real
+	// ~/.grafeio/sessions.
+	home := os.Getenv("GRAFEIO_HOME")
+	if home == "" {
+		if !demo {
+			fmt.Fprintln(os.Stderr, "GRAFEIO_HOME is required for --persist-restore / --persist-new (export the [persist-home] path printed by run 1)")
+			os.Exit(2)
+		}
+		var err error
+		home, err = os.MkdirTemp("", "grafeio-persist-home")
+		if err != nil {
+			fail("persist home", err)
+		}
+		if err := os.Setenv("GRAFEIO_HOME", home); err != nil {
+			fail("persist home env", err)
+		}
+	}
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		fail("persist home mkdir", err)
+	}
+	fmt.Printf("[persist-home] %s\n", home)
+
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		fail("config", err)
+	}
+	dir, err := os.Getwd()
+	if err != nil {
+		fail("getwd", err)
+	}
+	fmt.Printf("[cfg] boss=%q model=%q dir=%q session=%s\n",
+		cfg.Boss.Name, cfg.Boss.Model, dir, app.SessionPath(dir))
+
+	switch {
+	case demo:
+		persistRunSave(cfg, dir)
+	case restore:
+		persistRunRestore(cfg, dir)
+	case fresh:
+		persistRunNew(cfg, dir)
+	}
+}
+
+// persistLiveBoot spawns/attaches the live backend exactly like a real UI
+// boot, returning the backend plus a boss-reply channel. The emit also
+// mirrors the chat-user/BOSS final bubbles into chatLog so run 1 can
+// persist the transcript the office actually showed.
+func persistLiveBoot(cfg *config.Config, dir string, chatLog *[]state.ChatMsg) (state.Backend, chan string) {
+	bossCh := make(chan string, 64)
+	var mu sync.Mutex
+	emit := func(e state.Event) {
+		printEvent(e)
+		mu.Lock()
+		switch e.Kind {
+		case state.EvChatUser:
+			*chatLog = append(*chatLog, e.Msg)
+		case state.EvChatBoss:
+			if !e.Msg.Pending && !strings.HasPrefix(e.Msg.ID, "boss-") {
+				*chatLog = append(*chatLog, e.Msg)
+				select {
+				case bossCh <- e.Msg.Text:
+				default:
+				}
+			}
+		}
+		mu.Unlock()
+	}
+	b := backend.NewLive("", dir, cfg)
+	if err := b.Start(emit); err != nil {
+		fail("start", err)
+	}
+	return b, bossCh
+}
+
+// persistRunSave — run 1: live boot, one prompt, persist, print the file.
+func persistRunSave(cfg *config.Config, dir string) {
+	var chat []state.ChatMsg
+	b, bossCh := persistLiveBoot(cfg, dir, &chat)
+	fmt.Printf("[prompt] %q\n", "say pineapple")
+	if err := b.Send("say pineapple"); err != nil {
+		fail("send", err)
+	}
+	turn := collectTurn(bossCh, 60*time.Second)
+	if len(turn) == 0 {
+		_ = b.Stop()
+		fmt.Fprintln(os.Stderr, "PERSIST: FAIL — no completed boss bubble within 60s")
+		os.Exit(1)
+	}
+	for i, t := range turn {
+		fmt.Printf("[persist] completed bubble #%d %q\n", i+1, trunc(t, 200))
+	}
+	ps, ok := b.(persistSeam)
+	if !ok {
+		_ = b.Stop()
+		fmt.Fprintln(os.Stderr, "PERSIST: FAIL — live backend does not expose the PrimaryOverride/PrimaryID seam")
+		os.Exit(1)
+	}
+	primaryID := ps.PrimaryID()
+	if primaryID == "" {
+		_ = b.Stop()
+		fmt.Fprintln(os.Stderr, "PERSIST: FAIL — no primary session id after Start")
+		os.Exit(1)
+	}
+	// Snapshot + atomic write — the exact same seam the UI's quit path runs
+	// (app.PersistSession → Snapshot + SaveSession).
+	sf := app.Snapshot(dir, primaryID, state.OfficeState{Chat: chat})
+	if err := app.SaveSession(dir, sf); err != nil {
+		fail("persist write", err)
+	}
+	if err := b.Stop(); err != nil {
+		fail("stop", err)
+	}
+	fmt.Println("[done] backend stopped")
+	raw, err := os.ReadFile(app.SessionPath(dir))
+	if err != nil {
+		fail("session.json read-back", err)
+	}
+	fmt.Printf("--- session.json (%s) ---\n%s\n", app.SessionPath(dir), raw)
+	fmt.Printf("PERSIST: SAVED (primary=%s msgs=%d)\n", primaryID, len(chat))
+}
+
+// persistRunRestore — run 2: the restore boot. Mirrors app.New exactly:
+// LoadSession + Fresh gate + PrimaryOverride BEFORE Start; after Start the
+// saved primary id MUST have won (server still has the session — the
+// 404/fetch-failure degrade path is commented, not exercised here).
+func persistRunRestore(cfg *config.Config, dir string) {
+	sf, ok := app.LoadSession(dir)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "PERSIST: FAIL — no session.json for %s under %s (run --persist-demo first)\n", dir, os.Getenv("GRAFEIO_HOME"))
+		os.Exit(1)
+	}
+	if !sf.Fresh() {
+		fmt.Fprintln(os.Stderr, "PERSIST: FAIL — session.json is stale (older than 4 days)")
+		os.Exit(1)
+	}
+
+	b := backend.NewLive("", dir, cfg)
+	ps, ok := b.(persistSeam)
+	if !ok {
+		fmt.Fprintln(os.Stderr, "PERSIST: FAIL — live backend does not expose the PrimaryOverride/PrimaryID seam")
+		os.Exit(1)
+	}
+	// The app.New ordering contract: override lands BEFORE Start.
+	ps.PrimaryOverride(sf.PrimaryID)
+	if err := b.Start(func(e state.Event) { printEvent(e) }); err != nil {
+		fail("start", err)
+	}
+	restored := ps.PrimaryID()
+	if err := b.Stop(); err != nil {
+		fail("stop", err)
+	}
+	fmt.Println("[done] backend stopped")
+
+	notice := app.RestoreNotice(sf)
+	fmt.Printf("[notice] %s\n", notice)
+	failures := 0
+	check := func(ok bool, label string) {
+		if ok {
+			fmt.Printf("[assert] PASS %s\n", label)
+		} else {
+			failures++
+			fmt.Printf("[assert] FAIL %s\n", label)
+		}
+	}
+	check(restored == sf.PrimaryID && restored != "",
+		fmt.Sprintf("same primary id reused (saved %s -> live %s)", sf.PrimaryID, restored))
+	check(len(sf.Chat) < 50, fmt.Sprintf("session under the 50-msg stale guard (%d msgs)", len(sf.Chat)))
+	check(strings.Contains(notice, "restored office session from") && strings.Contains(notice, "/new for a fresh office"),
+		"restore notice line is the office session wording")
+	if failures == 0 {
+		fmt.Println("PERSIST: RESTORED")
+		return
+	}
+	fmt.Printf("PERSIST: RESTORE-FAIL (%d check(s) failed)\n", failures)
+	os.Exit(1)
+}
+
+// persistRunNew — run 3: the /new leg. NewOffice() must mint a FRESH
+// primary (!= the saved one), the /new notice must be the office-session
+// wording, and the overwrite must keep the LATEST primary in session.json.
+func persistRunNew(cfg *config.Config, dir string) {
+	sf, ok := app.LoadSession(dir)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "PERSIST: FAIL — no session.json for %s (run --persist-demo first)\n", dir)
+		os.Exit(1)
+	}
+	b := backend.NewLive("", dir, cfg)
+	// /new does NOT restore (the member asked for a fresh office) — no
+	// PrimaryOverride here. Start's normal find-or-create runs; in this
+	// directory that already reuses the previous session, which makes the
+	// NewOffice id difference the strong assert.
+	if err := b.Start(func(e state.Event) { printEvent(e) }); err != nil {
+		fail("start", err)
+	}
+	ob, ok := b.(officeSpawnSeam)
+	if !ok {
+		_ = b.Stop()
+		fmt.Fprintln(os.Stderr, "PERSIST: FAIL — live backend does not expose the NewOffice seam")
+		os.Exit(1)
+	}
+	newID, err := ob.NewOffice()
+	if err != nil {
+		_ = b.Stop()
+		fmt.Fprintf(os.Stderr, "PERSIST: FAIL — NewOffice: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("[notice] %s\n", app.NewOfficeNotice)
+	if ps, ok := b.(persistSeam); ok {
+		fmt.Printf("[persist] primary now %s (was %s)\n", ps.PrimaryID(), sf.PrimaryID)
+	}
+	// The app's /new + quit path: the NEXT persist writes the fresh
+	// session (the previous transcript was archived, never deleted — and
+	// this overwrite proves always-latest-wins from THIS dir onward).
+	if err := app.SaveSession(dir, app.Snapshot(dir, newID, state.OfficeState{})); err != nil {
+		fail("persist overwrite", err)
+	}
+	if err := b.Stop(); err != nil {
+		fail("stop", err)
+	}
+	fmt.Println("[done] backend stopped")
+
+	failures := 0
+	check := func(ok bool, label string) {
+		if ok {
+			fmt.Printf("[assert] PASS %s\n", label)
+		} else {
+			failures++
+			fmt.Printf("[assert] FAIL %s\n", label)
+		}
+	}
+	check(newID != "" && newID != sf.PrimaryID,
+		fmt.Sprintf("fresh primary id differs from the saved one (saved %s -> new %s)", sf.PrimaryID, newID))
+	check(strings.Contains(app.NewOfficeNotice, "new office spawned") &&
+		strings.Contains(app.NewOfficeNotice, "archived (kept on disk)"),
+		"/new notice is the office-session wording")
+	// always-latest-wins: the re-written session.json threads the NEW id.
+	sf2, ok2 := app.LoadSession(dir)
+	check(ok2 && sf2.PrimaryID == newID, "session.json overwrite keeps the new primary (always-latest-wins)")
+	raw, _ := os.ReadFile(app.SessionPath(dir))
+	fmt.Printf("--- session.json (%s) ---\n%s\n", app.SessionPath(dir), raw)
+	if failures == 0 {
+		fmt.Println("PERSIST: NEW")
+		return
+	}
+	fmt.Printf("PERSIST: NEW-FAIL (%d check(s) failed)\n", failures)
+	os.Exit(1)
 }
 
 func fail(stage string, err error) {

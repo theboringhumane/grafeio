@@ -201,9 +201,16 @@ type Model struct {
 	floorW        int
 	tabs          *panels.Tabs
 	chat          *panels.Chat
+	agents        *panels.Agents   // roster tab — floor-click selection highlight
 	activity      *panels.Activity
 	termTab       *termTabWrap // tab 2: the real OS-shell (lazy PTY, terminal.go)
 	keys          KeyMap
+
+	// floor-click bookkeeping (bubbletea v2 mouse): lastClickAgent/At
+	// detect a DOUBLE-click on the same sprite (double-click = toggle
+	// that agent's chat thread).
+	lastClickAgent string
+	lastClickAt    time.Time
 
 	// zen — transient fullscreen-floor mode: sidebar hidden entirely, topbar
 	// stays, statusbar minimal; any key exits. Never persisted (the ruling:
@@ -271,6 +278,12 @@ type Model struct {
 	// delta / thought / primary tool / any boss bubble event). Feeds the
 	// delegation reducer hook (applyDelegation, P3).
 	lastBossActivity int
+
+	// Office-session persistence (sessions.go; LIVE mode only):
+	// sessDir is the working directory the office belongs to ("" = no
+	// persist), sessLast throttles the 5s cheap-write loop off EvTick.
+	sessDir  string
+	sessLast time.Time
 }
 
 // permPrompt is a pending boss permission request.
@@ -391,6 +404,7 @@ func New(b state.Backend, cfg *config.Config) Model {
 		bossShort:        bossShort,
 		st:               initialState(b.Mode()),
 		chat:             chat,
+		agents:           agents,
 		activity:         activity,
 		termTab:          termTab,
 		activeThink:      map[string]bool{},
@@ -436,6 +450,24 @@ func New(b state.Backend, cfg *config.Config) Model {
 	m.tabs.SetCompact(m.compact())
 	m.chat.SetCompact(m.compact())
 	m.tabs.SetState(m.st)
+	// Office-session restore (LIVE ONLY — demo is a scripted tour and a
+	// restored real transcript would confuse it; per the ruling, demo
+	// skips). The PrimaryOverride MUST land before backend.Start (main
+	// owns Start) so the saved boss session wins the boot choice; the
+	// transcript/roster hydration is local state and safe pre-boot.
+	if b != nil && b.Mode() == state.ModeLive {
+		if dir, err := os.Getwd(); err == nil {
+			m.sessDir = dir
+			if sf, ok := LoadSession(dir); ok && sf.Fresh() {
+				if sf.PrimaryID != "" {
+					if ps, ok := b.(primarySeamBackend); ok {
+						ps.PrimaryOverride(sf.PrimaryID)
+					}
+				}
+				m.hydrateSession(sf)
+			}
+		}
+	}
 	return m
 }
 
@@ -449,6 +481,10 @@ func (m *Model) SelectTab(name string) bool {
 	}
 	return ok
 }
+
+// ActiveTabIndex reports the selected tab position (harness seam for the
+// click proofs — double-clicked floor sprites jump to chat, 0).
+func (m Model) ActiveTabIndex() int { return m.tabs.ActiveIndex() }
 
 // SetSoundBus injects the sound engine's bus (nil disables sound). The app
 // only calls Play — the engine is owned elsewhere.
@@ -514,6 +550,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// digest can't see — invalidate the frame cache conservatively.
 		m.frameNonce++
 		if cmd := m.handleKey(msg); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	case tea.MouseClickMsg:
+		// clicks mutate the same panel ephemera (thread toggles, tab
+		// switches, roster highlight) — same cache invalidation as keys.
+		m.frameNonce++
+		if cmd := m.handleClick(msg); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
 	case chatSentMsg:
@@ -720,6 +763,7 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 	switch {
 	case key == "ctrl+q":
 		// app quit works EVERYWHERE — terminal focus included
+		m.persistOfficeSession(true) // final SYNC snapshot (live only)
 		m.closeTerminal()
 		return tea.Quit
 	case m.zen:
@@ -761,10 +805,12 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 
 	switch key {
 	case "ctrl+c":
+		m.persistOfficeSession(true) // final SYNC snapshot (live only)
 		m.closeTerminal()
 		return tea.Quit
 	case "q":
 		if !chatActive {
+			m.persistOfficeSession(true) // final SYNC snapshot (live only)
 			m.closeTerminal()
 			return tea.Quit
 		}
@@ -785,6 +831,66 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		}
 	}
 	return m.tabs.Update(msg)
+}
+
+// clickDblWindow — two floor clicks on the SAME sprite inside this window
+// count as a double-click (thread toggle), not two selections.
+const clickDblWindow = 400 * time.Millisecond
+
+// handleClick routes bubbletea v2 mouse clicks (motion reporting stays
+// OFF — the view keeps MouseModeCellMotion, which emits clicks/wheel only,
+// no move events: battery rule). FLOOR: a click on an employee's 3-cell
+// sprite (office.HitAgent) selects the agent — activity tab opens, agents
+// tab pins a ▸ marker on its row, and an office notice names it; a second
+// click on the SAME sprite inside clickDblWindow instead toggles that
+// agent's work thread in chat (and jumps there). CHAT (sidebar, chat tab):
+// a click on an expanded worker thread's "┌" header row toggles that
+// agent's thread too. Clicks landing in the 2-cell frame chrome (topbar
+// row / statusbar row) are ignored outright.
+func (m *Model) handleClick(msg tea.MouseClickMsg) tea.Cmd {
+	if m.height == 0 || m.zen || msg.Button != tea.MouseLeft {
+		return nil
+	}
+	// the 2-cell chrome (topbar + statusbar) never reacts
+	if msg.Y <= 0 || msg.Y >= m.height-1 {
+		return nil
+	}
+	if msg.X >= m.floorW {
+		// sidebar: only the chat tab claims clicks (thread header rows).
+		// Content coords = screen minus the box chrome (floor border col +
+		// sidebar top row + tab bar & border — Tabs.ContentOffset).
+		if m.tabs.ActiveIndex() != 0 || m.chat == nil {
+			return nil
+		}
+		dx, dy := m.tabs.ContentOffset()
+		m.chat.ClickRow(msg.X-(m.floorW+dx), msg.Y-(1+dy))
+		return nil
+	}
+	id, ok := office.HitAgent(m.st, msg.X, msg.Y-1 /* topbar row */)
+	if !ok {
+		return nil
+	}
+	name := id
+	if e := findEmployee(m.st, id); e != nil {
+		name = e.Name
+	}
+	now := time.Now()
+	double := m.lastClickAgent == id && now.Sub(m.lastClickAt) <= clickDblWindow
+	m.lastClickAgent, m.lastClickAt = id, now
+	if double {
+		m.lastClickAgent = "" // a third click starts a fresh pair
+		if m.chat != nil {
+			m.chat.ToggleThread(name)
+			m.tabs.SetActive(0) // show the thread it just toggled
+		}
+		return nil
+	}
+	if m.agents != nil {
+		m.agents.SetSelected(name)
+	}
+	m.tabs.SetActive(5) // the activity tab shows the agent's work log
+	m.notice(name + " selected")
+	return nil
 }
 
 // terminalActive reports whether the focused tab is the OS-shell tab.
@@ -920,6 +1026,9 @@ func (m *Model) applyEvent(ev state.Event) tea.Cmd {
 	}
 
 	if ev.Kind == state.EvTick {
+		// office-session cheap-write loop: at most one ASYNC snapshot write
+		// per 5s window (sessions.go — no-op in demo mode).
+		m.persistOfficeSession(false)
 		// social clock: plans + fires its beats off the tick (EvBubble/
 		// EvIdleDrift events through the normal reducer path — ambient.go).
 		m.runSocial()
@@ -1371,6 +1480,7 @@ func capChat(chat []state.ChatMsg) []state.ChatMsg {
 	chat = capList(chat, chatCap)
 	chat = capKind(chat, "think", thinkCap)
 	chat = capKind(chat, "tool", toolCap)
+	chat = capKind(chat, "wthink", thinkCap) // employee thread thoughts, per-CallID merged
 	return chat
 }
 
@@ -1603,8 +1713,53 @@ func reducer(st state.OfficeState, ev state.Event) state.OfficeState {
 			// keyed by CallID — mid-stream updates REPLACE the entry in place
 			// (accumulated text), Done=true is the final update; the model's
 			// activeThink set decides streaming vs collapsed at render.
-			// employee thoughts: activity line only, no chat.
+			// employee thoughts: the activity line still records them, and
+			// they ALSO merge (one per agent+CallID, accumulated text,
+			// Done=true the final update — same stream mechanics as boss)
+			// into the agent's own work thread as Kind "wthink": the chat
+			// panel renders them inside the thread (dim-italic "thinking ·
+			// N lines" rows live, a "· N think" count once collapsed,
+			// full body under ctrl+g). Meta carries the tick (␟ separator,
+			// same carrier as wtool) for the thread's staleness collapse.
 			if ev.EmployeeID != "boss" {
+				name := ev.EmployeeName
+				if name == "" {
+					if e := findEmployee(st, ev.EmployeeID); e != nil {
+						name = e.Name
+					}
+				}
+				if name == "" || name == "boss" {
+					return st // unknown actor: activity-line only, as before
+				}
+				toolState := "running"
+				if ev.Done {
+					toolState = "done"
+				}
+				id := "wthink-" + name + "-" + ev.CallID
+				if ev.CallID == "" {
+					id = "wthink-" + name + "-" + nextMsgID()
+				}
+				entry := state.ChatMsg{
+					ID:   id,
+					From: name,
+					Kind: "wthink",
+					Text: ev.Text,
+					Meta: toolState + "\x1f" + strconv.Itoa(st.Tick),
+					At:   time.Now().UnixMilli(),
+				}
+				next := append([]state.ChatMsg(nil), st.Chat...)
+				merged := false
+				for i, msg := range next {
+					if msg.Kind == entry.Kind && msg.ID == entry.ID {
+						next[i] = entry
+						merged = true
+						break
+					}
+				}
+				if !merged {
+					next = append(next, entry)
+				}
+				st.Chat = capChat(next)
 				return st
 			}
 			st.BossThinking = !ev.Done
@@ -1811,9 +1966,10 @@ const slashHelp = `commands:
   /queue             show the backlog (numbered items batched on flush)
   /queue clear       drop all queued backlog items
   /route             force-dispatch the backlog now (bypasses the busy gate)
-  @<file>            attach file (popover picker) · ctrl+v pastes images
+  @<file>            attach file (popover picker) · cmd+v pastes images (ctrl+v too)
   /perm              re-open an esc'd permission prompt
   /question          re-open a deferred boss question
+  /new               fresh office (previous transcript archived on disk)
   /status            office status
   /quit              exit grafeio`
 
@@ -2033,6 +2189,8 @@ func (m *Model) applySlash(input string) tea.Cmd {
 			Text:    m.question.Text,
 			Options: m.question.Options,
 		})
+	case "/new":
+		m.newOffice() // sessions.go — clear surfaces + fresh "grafeio office"
 	case "/status":
 		var pend, doing, done int
 		for _, t := range m.st.Tasks {
@@ -2049,6 +2207,7 @@ func (m *Model) applySlash(input string) tea.Cmd {
 			m.st.Mode, chrome.CurrentTheme().Name, PowerMode(m.cfg), len(m.st.Employees),
 			pend, doing, done, m.st.StatusLine))
 	case "/quit":
+		m.persistOfficeSession(true) // final SYNC snapshot (live only)
 		m.closeTerminal()
 		return tea.Quit
 	default:

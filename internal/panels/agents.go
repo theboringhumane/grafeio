@@ -59,6 +59,7 @@ type Agents struct {
 	w, h     int
 	rev      string
 	bossName string // cfg.Boss.Name — the human label pinned first (default below)
+	selected string // floor-click selection: a "▸" marker + bold row (popover.go SetSelected)
 }
 
 // defaultBossName is the pinned boss label when no config name is set.
@@ -155,13 +156,20 @@ func (a *Agents) render() string {
 		word := spriteWord(e.Sprite)
 		c := chrome.RoleColor(label)
 
+		// floor-click selection marker: "▸ " + bold row (2 cells of the
+		// width budget go to the marker)
+		sel := a.selected != "" && e.Name == a.selected
+		marker := "  "
+		if sel {
+			marker = lipgloss.NewStyle().Foreground(c).Bold(true).Render("▸ ")
+		}
 		leftPlain := label + " " + chrome.RoleGlyph(e.Role) + " " + word
 		task := e.Task
-		room := a.w - len(leftPlain) - 1
+		room := a.w - len(leftPlain) - 1 - 2
 		if task != "" && room >= 6 && len(task) > room {
 			task = task[:room-3] + "..." // ellipsis on TASK TEXT (machine), not NL
 		}
-		gap := a.w - len(leftPlain) - len(task)
+		gap := a.w - len(leftPlain) - len(task) - 2
 		if gap < 1 {
 			gap = 1
 		}
@@ -176,7 +184,10 @@ func (a *Agents) render() string {
 				chrome.Fg(c, chrome.RoleGlyph(e.Role)) + " " +
 				wordStyle(word, word)
 		}
-		line := left + strings.Repeat(" ", gap)
+		if sel {
+			left = lipgloss.NewStyle().Bold(true).Render(left)
+		}
+		line := marker + left + strings.Repeat(" ", gap)
 		if task != "" && gap > 1 {
 			line += chrome.DimText.Render(task)
 		}

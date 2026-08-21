@@ -25,9 +25,10 @@
 //	                    [--stream]  (chat-stream proof: one "bossmsg-m1" bubble
 //	                                streamed as 5 ACCUMULATED pending updates
 //	                                300ms apart, then the pinned final; prints
-//	                                frame mid-stream (partial bubble + caret,
-//	                                spinner row gone) and after done (one single
-//	                                settled bubble — replace-in-place, no dup).
+//	                                frame mid-stream (partial bubble growing in
+//	                                the viewport, typing row below the divider)
+//	                                and after done (one single settled bubble —
+//	                                replace-in-place, no dup).
 //	                                A message is typed mid-stream to prove the
 //	                                queue holds until the final bubble; the
 //	                                ordering trace prints enqueue/done/flush.)
@@ -96,7 +97,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -454,9 +454,11 @@ var streamParts = []string{
 // streaming contract: Send stages ONE "boss-N" placeholder; the reply
 // arrives as 5 ACCUMULATED pending updates on the STABLE ID "bossmsg-m1"
 // (300ms apart), then the pinned final (same ID, Pending=false). The mid
-// frame (t=1.25s) shows the grown bubble + caret with the spinner row gone;
-// the done frame (t=2.8s) shows exactly ONE settled bubble — deltas merged
-// in place, never appended. Done also flushes the message typed mid-stream.
+// frame (t=1.25s) shows the grown bubble with the typing row still live
+// below the divider (the row runs for the whole pending period now —
+// there is no caret); the done frame (t=2.8s) shows exactly ONE settled
+// bubble — deltas merged in place, never appended. Done also flushes the
+// message typed mid-stream.
 func (b *stubBackend) scriptStream(at func(ms int, ev state.Event)) {
 	trace := func(line string) {
 		if b.trace != nil {
@@ -1640,14 +1642,18 @@ func runTerminalProof() error {
 
 // --- fix-wave proof (--focus) ----------------------------------------------
 // Three frames over ONE synchronous driver (no tea.Program, no wall clock):
-// every EvTick is pumped by hand, so tick parity — and therefore the
-// caret-blink phase — is exact. Frame A catches the empty typing
-// placeholder (spinner row, NO caret); frame B catches a streaming partial
-// bubble at an even tick (caret on its OWN bottom row of the bubble);
-// frame C catches two concurrent agents: employee tool calls grouped into
-// per-agent work threads (headers + merged rows), the boss's own tool
-// line still inline, and the boss quiet at its placeholder with workers
-// busy → BossDelegating ("boss: delegating · 2 busy" + [delegat] nameplate).
+// every EvTick is pumped by hand, so the panel state is exact. Frame A
+// catches the empty typing placeholder: the typing row sits BELOW the
+// divider (first row above the input region), no "▌" anywhere. Frame B
+// catches a streaming partial bubble: the text grows in the viewport and
+// the typing row STAYS below the divider for the whole pending period —
+// still no caret. Frame C catches two concurrent agents: employee tool
+// calls grouped into per-agent work threads (headers + merged rows), the
+// boss's own tool line still inline, and the boss quiet at its
+// placeholder with workers busy → BossDelegating ("boss: delegating ·
+// 2 busy" + [delegat] nameplate). Every frame also asserts the chat
+// panel's rows stay inside the width the divider draws (wrap, never
+// overflow, never clip).
 
 // focusDriver — minimal synchronous model pump (same shape as socialDriver).
 type focusDriver struct {
@@ -1680,6 +1686,105 @@ func focusTool(ownerID, ownerName, callID, toolName, summary, toolState string) 
 		ToolName: toolName, ToolSummary: summary, ToolState: toolState, CallID: callID}
 }
 
+// chatPanelSegs yields the chat panel's interior segment of every full
+// frame line — the slice between the line's LAST two "│" borders (the
+// chat sidebar is the rightmost panel), ansi-stripped for width math.
+// Rows without panel borders (topbar/statusbar) are skipped, so indexes
+// are panel-relative, not screen rows.
+func chatPanelSegs(frame string) []string {
+	var segs []string
+	for _, ln := range strings.Split(frame, "\n") {
+		parts := strings.Split(ansi.Strip(ln), "│")
+		if len(parts) < 3 {
+			continue
+		}
+		segs = append(segs, parts[len(parts)-2])
+	}
+	return segs
+}
+
+// chatDividerIdx — the segs index of the chat divider row (a segment of
+// pure "─"), -1 when absent.
+func chatDividerIdx(segs []string) int {
+	for i, seg := range segs {
+		t := strings.TrimSpace(seg)
+		if t != "" && strings.Trim(t, "─") == "" {
+			return i
+		}
+	}
+	return -1
+}
+
+// chatPanelTail — the chat panel's segments from the divider down (the
+// divider row itself first), capped at n rows.
+func chatPanelTail(frame string, n int) []string {
+	segs := chatPanelSegs(frame)
+	if di := chatDividerIdx(segs); di >= 0 {
+		tail := segs[di:]
+		if len(tail) > n {
+			tail = tail[:n]
+		}
+		return tail
+	}
+	return nil
+}
+
+// assertChatLayout — the panel hygiene sweep shared by every focus frame:
+// no "▌" anywhere (the blinking caret is gone in EVERY state), and every
+// chat row stays inside the width the divider row itself draws (wrap,
+// never overflow).
+func assertChatLayout(tag, frame string) error {
+	if strings.Contains(frame, "▌") {
+		return fmt.Errorf("%s: found \"▌\" — the stream caret must not exist in any chat state", tag)
+	}
+	segs := chatPanelSegs(frame)
+	di := chatDividerIdx(segs)
+	if di < 0 {
+		return fmt.Errorf("%s: no chat divider row found", tag)
+	}
+	budget := ansi.StringWidth(segs[di])
+	for i, seg := range segs {
+		if w := ansi.StringWidth(seg); w > budget {
+			return fmt.Errorf("%s: chat row %d overflows the %d-cell panel budget (%d cells): %q", tag, i, budget, w, strings.TrimSpace(seg))
+		}
+	}
+	return nil
+}
+
+// assertTypingRowBelowDivider — the row carrying needle (typing spinner /
+// delegating line) sits EXACTLY one segs-step under the divider: the
+// first row of the input region, above chips/picker/textarea. While the
+// boss is busy the TEXTAREA PLACEHOLDER quotes the same busy text
+// ("› boss is typing…") — those prompt rows are skipped; the typing row
+// is the one renderer-owned line carrying it (exactly one must exist).
+func assertTypingRowBelowDivider(tag, frame, needle string) error {
+	segs := chatPanelSegs(frame)
+	di := chatDividerIdx(segs)
+	if di < 0 {
+		return fmt.Errorf("%s: no chat divider row found", tag)
+	}
+	row := -1
+	for i, seg := range segs {
+		if !strings.Contains(seg, needle) {
+			continue
+		}
+		if strings.HasPrefix(strings.TrimSpace(seg), "›") {
+			continue // textarea placeholder quoting the busy text — a prompt row, not the typing row
+		}
+		if row >= 0 {
+			return fmt.Errorf("%s: %q appears on MORE than one chat row", tag, needle)
+		}
+		row = i
+	}
+	if row < 0 {
+		return fmt.Errorf("%s: typing row %q missing from the chat panel", tag, needle)
+	}
+	if row != di+1 {
+		return fmt.Errorf("%s: typing row must be the FIRST row below the divider (divider at seg %d, row at %d)", tag, di, row)
+	}
+	return nil
+}
+
 func runFocusProof() error {
 	fail := func(format string, args ...any) error { return fmt.Errorf(format, args...) }
 	d := newFocusDriver()
@@ -1692,7 +1797,7 @@ func runFocusProof() error {
 		"wire the sse stream", false)})
 	d.send(state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-1", "boss", "", true)})
 	d.pump(4) // tick 4 — settled placeholder
-	fmt.Println("===== UI SHOT · FOCUS A — empty pending bubble: typing spinner row, NO caret row =====")
+	fmt.Println("===== UI SHOT · FOCUS A — empty pending bubble: typing row BELOW the divider, NO caret =====")
 	frameA := d.m.Frame()
 	fmt.Println(frameA)
 	fmt.Println("===== UI SHOT =====")
@@ -1703,24 +1808,14 @@ func runFocusProof() error {
 		"Wiring the handler —", true)})
 	d.send(state.Event{Kind: state.EvChatBoss, Msg: chatMsg("bossmsg-m1", "boss",
 		"Wiring the handler — the **SSE stream** fans out to both workers now.", true)})
-	d.pump(2) // tick 6 — even phase: caret row visible
-	fmt.Println("===== UI SHOT · FOCUS B — streaming partial: caret on its OWN bottom row of the bubble =====")
+	d.pump(2) // tick 6 — mid-stream
+	fmt.Println("===== UI SHOT · FOCUS B — streaming bubble grows in the viewport; typing row STAYS below the divider, NO caret =====")
 	frameB := d.m.Frame()
 	fmt.Println(frameB)
 	fmt.Println("===== UI SHOT =====")
-	for _, ln := range strings.Split(frameB, "\n") {
-		if !strings.Contains(ln, "▌") {
-			continue
-		}
-		// the chat panel's segment of this full-frame line, raw ANSI:
-		// border → (hanging indent) → dim ▌ → border — nothing else.
-		start := strings.Index(ln, "│")
-		end := strings.LastIndex(ln, "│")
-		if start >= 0 && end > start {
-			fmt.Printf("--- caret row, raw ANSI (dedicated-row proof; prefix = hanging indent, then NOTHING but ▌) ---\n%s\n",
-				strconv.Quote(ln[start:end+len("│")]))
-		}
-		break
+	fmt.Println("--- chat panel, divider row down to the input (frame B, ansi-stripped segments) ---")
+	for _, seg := range chatPanelTail(frameB, 6) {
+		fmt.Println(seg)
 	}
 
 	// (c) settle the round-1 bubble, dispatch two workers, storm tool
@@ -1750,45 +1845,35 @@ func runFocusProof() error {
 	fmt.Println(frameC)
 	fmt.Println("===== UI SHOT =====")
 
-	// asserts — frame A
+	// asserts — frame A: typing row below the divider, no caret anywhere,
+	// no delegation while the boss itself is generating.
 	for _, want := range []string{"is typing…"} {
 		if !strings.Contains(frameA, want) {
 			return fail("focus A: frame missing %q", want)
 		}
 	}
-	for _, not := range []string{"▌", "delegating"} {
-		if strings.Contains(frameA, not) {
-			return fail("focus A: frame shows %q (empty placeholder must keep the spinner, no caret, no delegation)", not)
+	if strings.Contains(frameA, "delegating") {
+		return fail("focus A: empty pending placeholder shows delegation text")
+	}
+	if err := assertTypingRowBelowDivider("focus A", frameA, "is typing…"); err != nil {
+		return err
+	}
+	if err := assertChatLayout("focus A", frameA); err != nil {
+		return err
+	}
+	// asserts — frame B: a STREAMING bubble keeps the typing row for the
+	// whole pending period — the partial text lives in the viewport, the
+	// pulse stays below the divider. No caret in any state.
+	for _, want := range []string{"is typing…", "SSE stream"} {
+		if !strings.Contains(frameB, want) {
+			return fail("focus B: frame missing %q (streaming text in the viewport AND the typing row at once)", want)
 		}
 	}
-	// asserts — frame B: caret present, and ALWAYS its own chat row (the
-	// only text on the row after the hanging indent; never glued onto
-	// content). The frame is the whole 130-col screen, so isolate the
-	// chat panel's segment between its "│" borders.
-	caretRows := 0
-	for _, ln := range strings.Split(frameB, "\n") {
-		if !strings.Contains(ln, "▌") {
-			continue
-		}
-		caretRows++
-		stripped := ansi.Strip(ln)
-		parts := strings.Split(stripped, "│")
-		if len(parts) < 3 {
-			return fail("focus B: caret outside the chat panel borders: %q", stripped)
-		}
-		seg := parts[len(parts)-2]
-		if strings.TrimSpace(seg) != "▌" {
-			return fail("focus B: caret shares the chat row with content: %q", seg)
-		}
-		if p := seg[:strings.Index(seg, "▌")]; strings.TrimSpace(p) != "" {
-			return fail("focus B: caret glued onto content (prefix %q is not all blank)", p)
-		}
+	if err := assertTypingRowBelowDivider("focus B", frameB, "is typing…"); err != nil {
+		return err
 	}
-	if caretRows == 0 {
-		return fail("focus B: no caret row at tick 6 (even blink phase)")
-	}
-	if caretRows > 1 {
-		return fail("focus B: %d caret rows — double-caret accumulation", caretRows)
+	if err := assertChatLayout("focus B", frameB); err != nil {
+		return err
 	}
 	// asserts — frame C
 	for _, want := range []string{
@@ -1808,8 +1893,13 @@ func runFocusProof() error {
 	if strings.Contains(frameC, "│ [tool] write") {
 		return fail("focus C: boss tool line was captured into a worker thread (must stay inline)")
 	}
-	if strings.Contains(frameC, "▌") {
-		return fail("focus C: caret row present on an EMPTY pending bubble")
+	// the delegating row rides the SAME below-divider slot as the typing
+	// row (a settled swap of it)
+	if err := assertTypingRowBelowDivider("focus C", frameC, "delegating · 2 busy"); err != nil {
+		return err
+	}
+	if err := assertChatLayout("focus C", frameC); err != nil {
+		return err
 	}
 	// collapse leg: tekton-1 returns (sprite leaves the busy set) → its
 	// thread AUTO-COLLAPSES to the one-line summary; ctrl+g expands ALL
@@ -1833,7 +1923,489 @@ func runFocusProof() error {
 		!strings.Contains(frameExpanded, "│ [tool] read · internal/room/manager.go ✓") {
 		return fail("focus expand: ctrl+g did not re-expand the completed thread")
 	}
-	fmt.Println("asserts: OK — caret is a dedicated bottom row (empty bubble keeps the spinner, no caret), worker threads grouped + CallID-merged, boss tool inline, delegating row + [delegat] nameplate, EvReturned auto-collapses, ctrl+g re-expands completed threads")
+	fmt.Println("asserts: OK — no caret in any state; typing row sits below the divider (above the input) for the WHOLE pending period; delegating row swaps into the same slot; every chat row inside the divider's width budget; worker threads grouped + CallID-merged, boss tool inline, [delegat] nameplate, EvReturned auto-collapses, ctrl+g re-expands completed threads")
+	return nil
+}
+
+// runPersistDemoSkipProof (--persist) — the office-session DEMO regression:
+// restore + persist are LIVE-only by ruling (demo restore = confusing).
+// Seeds a FRESH session.json for cwd in a scratch GRAFEIO_HOME (so the
+// "skip" cannot be a missing-file false pass), runs the standard scripted
+// demo shot, then asserts: (1) LoadSession DOES find the seeded file
+// (the gate is the mode check, not the file lookup), (2) NO "restored
+// office session" notice ever surfaces in the office state chat, (3) the
+// demo boot never OVERWRITES the seeded file (SavedAt byte-identical).
+func runPersistDemoSkipProof() error {
+	home, err := os.MkdirTemp("", "grafeio-persist-demo-skip")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(home)
+	if err := os.Setenv("GRAFEIO_HOME", home); err != nil {
+		return err
+	}
+	fmt.Printf("--- scratch GRAFEIO_HOME: %s ---\n", home)
+
+	dir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	seed := app.Snapshot(dir, "ses-demo-fake", state.OfficeState{
+		Chat: []state.ChatMsg{
+			{ID: "u1", From: "user", Kind: "user", Text: "old turn from a previous run"},
+			{ID: "b1", From: "boss", Kind: "boss", Text: "the previous reply"},
+		},
+	})
+	if err := app.SaveSession(dir, seed); err != nil {
+		return err
+	}
+	before, err := os.ReadFile(app.SessionPath(dir))
+	if err != nil {
+		return err
+	}
+	if _, ok := app.LoadSession(dir); !ok {
+		return fmt.Errorf("seeded session.json not loadable — the skip assert would be vacuous")
+	}
+
+	// The standard shot: the REAL app model over the scripted stub (demo
+	// mode) for the full window.
+	backend := &stubBackend{done: make(chan struct{}), flushQueue: true}
+	fm, err := runManualLoop(config.Default(), backend, "chat", shotDur, nil)
+	if err != nil {
+		return err
+	}
+	frame := fm.Frame()
+	fmt.Println("===== UI SHOT · --persist (demo boot with a seeded session.json — restore must NOT fire) =====")
+	fmt.Println(frame)
+	fmt.Println("===== UI SHOT =====")
+
+	// (2) no restore notice in the office chat state.
+	for _, c := range fm.State().Chat {
+		if strings.Contains(c.Text, "restored office session from") {
+			return fmt.Errorf("demo boot restored the seeded office session (restore is live-only): %q", c.Text)
+		}
+	}
+	// (2b) the demo script ran normally — its scripted turn is present.
+	found := false
+	for _, c := range fm.State().Chat {
+		if strings.Contains(c.Text, "hello.html") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("the demo script did not run (no hello.html turn) — cannot claim a clean demo boot")
+	}
+	// (3) the demo boot never persisted over the seeded file.
+	after, err := os.ReadFile(app.SessionPath(dir))
+	if err != nil {
+		return err
+	}
+	if string(before) != string(after) {
+		return fmt.Errorf("demo boot overwrote session.json (persist is live-only)")
+	}
+	fmt.Println("asserts: OK — seeded session.json found by LoadSession but demo mode skipped restore, no restore notice in chat, file untouched (live-only)")
+	fmt.Println("PERSIST-DEMO-SKIP: OK")
+	return nil
+}
+
+// --- slash popover proof (--slashpop) --------------------------------------
+// Synchronous keys through the REAL app model: typing "/" at a word start
+// opens the command popover, "/th" prefix-filters it live, Enter on /theme
+// pre-fills "/theme " and flips the box into the THEME picker, arrows apply
+// a LIVE preview (two states printed), esc cancels back to the original
+// theme, Enter commits through the plain /theme slash path (persist +
+// office notice).
+
+// drainCmd bounded-drives a returned cmd tree (the slash commit runs
+// through onSend → slashMsg): timer arms (tick/blink) are skipped after a
+// short wait — the app re-arms them on its own events; the proof only
+// needs the produced MESSAGES.
+func drainCmd(d *focusDriver, cmd tea.Cmd, depth int) {
+	if cmd == nil || depth > 8 {
+		return
+	}
+	ch := make(chan tea.Msg, 1)
+	go func() { ch <- cmd() }()
+	var msg tea.Msg
+	select {
+	case msg = <-ch:
+	case <-time.After(150 * time.Millisecond):
+		return // a timer arm (tick/cursor blink): not a message the proof needs
+	}
+	if msg == nil {
+		return
+	}
+	if batch, ok := msg.(tea.BatchMsg); ok {
+		for _, c := range batch {
+			drainCmd(d, c, depth+1)
+		}
+		return
+	}
+	d.send(msg)
+}
+
+func runSlashPopProof() error {
+	fail := func(format string, args ...any) error { return fmt.Errorf(format, args...) }
+	d := newFocusDriver()
+	names := chrome.ThemeNames()
+	orig := chrome.CurrentTheme().Name
+	defer func() { // leave the machine as found (theme file included)
+		chrome.SetTheme(orig)
+		office.SetTheme(orig)
+		_ = chrome.PersistTheme()
+	}()
+	if len(names) < 3 {
+		return fail("slashpop: need ≥3 themes registered, got %d", len(names))
+	}
+	typeIn := func(s string) {
+		for _, r := range s {
+			d.send(tea.KeyPressMsg(tea.Key{Code: r, Text: string(r)}))
+		}
+	}
+	key := func(code rune) tea.Cmd {
+		tm, c := d.m.Update(tea.KeyPressMsg(tea.Key{Code: code}))
+		if fm, ok := tm.(app.Model); ok {
+			d.m = fm
+		}
+		return c
+	}
+
+	// frame 1 — "/th": filtered command menu (/theme /themes /thinking)
+	typeIn("/th")
+	fmt.Println("===== UI SHOT · SLASH A — typed \"/th\": the popover prefix-filters to /theme /themes /thinking =====")
+	frameA := d.m.Frame()
+	fmt.Println(frameA)
+	fmt.Println("===== UI SHOT =====")
+	for _, want := range []string{"commands", "› /theme", "/themes", "/thinking", "switch theme (persists)", "/theme <name>"} {
+		if !strings.Contains(frameA, want) {
+			return fail("slashpop A: frame missing %q", want)
+		}
+	}
+	for _, not := range []string{"/tools", "/clear", "/zen"} {
+		if strings.Contains(frameA, not) {
+			return fail("slashpop A: unfiltered command %q still shows for fragment \"/th\"", not)
+		}
+	}
+
+	// Enter applies /theme → "/theme " prefill + the THEME picker opens
+	key(tea.KeyEnter)
+	fmt.Println("===== UI SHOT · SLASH B — Enter on /theme: \"› /theme \" prefill, live theme list =====")
+	frameB := d.m.Frame()
+	fmt.Println(frameB)
+	fmt.Println("===== UI SHOT =====")
+	for _, want := range []string{"theme preview", "noir", "paper", "dracula", "commit + persist"} {
+		if !strings.Contains(frameB, want) {
+			return fail("slashpop B: frame missing %q", want)
+		}
+	}
+	if !strings.Contains(ansi.Strip(frameB), "› /theme ") {
+		return fail("slashpop B: textarea prefill %q missing (raw frame is style-split)", "› /theme ")
+	}
+	if cur := chrome.CurrentTheme().Name; cur != orig {
+		return fail("slashpop B: theme switched on Enter-apply (%s) — preview must wait for arrows", cur)
+	}
+
+	// THEME PREVIEW state 1 — one ↓: the second theme paints live
+	key(tea.KeyDown)
+	p1 := chrome.CurrentTheme().Name
+	fmt.Printf("===== UI SHOT · SLASH C — preview state 1 (↓ once): active theme is now %q — PAINTED LIVE =====\n", p1)
+	frameC := d.m.Frame()
+	fmt.Println(frameC)
+	fmt.Println("===== UI SHOT =====")
+	if p1 != names[1] {
+		return fail("slashpop C: expected live preview %q after one ↓, got %q", names[1], p1)
+	}
+
+	// THEME PREVIEW state 2 — another ↓: the third theme paints live
+	key(tea.KeyDown)
+	p2 := chrome.CurrentTheme().Name
+	fmt.Printf("===== UI SHOT · SLASH D — preview state 2 (↓ again): active theme is now %q — PAINTED LIVE =====\n", p2)
+	frameD := d.m.Frame()
+	fmt.Println(frameD)
+	fmt.Println("===== UI SHOT =====")
+	if p2 != names[2] {
+		return fail("slashpop D: expected live preview %q after two ↓, got %q", names[2], p2)
+	}
+
+	// esc cancels the preview session back to the original theme
+	key(tea.KeyEscape)
+	if cur := chrome.CurrentTheme().Name; cur != orig {
+		return fail("slashpop esc: preview was not cancelled back — got %q, want %q", cur, orig)
+	}
+
+	// retype to re-open in theme mode, ↓ previews the second theme, Enter
+	// COMMITS through the plain /theme path (persist + office notice)
+	for i := 0; i < 20; i++ {
+		key(tea.KeyBackspace)
+	}
+	typeIn("/theme ")
+	key(tea.KeyDown)
+	picked := chrome.CurrentTheme().Name
+	drainCmd(d, key(tea.KeyEnter), 0)
+	fmt.Println("===== UI SHOT · SLASH E — after commit: draft cleared, office notice \"theme → …\" =====")
+	frameE := d.m.Frame()
+	fmt.Println(frameE)
+	fmt.Println("===== UI SHOT =====")
+	if picked != names[1] {
+		return fail("slashpop E: commit leg previews %q after one ↓, got %q", names[1], picked)
+	}
+	if !strings.Contains(frameE, "theme → "+picked) {
+		return fail("slashpop E: office notice %q missing after commit", "theme → "+picked)
+	}
+	if cur := chrome.CurrentTheme().Name; cur != picked {
+		return fail("slashpop E: committed theme %q not active (%q)", picked, cur)
+	}
+	fmt.Println("asserts: OK — \"/\" opens the popover, \"/th\" filters live, /theme prefill flips to the theme picker, arrows preview live (two states printed), esc cancels back, enter commits + persists via the plain slash path")
+	return nil
+}
+
+// --- employee thinking inside worker threads (--threads-think) --------------
+// tekton-1's EvThought entries merge per CallID into its OWN work thread:
+// a dim-italic "thinking · N lines" row among the tool rows while the
+// thread is live, a "· N think" count in the collapsed summary after
+// EvReturned, a full body under ctrl+g. The boss's EvThought path stays
+// byte-identical (flow "thinking · N lines", no thread).
+
+func runThreadsThinkProof() error {
+	fail := func(format string, args ...any) error { return fmt.Errorf(format, args...) }
+	d := newFocusDriver()
+	d.send(state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — threads-think stub online"})
+	d.send(state.Event{Kind: state.EvHire, Employee: state.Employee{
+		ID: "dev-1", Name: "tekton-1", Role: state.RoleDeveloper, Sprite: state.SpriteAtDesk}})
+	d.send(state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
+		"wire the sse stream", false)})
+	d.send(state.Event{Kind: state.EvChatBoss, Msg: chatMsg("bossmsg-m1", "boss",
+		"On it — tekton-1 is wiring the handler.", false)})
+	// boss think: unchanged flow rendering (proves the boss path is intact)
+	d.send(state.Event{Kind: state.EvThought, EmployeeID: "boss", CallID: "bk-1",
+		Text: "weighing the fan-out", Done: false})
+	d.send(state.Event{Kind: state.EvThought, EmployeeID: "boss", CallID: "bk-1",
+		Text: "weighing the fan-out\nsent it out", Done: true})
+	// tekton-1: dispatch, tools, AND a streamed employee thought
+	d.send(state.Event{Kind: state.EvDispatch, EmployeeID: "dev-1",
+		Task: state.BoardTask{ID: "t1", Title: "Wire the SSE stream", At: time.Now().UnixMilli()}})
+	d.send(state.Event{Kind: state.EvWorking, EmployeeID: "dev-1", TaskID: "t1"})
+	d.send(focusTool("dev-1", "tekton-1", "call-t1", "read", "internal/room/manager.go", "done"))
+	d.send(state.Event{Kind: state.EvThought, EmployeeID: "dev-1", EmployeeName: "tekton-1", CallID: "tk-1",
+		Text: "scanning options\nchoosing approach", Done: false})
+	d.send(focusTool("dev-1", "tekton-1", "call-t2", "edit", "internal/room/handler.go", "done"))
+	d.send(state.Event{Kind: state.EvThought, EmployeeID: "dev-1", EmployeeName: "tekton-1", CallID: "tk-1",
+		Text: "scanning options\nchoosing approach\nwriting the patch", Done: true})
+	d.pump(4)
+	fmt.Println("===== UI SHOT · THINK A — live thread: employee thought merged per CallID as \"thinking · N lines\" =====")
+	frameA := d.m.Frame()
+	fmt.Println(frameA)
+	fmt.Println("===== UI SHOT =====")
+	for _, want := range []string{
+		"┌ tekton-1 · Wire the SSE stream",           // thread header
+		"│ [tool] read · internal/room/manager.go ✓", // tool row, unchanged
+		"│ thinking · 3 lines",                       // employee thought, one merged row
+	} {
+		if !strings.Contains(frameA, want) {
+			return fail("threads-think A: frame missing %q", want)
+		}
+	}
+	if !strings.Contains(ansi.Strip(frameA), "thinking · 2 lines") {
+		return fail("threads-think A: boss thought missing its collapsed flow row (style-split raw text)")
+	}
+	if strings.Contains(ansi.Strip(frameA), "│ thinking · 2 lines") {
+		return fail("threads-think A: the BOSS's thought leaked into a worker thread")
+	}
+	if strings.Contains(frameA, "writing the patch") {
+		return fail("threads-think A: live view must show the one-line count, not the body")
+	}
+
+	// EvReturned → collapsed summary KEEPS the think count
+	d.send(state.Event{Kind: state.EvReturned, EmployeeID: "dev-1", TaskID: "t1",
+		Mail: mail("m1", "tekton-1", "boss", "return: sse stream", "stream is live.", state.MailReturn)})
+	d.pump(1)
+	fmt.Println("===== UI SHOT · THINK B — collapsed thread: \"· 2 tool calls · 1 think ✓ done\" =====")
+	frameB := d.m.Frame()
+	fmt.Println(frameB)
+	fmt.Println("===== UI SHOT =====")
+	if !strings.Contains(frameB, "tekton-1 · Wire the SSE stream (· 2 tool calls · 1 think ✓ done)") {
+		return fail("threads-think B: collapsed summary with the think count missing")
+	}
+	if strings.Contains(frameB, "│ thinking") {
+		return fail("threads-think B: think row visible under a collapsed thread")
+	}
+
+	// ctrl+g: full expand covers tools AND thoughts (body in natural order)
+	d.send(tea.KeyPressMsg(tea.Key{Code: 'g', Mod: tea.ModCtrl}))
+	fmt.Println("===== UI SHOT · THINK C — ctrl+g: full expand covers tools AND the thinking body =====")
+	frameC := d.m.Frame()
+	fmt.Println(frameC)
+	fmt.Println("===== UI SHOT =====")
+	for _, want := range []string{
+		"┌ tekton-1 · Wire the SSE stream",
+		"│ [tool] edit · internal/room/handler.go ✓",
+		"│ thinking",
+		"writing the patch", // body renders on full expand
+	} {
+		if !strings.Contains(frameC, want) {
+			return fail("threads-think C: frame missing %q", want)
+		}
+	}
+	// natural order: read row < think body < edit row (chat arrival order —
+	// the thought merged in place between the two tool calls)
+	if strings.Index(frameC, "│ [tool] read") > strings.Index(frameC, "writing the patch") ||
+		strings.Index(frameC, "writing the patch") > strings.Index(frameC, "│ [tool] edit") {
+		return fail("threads-think C: think body must sit in natural chat order (between the read and edit rows)")
+	}
+	fmt.Println("asserts: OK — employee EvThought merges per CallID into the agent's thread (live one-liner), collapsed summary keeps the count, ctrl+g expands tools + thoughts in natural order, boss path byte-identical")
+	return nil
+}
+
+// --- clickable agents (--click) ----------------------------------------------
+// Scripted bubbletea v2 mouse clicks through the REAL model: (S) a click on
+// tekton-1's floor sprite selects it — activity tab opens, the agents tab
+// pins a ▸ marker, an office notice names it; (D) a double-click on the
+// same sprite toggles that agent's chat thread (and jumps there); (H) a
+// click on a worker thread's "┌" header row in chat toggles it too.
+
+// clickPairGap — the model's double-click window (400ms); the proof sleeps
+// past it between the select phase and the double-click phase.
+const clickPairGap = 400 * time.Millisecond
+
+func runClickProof() error {
+	fail := func(format string, args ...any) error { return fmt.Errorf(format, args...) }
+	d := newFocusDriver()
+	d.send(state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — click stub online"})
+	d.send(state.Event{Kind: state.EvHire, Employee: state.Employee{
+		ID: "dev-1", Name: "tekton-1", Role: state.RoleDeveloper, Sprite: state.SpriteAtDesk}})
+	d.send(state.Event{Kind: state.EvHire, Employee: state.Employee{
+		ID: "sco-1", Name: "skopos-1", Role: state.RoleScout, Sprite: state.SpriteAtDesk}})
+	d.send(state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
+		"wire the sse stream", false)})
+	d.send(state.Event{Kind: state.EvChatBoss, Msg: chatMsg("bossmsg-m1", "boss",
+		"Both workers are on it.", false)})
+	d.send(state.Event{Kind: state.EvDispatch, EmployeeID: "dev-1",
+		Task: state.BoardTask{ID: "t1", Title: "Wire the SSE stream", At: time.Now().UnixMilli()}})
+	d.send(state.Event{Kind: state.EvWorking, EmployeeID: "dev-1", TaskID: "t1"})
+	d.send(state.Event{Kind: state.EvDispatch, EmployeeID: "sco-1",
+		Task: state.BoardTask{ID: "t2", Title: "Scan the repo", At: time.Now().UnixMilli()}})
+	d.send(state.Event{Kind: state.EvWorking, EmployeeID: "sco-1", TaskID: "t2"})
+	d.send(focusTool("dev-1", "tekton-1", "call-t1", "read", "internal/room/manager.go", "done"))
+	d.send(focusTool("sco-1", "skopos-1", "call-s1", "grep", "SSE, 12 hits", "done"))
+	d.send(focusTool("dev-1", "tekton-1", "call-t2", "edit", "internal/room/handler.go", "done"))
+	d.send(focusTool("sco-1", "skopos-1", "call-s2", "read", "internal/api/room.go", "done"))
+	d.pump(30) // walkers settle at their anchors; the plan is built
+	_ = d.m.Frame()
+
+	clickFloor := func(id string) {
+		p, ok := office.SpritePosition(id)
+		if !ok {
+			return
+		}
+		// screen coords: floor X is absolute, +1 row for the topbar
+		d.send(tea.MouseClickMsg(tea.Mouse{X: p.X + 1, Y: p.Y + 1, Button: tea.MouseLeft}))
+	}
+
+	// (S) single click on tekton-1's sprite → selection
+	clickFloor("dev-1")
+	fmt.Println("===== UI SHOT · CLICK S — floor click on tekton-1: activity tab opened, agent selected =====")
+	frameS := d.m.Frame()
+	fmt.Println(frameS)
+	fmt.Println("===== UI SHOT =====")
+	if !strings.Contains(frameS, "ACTIVITY") {
+		return fail("click S: the activity tab did not open on a floor click")
+	}
+	if !strings.Contains(frameS, "tekton-1") {
+		return fail("click S: activity log shows no tekton-1 entries")
+	}
+	// the notice lives in chat history; the marker on the agents tab
+	if !d.m.SelectTab("agents") {
+		return fail("click S: agents tab not selectable")
+	}
+	frameSA := d.m.Frame()
+	if !strings.Contains(ansi.Strip(frameSA), "▸ tekton-1") {
+		return fail("click S: agents tab missing the ▸ selection marker on tekton-1")
+	}
+	if !d.m.SelectTab("chat") {
+		return fail("click S: chat tab not selectable")
+	}
+	frameSC := d.m.Frame()
+	if !strings.Contains(frameSC, "tekton-1 selected") {
+		return fail("click S: office notice \"tekton-1 selected\" missing from chat")
+	}
+	fmt.Println("--- agents tab (▸ marker) + chat notice verified ---")
+
+	// frame chrome: clicks on the topbar/statusbar rows do NOTHING
+	d.send(tea.MouseClickMsg(tea.Mouse{X: 40, Y: 0, Button: tea.MouseLeft}))
+	d.send(tea.MouseClickMsg(tea.Mouse{X: 40, Y: shotRows - 1, Button: tea.MouseLeft}))
+	if strings.Contains(d.m.Frame(), "boss selected") || strings.Contains(d.m.Frame(), "▸ boss") {
+		return fail("click chrome: a topbar/statusbar click leaked into a selection")
+	}
+
+	// tekton-1 returns; its thread auto-collapses
+	d.send(state.Event{Kind: state.EvReturned, EmployeeID: "dev-1", TaskID: "t1",
+		Mail: mail("m1", "tekton-1", "boss", "return: sse stream", "stream is live.", state.MailReturn)})
+	d.pump(1)
+	if !strings.Contains(d.m.Frame(), "tekton-1 · Wire the SSE stream (· 2 tool calls ✓ done)") {
+		return fail("click D setup: tekton-1 thread did not collapse after EvReturned")
+	}
+	time.Sleep(clickPairGap + 100*time.Millisecond) // out of the double-click window
+
+	// (D) double-click the sprite → thread expansion toggles, chat opens
+	clickFloor("dev-1")
+	clickFloor("dev-1")
+	fmt.Println("===== UI SHOT · CLICK D — double-click tekton-1: its collapsed thread re-expands =====")
+	frameD := d.m.Frame()
+	fmt.Println(frameD)
+	fmt.Println("===== UI SHOT =====")
+	if !strings.Contains(frameD, "┌ tekton-1 · Wire the SSE stream") {
+		return fail("click D: double-click did not re-expand tekton-1's thread (chat should show the ┌ header)")
+	}
+	if !strings.Contains(frameD, "│ [tool] read · internal/room/manager.go ✓") {
+		return fail("click D: expanded thread missing its tool rows")
+	}
+	if d.m.ActiveTabIndex() != 0 {
+		return fail("click D: double-click must jump to the chat tab")
+	}
+
+	// (H) click the skopos-1 "┌" header row in chat → its thread collapses
+	// (find the header's actual screen row in the rendered frame)
+	_, _, _, floorW := d.m.LayoutInfo()
+	headerY := -1
+	for i, ln := range strings.Split(frameD, "\n") {
+		if strings.Contains(ln, "┌ skopos-1") {
+			headerY = i
+			break
+		}
+	}
+	if headerY < 0 {
+		return fail("click H setup: skopos-1 header row not found in the frame")
+	}
+	d.send(tea.MouseClickMsg(tea.Mouse{X: floorW + 5, Y: headerY, Button: tea.MouseLeft}))
+	fmt.Println("===== UI SHOT · CLICK H — chat click on the skopos-1 ┌ header: its thread collapses =====")
+	frameH := d.m.Frame()
+	fmt.Println(frameH)
+	fmt.Println("===== UI SHOT =====")
+	if !strings.Contains(frameH, "skopos-1 · Scan the repo (· 2 tool calls ✓ done)") {
+		return fail("click H: header click did not collapse skopos-1's thread")
+	}
+	if strings.Contains(frameH, "│ [tool] grep · SSE, 12 hits ✓") {
+		return fail("click H: tool rows still expanded after the header click")
+	}
+	// click the collapsed SUMMARY row → re-expands (the toggle round-trips;
+	// the summary is the thread's header while collapsed)
+	summaryY := -1
+	for i, ln := range strings.Split(frameH, "\n") {
+		if strings.Contains(ln, "skopos-1 · Scan the repo (· 2 tool calls ✓ done)") {
+			summaryY = i
+			break
+		}
+	}
+	if summaryY < 0 {
+		return fail("click H: collapsed summary row not found in the frame")
+	}
+	d.send(tea.MouseClickMsg(tea.Mouse{X: floorW + 5, Y: summaryY, Button: tea.MouseLeft}))
+	frameH2 := d.m.Frame()
+	if !strings.Contains(frameH2, "┌ skopos-1 · Scan the repo") {
+		return fail("click H: clicking the collapsed summary did not re-expand skopos-1's thread")
+	}
+	fmt.Println("asserts: OK — floor click selects (activity tab + ▸ marker + office notice), double-click toggles the thread + jumps to chat, thread-header clicks toggle round-trip, chrome rows ignore clicks")
 	return nil
 }
 
@@ -1846,7 +2418,7 @@ func main() {
 	debug := flag.Bool("debug", false, "queue flush proof: resolves the pending boss so the queue drains; prints [queue] trace lines")
 	think := flag.Bool("think", false, "think-stream proof: one CallID streamed in accumulated updates, prints BOTH frames (t=2.0s mid-stream expanded, t=3.2s collapsed after Done)")
 	thinkStop := flag.String("think-stop", "", "with --think: print ONE frame only (mid = t=2.0s streaming, done = t=3.2s collapsed) for the gallery shot")
-	stream := flag.Bool("stream", false, "chat-stream proof: one \"bossmsg-m1\" reply streamed as 5 accumulated pending updates then pinned; prints frame mid-stream (bubble + caret, spinner gone) and after done (single settled bubble) plus the enqueue/done/flush ordering trace")
+	stream := flag.Bool("stream", false, "chat-stream proof: one \"bossmsg-m1\" reply streamed as 5 accumulated pending updates then pinned; prints frame mid-stream (bubble growing in the viewport, typing row live below the divider) and after done (single settled bubble) plus the enqueue/done/flush ordering trace")
 	askAnswer := flag.Bool("ask-answer", false, "question-hold proof: boss EvQuestion opens the answer modal (typing placeholder removed, park status line); typing + enter routes through AnswerQuestion — prints BOTH frames (modal open / after answered) + the stub capture log")
 	askEsc := flag.Bool("ask-esc", false, "question-hold proof: esc defers the modal (notice), /question re-opens it, the answer still routes through AnswerQuestion")
 	askQueue := flag.Bool("ask-queue", false, "queue-hold proof: a message typed while the question hold is outstanding must ENQUEUE; AnswerQuestion → resolved → completed boss reply → flush, ordering trace printed")
@@ -1856,11 +2428,47 @@ func main() {
 	social := flag.Bool("social", false, "social-clock proof: synchronous tick pump — three frames (tea ask / both walking / gossip chain), banter chain trace, question-modal gate assert, tick-seeded determinism check")
 	layout := flag.Bool("layout", false, "layout-modes proof: three frames over the same window — NORMAL (sidebar 44), compact (sidebar 30, short tab labels, 2-row chat input, compressed topbar), wide 56 — with computed width asserts per frame")
 	terminal := flag.Bool("terminal", false, "terminal-tab proof: the stub TermPanel wires through app.SpawnTerminal — lazy-spawn on first visit, keys routed into the shell surface, frame + asserts")
-	focus := flag.Bool("focus", false, "fix-wave proof, THREE synchronous-tick frames: (a) empty pending bubble — typing spinner row, NO caret; (b) streaming partial bubble — caret on its OWN bottom row of the bubble (raw-ANSI row printed); (c) two concurrent agents — per-agent work threads grouped (headers + merged rows), boss tool line still inline, boss idle at the placeholder in delegating state (dim row, [delegat] nameplate)")
+	focus := flag.Bool("focus", false, "fix-wave proof, THREE synchronous-tick frames: (a) empty pending bubble — typing row below the divider (above the input), NO caret anywhere; (b) streaming partial bubble — text grows in the viewport while the typing row STAYS below the divider for the whole pending period (still no caret); (c) two concurrent agents — per-agent work threads grouped (headers + merged rows), boss tool line still inline, boss idle at the placeholder in delegating state (dim row in the same below-divider slot, [delegat] nameplate). Every frame: no \"▌\", every chat row inside the divider's width budget")
+	persist := flag.Bool("persist", false, "office-session DEMO regression: seed a fresh session.json for cwd in a scratch GRAFEIO_HOME, run the standard demo shot, assert NO restore notice surfaces and the file is untouched (restore is live-only) — prints PERSIST-DEMO-SKIP: OK|FAIL")
+	slashpop := flag.Bool("slashpop", false, "slash-popover proof: type \"/th\" → filtered menu (/theme /themes /thinking), Enter pre-fills \"/theme \" → theme picker, arrows preview LIVE (two states printed), esc cancels back, Enter commits + persists via the plain slash path")
+	threadsThink := flag.Bool("threads-think", false, "employee-thinking-in-threads proof: tekton-1 EvThought merges per CallID into its work thread (live \"thinking · N lines\" row), collapsed summary keeps the count (\"· 1 think\"), ctrl+g expands tools + thoughts — boss path byte-identical")
+	click := flag.Bool("click", false, "mouse proof: scripted clicks — floor sprite click selects the agent (activity tab + ▸ marker + office notice), double-click toggles its thread + jumps to chat, chat thread-header/summary clicks toggle round-trip, chrome rows ignore clicks")
 	flag.Parse()
+
+	if *persist {
+		if err := runPersistDemoSkipProof(); err != nil {
+			fmt.Fprintf(os.Stderr, "uishot: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *focus {
 		if err := runFocusProof(); err != nil {
+			fmt.Fprintf(os.Stderr, "uishot: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *slashpop {
+		if err := runSlashPopProof(); err != nil {
+			fmt.Fprintf(os.Stderr, "uishot: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *threadsThink {
+		if err := runThreadsThinkProof(); err != nil {
+			fmt.Fprintf(os.Stderr, "uishot: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *click {
+		if err := runClickProof(); err != nil {
 			fmt.Fprintf(os.Stderr, "uishot: %v\n", err)
 			os.Exit(1)
 		}
@@ -2063,7 +2671,7 @@ func main() {
 			at    time.Duration
 			label string
 		}{
-			{1250 * time.Millisecond, "frame 1 — t=1.25s (MID-STREAM: grown bubble + caret, spinner row gone, one message enqueued)"},
+			{1250 * time.Millisecond, "frame 1 — t=1.25s (MID-STREAM: grown bubble, typing row below the divider, one message enqueued)"},
 			{2800 * time.Millisecond, "frame 2 — t=2.8s (AFTER DONE: one settled bubble — replace-in-place, no dup — queue flushed)"},
 		}
 		for _, s := range stops {

@@ -68,6 +68,25 @@ func SpritePosition(id string) (Point, bool) {
 	return Point{X: w.x, Y: w.y}, true
 }
 
+// HitAgent — mouse seam (additive): the employee whose SPRITE CELL covers
+// grid coordinate (x, y). A sprite is the 3-cell-wide frame stamped at its
+// walker position (p.X..p.X+2, p.Y); an employee without a walker yet stands
+// at its seat anchor. Later roster entries win on overlap (the floor stamps
+// them last, so the visible glyph owns the cell).
+func HitAgent(st state.OfficeState, x, y int) (employeeID string, ok bool) {
+	for i := len(st.Employees) - 1; i >= 0; i-- {
+		e := st.Employees[i]
+		p, found := SpritePosition(e.ID)
+		if !found {
+			p = SeatAnchor(e.Seat)
+		}
+		if y == p.Y && x >= p.X && x <= p.X+2 {
+			return e.ID, true
+		}
+	}
+	return "", false
+}
+
 func targetFor(sprite state.SpriteState, seat string, plan Plan) Point {
 	switch sprite {
 	case state.SpriteToManager, state.SpriteMeeting:

@@ -7,13 +7,26 @@
 //
 // Two platform realities shape the design:
 //
-//   - Terminal paste (tea.PasteMsg, bracketed paste) NEVER carries image
+//   - On macOS cmd+v is the user's paste gesture, but the CMD key never
+//     reaches a TUI in Terminal.app/iTerm2 (those terminals convert the
+//     paste themselves, delivering BRACKETED PASTE = tea.PasteMsg); only
+//     kitty-keyboard-protocol terminals configured to pass super report it
+//     as a key ("super+v" in bubbletea v2). An image clipboard + cmd+v in
+//     Terminal.app delivers NOTHING at all (no bytes to send), so the app
+//     keeps its own image triggers — ctrl+v, accepted alongside super+v —
+//     and the smart tea.PasteMsg arm: bracketed paste NEVER carries image
 //     bytes, and the module's one clipboard dep (atotto/clipboard, ride-
 //     along of bubbles/textarea) is text-only. Zero new dependencies is
 //     the house rule, so an image probe shells out on darwin: pngpaste
 //     when installed, else osascript writing «class PNGf» to a temp file.
 //     The probe runs inside a tea.Cmd — shell outs can take tens of ms
 //     and must never sit on the update goroutine.
+//
+//   - A Finder file copy + cmd+v pastes as the file's PATH text (Terminal
+//     .app's "Paste Escaped Text": backslash-escaped spaces, sometimes
+//     surrounding quotes) — the tea.PasteMsg arm classifies that via
+//     pasteFilePaths and stages the files as chips instead of typing the
+//     path into the draft.
 //
 //   - The @ picker lists the process cwd (the repo the TUI runs against).
 //     The walk also runs in a tea.Cmd, capped hard (depth 6, 500 entries,
@@ -40,6 +53,7 @@ import (
 
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/theboringhumane/grafeio/internal/chrome"
 	"github.com/theboringhumane/grafeio/internal/state"
@@ -67,10 +81,16 @@ type chatAttachment struct {
 	temp string
 }
 
-// clipPasteMsg reports the image-paste probe (readClipboardImage):
+// clipPasteMsg reports the image-paste probe (probeClipboardImage):
 // path+temp set → attach; noImage → nothing image-like on the clipboard,
 // replay the textarea's own TEXT paste; err → tool failure, notice +
 // text-paste fallback; unsupported → non-darwin platform (notice-once).
+// The reprobe pair marks a probe started from the tea.PasteMsg arm (cmd+v
+// on an image-only clipboard arrives as an EMPTY bracketed paste): a miss
+// then re-feeds `reinsert` — the original paste bytes — straight into the
+// textarea instead of the OSC52 clipboard replay (those bytes already
+// arrived; there is nothing left to fetch), and the platform notices stay
+// silent (the ctrl+v/super+v key path owns them).
 type clipPasteMsg struct {
 	path        string
 	temp        string
@@ -78,6 +98,8 @@ type clipPasteMsg struct {
 	err         error
 	noImage     bool
 	unsupported bool
+	reprobe     bool
+	reinsert    string
 }
 
 // attachWalkMsg delivers the @ picker's repo file list (relative slash
@@ -98,11 +120,12 @@ func (c *Chat) noticef(text string) tea.Cmd {
 	return nil
 }
 
-// ---------------------------------------------------------------- ctrl+v image paste
+// ------------------------------------------------- image paste: triggers + probe
 
-// startImagePaste kicks the clipboard image probe. An image result
-// attaches (chips); text/empty clipboards replay the textarea's own paste
-// path (see onClipPaste), keeping today's plain-text behavior exactly.
+// startImagePaste kicks the clipboard image probe (the ctrl+v / super+v
+// key trigger). An image result attaches (chips); text/empty clipboards
+// replay the textarea's own paste path (see onClipPaste), keeping
+// today's plain-text behavior exactly.
 func (c *Chat) startImagePaste() tea.Cmd {
 	if c.atOpen {
 		// pasting is not fragment typing: close the picker (the fragment
@@ -112,18 +135,40 @@ func (c *Chat) startImagePaste() tea.Cmd {
 	return readClipboardImage()
 }
 
+// startImagePasteReprobe runs the SAME probe for the smart tea.PasteMsg
+// arm: on macOS an image-only clipboard delivers cmd+v as an EMPTY
+// bracketed paste (the terminal has no text to send), so the paste
+// itself is the trigger. orig carries the original paste bytes — on a
+// miss onClipPaste re-feeds THEM to the textarea instead of the OSC52
+// clipboard replay.
+func (c *Chat) startImagePasteReprobe(orig string) tea.Cmd {
+	if c.atOpen {
+		c.closeAttachPicker()
+	}
+	return probeClipboardImage(orig, true)
+}
+
 // readClipboardImage probes the OS clipboard for IMAGE bytes. darwin:
 // pngpaste when $PATH has it, else osascript (writes «class PNGf» to a
 // temp file — both exit non-zero on a text/empty clipboard, which is the
 // "no image" signal, not an error). Non-darwin: the unsupported arm.
 func readClipboardImage() tea.Cmd {
+	return probeClipboardImage("", false)
+}
+
+// probeClipboardImage is readClipboardImage's body parameterized for the
+// two trigger paths: reprobe=false is the key trigger (misses replay the
+// textarea text paste); reprobe=true is the bracketed-paste trigger
+// (misses re-insert orig — startImagePasteReprobe). The shell-out
+// mechanics are identical either way.
+func probeClipboardImage(orig string, reprobe bool) tea.Cmd {
 	return func() tea.Msg {
 		if runtime.GOOS != "darwin" {
-			return clipPasteMsg{unsupported: true}
+			return clipPasteMsg{unsupported: true, reprobe: reprobe, reinsert: orig}
 		}
 		dir, err := os.MkdirTemp("", "grafeio-paste-*")
 		if err != nil {
-			return clipPasteMsg{err: err}
+			return clipPasteMsg{err: err, reprobe: reprobe, reinsert: orig}
 		}
 		path := filepath.Join(dir, "paste.png")
 		var runErr error
@@ -140,29 +185,45 @@ func readClipboardImage() tea.Cmd {
 		}
 		if runErr != nil {
 			_ = os.RemoveAll(dir)
-			return clipPasteMsg{noImage: true}
+			return clipPasteMsg{noImage: true, reprobe: reprobe, reinsert: orig}
 		}
 		data, err := os.ReadFile(path)
 		if err != nil || len(data) == 0 {
 			_ = os.RemoveAll(dir)
-			return clipPasteMsg{noImage: true}
+			return clipPasteMsg{noImage: true, reprobe: reprobe, reinsert: orig}
 		}
 		m := http.DetectContentType(headSniff(data))
 		if !strings.HasPrefix(m, "image/") {
 			// pngpaste wrote something non-image-shaped: treat as noise,
 			// not an attachment (and don't leak the temp dir).
 			_ = os.RemoveAll(dir)
-			return clipPasteMsg{noImage: true}
+			return clipPasteMsg{noImage: true, reprobe: reprobe, reinsert: orig}
 		}
-		return clipPasteMsg{path: path, temp: dir, mime: m}
+		return clipPasteMsg{path: path, temp: dir, mime: m, reprobe: reprobe, reinsert: orig}
 	}
 }
 
-// onClipPaste consumes the probe result: attach on an image hit, replay
-// the textarea's own text paste (textarea.Paste — the ctrl+v clipboard
-// path, whose internal msgs now arrive through Update's default arm) on
-// every miss, with the platform/tool notices alongside.
+// onClipPaste consumes the probe result: attach on an image hit. On a
+// miss the fallback depends on the trigger — the key path replays the
+// textarea's own text paste (textarea.Paste — the ctrl+v clipboard path,
+// whose internal msgs now arrive through Update's default arm) with the
+// platform/tool notices alongside; the reprobe path (a tea.PasteMsg-arms
+// probe) re-feeds the paste's original bytes straight into the textarea
+// with NO notices (the user pasted, their text must simply land).
 func (c *Chat) onClipPaste(msg clipPasteMsg) tea.Cmd {
+	if msg.reprobe && (msg.unsupported || msg.err != nil || msg.noImage || msg.path == "") {
+		// The probe answered "no image" for a bracketed paste: feed the
+		// original bytes DIRECTLY to the textarea here — returning a
+		// tea.PasteMsg would re-enter the same Update arm and probe-loop
+		// forever. (This can only fire on darwin — the arm gates it — so
+		// no unsupported notice; a tool error is still worth surfacing.)
+		var cmd tea.Cmd
+		c.ta, cmd = c.ta.Update(tea.PasteMsg{Content: msg.reinsert})
+		if msg.err != nil {
+			return tea.Batch(c.noticef("image paste failed: "+msg.err.Error()), cmd)
+		}
+		return cmd
+	}
 	switch {
 	case msg.unsupported:
 		var note tea.Cmd
@@ -182,6 +243,94 @@ func (c *Chat) onClipPaste(msg clipPasteMsg) tea.Cmd {
 		name = "paste-" + itoa(c.pasteSeq) + ".png"
 	}
 	return c.addAttachment(chatAttachment{name: name, mime: msg.mime, path: msg.path, temp: msg.temp})
+}
+
+// ------------------------------------------------- smart paste: Finder file copies
+
+// pasteFilePaths classifies a bracketed-paste body as a Finder-copy
+// paste: on macOS, pasting a copied file delivers its PATH as text
+// (one token per file, backslash-escaped spaces, sometimes surrounding
+// quotes). The body splits into whitespace-separated tokens honoring
+// "\x" → literal "x" unescaping and single/double surrounding quotes;
+// ok=true ONLY when every token resolves to an EXISTING REGULAR file
+// (a directory or a missing path classifies the whole paste as plain
+// text). No ~ expansion — the shell does that, the paste buffer
+// doesn't.
+func pasteFilePaths(content string) (paths []string, ok bool) {
+	toks := splitPasteTokens(strings.TrimSpace(content))
+	if len(toks) == 0 {
+		return nil, false
+	}
+	paths = make([]string, 0, len(toks))
+	for _, tok := range toks {
+		info, err := os.Stat(tok)
+		if err != nil || !info.Mode().IsRegular() {
+			return nil, false
+		}
+		paths = append(paths, tok)
+	}
+	return paths, true
+}
+
+// splitPasteTokens tokenizes a trimmed paste body on whitespace,
+// unescaping "\x" → "x" (Terminal.app escapes spaces as "\ ") and
+// stripping ONE pair of surrounding single/double quotes per token.
+// A trailing lone backslash survives literally.
+func splitPasteTokens(s string) []string {
+	var toks []string
+	r := []rune(s)
+	for i := 0; i < len(r); {
+		for i < len(r) && unicode.IsSpace(r[i]) {
+			i++
+		}
+		if i >= len(r) {
+			break
+		}
+		var b strings.Builder
+		for i < len(r) && !unicode.IsSpace(r[i]) {
+			if r[i] == '\\' && i+1 < len(r) {
+				b.WriteRune(r[i+1])
+				i += 2
+				continue
+			}
+			if (r[i] == '\'' || r[i] == '"') && b.Len() == 0 {
+				q := r[i]
+				i++
+				for i < len(r) && r[i] != q {
+					b.WriteRune(r[i])
+					i++
+				}
+				if i < len(r) {
+					i++ // the closing quote
+				}
+				continue
+			}
+			b.WriteRune(r[i])
+			i++
+		}
+		if b.Len() > 0 {
+			toks = append(toks, b.String())
+		}
+	}
+	return toks
+}
+
+// attachPastedFiles stages one chip per Finder-copied path (the smart
+// tea.PasteMsg arm): display name + sniffed MIME, no temp dir (the file
+// is the user's own, not a panel-created paste). The @ picker closes
+// like startImagePaste — a paste is not fragment typing — and NOTHING
+// is typed into the textarea.
+func (c *Chat) attachPastedFiles(paths []string) tea.Cmd {
+	if c.atOpen {
+		c.closeAttachPicker()
+	}
+	var cmds []tea.Cmd
+	for _, p := range paths {
+		if cmd := c.addAttachment(chatAttachment{name: filepath.Base(p), mime: attachMime(p), path: p}); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+	return tea.Batch(cmds...)
 }
 
 // headSniff returns DetectContentType's ≤512-byte sniff window (the
@@ -490,21 +639,57 @@ func (c *Chat) chipsLines() []string {
 		items[i] = label
 	}
 	// greedy fit: keep as many leading chips as the row budget allows.
+	// NB wrapChips — NOT wrapPlain: the (+N) accounting assumes the old
+	// greedy wrap where ONE over-wide chip is a single (later-clipped)
+	// row, not split into many
 	shown := len(items)
-	for shown > 1 && len(strings.Split(wrapPlain("📎 "+strings.Join(items[:shown], " · "), c.w), "\n")) > chipMaxRows {
+	for shown > 1 && len(strings.Split(wrapChips("📎 "+strings.Join(items[:shown], " · "), c.w), "\n")) > chipMaxRows {
 		shown--
 	}
 	text := "📎 " + strings.Join(items[:shown], " · ")
 	if rest := len(items) - shown; rest > 0 {
 		text += "  ·  (+" + itoa(rest) + ")"
 	}
-	lines := strings.Split(strings.TrimRight(wrapPlain(text, c.w), "\n"), "\n")
+	lines := strings.Split(strings.TrimRight(wrapChips(text, c.w), "\n"), "\n")
 	for i, ln := range lines {
-		// a single chip wider than the panel wraps whole on wrapPlain —
+		// a single chip wider than the panel wraps whole on wrapChips —
 		// clip it (the narrow-sidebar degrade rule: never overflow)
 		lines[i] = clipPlain(ln, c.w)
 	}
 	return lines
+}
+
+// wrapChips greedy word-wraps plain text to w cells WITHOUT the
+// hard-split foldWrap applies: a chip wider than the row stays whole on
+// its own row so chipsLines can CLIP it (chips degrade to "(+N)", not to
+// a stack of file-path fragments).
+func wrapChips(s string, w int) string {
+	if w < 4 {
+		w = 4
+	}
+	var out []string
+	for _, para := range strings.Split(s, "\n") {
+		var cur strings.Builder
+		curW := 0
+		for _, word := range strings.Fields(para) {
+			ww := lipgloss.Width(word)
+			switch {
+			case curW == 0:
+				cur.WriteString(word)
+				curW = ww
+			case curW+1+ww <= w:
+				cur.WriteString(" " + word)
+				curW += 1 + ww
+			default:
+				out = append(out, cur.String())
+				cur.Reset()
+				cur.WriteString(word)
+				curW = ww
+			}
+		}
+		out = append(out, cur.String())
+	}
+	return strings.Join(out, "\n")
 }
 
 // chipsH — rows the chips line consumes (SetSize budget): 0 when nothing

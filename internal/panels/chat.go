@@ -6,34 +6,37 @@
 //		            user turns are plain-wrapped and prefixed cyan "you › ";
 //		            boss turns are rendered THROUGH GLAMOUR as markdown
 //		            (**bold**, lists, fences format + wrap) with a yellow
-//		            "boss › " hanging indent.
+//		            "boss › " hanging indent, then HARD-FOLDED to the panel
+//		            width (glamour's wrap misses code fences and unbreakable
+//		            URLs — foldStyledLines refolds those, ANSI-aware).
 //		            Kind "think" entries render as dim-italic thinking blocks —
 //		            LIVE while their CallID streams (spinner header, growing
 //		            tail, always expanded), then COLLAPSED to
 //		            "thinking · N lines" until ctrl+t expands all;
 //		            Kind "tool" entries (BOSS/primary) render as dim one-liners
-//		            merged by CallID; Kind "wtool" entries (EMPLOYEE tools)
+//		            merged by CallID (wrapped with a hanging indent, never
+//		            clipped); Kind "wtool" entries (EMPLOYEE tools)
 //		            never touch the flow — they group into the workers-thread
 //		            region at the END of the conversation: one group per
 //		            agent (newest at the bottom), header "┌ <agent> · <task>"
-//		            over indented "│ [tool] …" rows while the agent is active,
+//		            over indented "│ [tool] …" rows while the agent is active
+//		            (long rows WRAP with "│ " continuations, never truncate),
 //		            auto-collapsing to "<agent> · <task> (· N tool calls ✓
 //		            done)" on EvReturned or 120 ticks of quiet, with ctrl+g
 //		            expanding/collapsing all completed threads;
 //		            From "office" entries render as dim local notices (red when
 //		            Meta == "error").
-//		spinner   — shown only while a boss reply is pending WITH NO TEXT YET
-//		            (" <boss> is typing…", named from brain.json boss.name).
+//		divider
+//		spinner   — the typing row, shown for the WHOLE pending period:
+//		            while ANY boss reply is outstanding (" <boss> is
+//		            typing…", named from brain.json boss.name) — with or
+//		            without streamed text. A pending boss bubble WITH text
+//		            keeps rendering in the viewport as a streaming "boss ›"
+//		            turn (glamour markdown re-rendered per delta); the row
+//		            below is the liveness signal now — there is NO caret.
 //		            While BossDelegating holds (boss quiet, workers busy)
 //		            the row swaps to a settled dim " <boss>: delegating ·
-//		            N busy" — no spinner. A pending boss bubble WITH text
-//		            renders in the viewport itself as a streaming "boss ›"
-//		            turn: glamour markdown re-rendered per delta plus a
-//		            blinking dim caret "▌" on its OWN bottom row of the
-//		            bubble (hanging at the content indent, never glued onto
-//		            a content line; blink follows the office tick) — the
-//		            spinner row disappears once the bubble speaks for itself.
-//		divider
+//		            N busy" — no spinner.
 //		textarea  — multiline input; Enter sends, Shift+Enter (or Ctrl+J) is a
 //		            newline, placeholder "talk to the boss…". NEVER locked: while
 //		            the boss is typing, Enter ENQUEUES (the app owns the queue)
@@ -56,6 +59,7 @@ package panels
 
 import (
 	"image/color"
+	"runtime"
 	"strings"
 
 	"charm.land/bubbles/v2/key"
@@ -92,11 +96,17 @@ const (
 // errMeta — chat entry markers the app reducer tags onto state.ChatMsg so
 // this panel can style them without touching the user/boss turn paths.
 // wtoolKind is the EMPLOYEE tool line: never rendered inline; grouped into
-// the workers-thread region at the end of the conversation.
+// the workers-thread region at the end of the conversation. wthinkKind is
+// the EMPLOYEE EvThought line (the app reducer merges one per agent+CallID,
+// same stream mechanics as the boss's thinkKind): it joins the SAME worker
+// thread — a dim-italic "thinking · N lines" row while the thread is
+// live, a "· N think" count in the collapsed summary, a full body under
+// ctrl+g.
 const (
 	thinkKind    = "think"
 	toolKind     = "tool"
 	wtoolKind    = "wtool"
+	wthinkKind   = "wthink"
 	questionKind = "question"
 	diffKind     = "diff"
 	officeFrom   = "office"
@@ -165,10 +175,10 @@ type Chat struct {
 	// bossShort — the boss's display short name (first word of brain.json
 	// boss.name), used by the busy placeholder + typing spinner line.
 	bossShort string
-	// pendingSpin — the " boss is typing…" spinner row shows ONLY while a
-	// boss reply is outstanding with no streamed text yet (the typing
-	// placeholder). Once a streaming boss bubble has text, the bubble
-	// itself (with its blinking caret) replaces the spinner row.
+	// pendingSpin — the typing row (" boss is typing…" spinner) shows for
+	// the WHOLE pending period: any outstanding boss reply, text or not.
+	// The streaming bubble in the viewport carries the partial text; this
+	// row (below the divider, above the input) carries the liveness.
 	pendingSpin bool
 	follow      bool // stick to the bottom unless the user scrolled up
 
@@ -222,6 +232,24 @@ type Chat struct {
 	pasteSeq         int                       // paste-N.png naming for image attaches
 	pasteUnsupported bool                      // non-darwin notice latch (fire once)
 	onNotice         func(text string) tea.Cmd // office-notice seam (cap/drop/platform)
+
+	// Slash popover (popover.go): "/" at a word start opens the command
+	// menu; "/theme " flips it into the live-preview theme picker.
+	slashOpen      bool
+	slashMode      int // slashModeCmd | slashModeTheme
+	slashFrag      string
+	slashSel       int
+	slashCmds      []slashCommand // refilterSlash's visible slice (cmd mode)
+	slashThemes    []string       // refilterSlash's visible slice (theme mode)
+	slashPrevTheme string         // theme captured when a preview session opened
+
+	// click/expansion bookkeeping for the workers-thread region:
+	// threadExpand holds PER-AGENT explicit expansion (double-click an
+	// agent on the floor / click a thread header — a set entry wins over
+	// the live+ctrl+g default); threadRows maps rendered content line →
+	// agent name for the expanded-thread "┌" headers (mouse hit lookup).
+	threadExpand map[string]bool
+	threadRows   map[int]string
 
 	diffCache map[string]diffCacheEntry // parsed+hilighted diff rows by msg ID
 }
@@ -307,6 +335,65 @@ func (c *Chat) ToggleThreads() {
 	c.forceRender()
 }
 
+// ExpandThread sets ONE agent's work-thread expansion explicitly (mouse:
+// double-click the agent's floor sprite / click the thread's "┌" header).
+// A set per-agent override wins over the live/ctrl+g default until the
+// next call — ctrl+g still moves the global baseline underneath it.
+func (c *Chat) ExpandThread(agent string, expanded bool) {
+	if c.threadExpand == nil {
+		c.threadExpand = map[string]bool{}
+	}
+	c.threadExpand[agent] = expanded
+	c.forceRender()
+}
+
+// ToggleThread flips ONE agent's thread from its CURRENT effective state
+// (what renderWorkers shows for it right now).
+func (c *Chat) ToggleThread(agent string) {
+	c.ExpandThread(agent, !c.threadExpandedNow(agent))
+}
+
+// threadExpandedNow — the thread's effective expansion under the same
+// rule renderWorkers applies: per-agent override wins, else live (busy
+// sprite + activity inside the staleness horizon), else ctrl+g.
+func (c *Chat) threadExpandedNow(name string) bool {
+	if v, ok := c.threadExpand[name]; ok {
+		return v
+	}
+	if av, ok := c.agents[name]; ok && av.active {
+		lastTick := 0
+		for _, m := range c.chat {
+			if (m.Kind == wtoolKind || m.Kind == wthinkKind) && m.From == name {
+				if _, tk := parseWtoolMeta(m.Meta); tk > lastTick {
+					lastTick = tk
+				}
+			}
+		}
+		if c.tick-lastTick <= wtoolStaleTicks {
+			return true
+		}
+	}
+	return c.threadsExpanded
+}
+
+// ClickRow handles a mouse click at (x, y) IN CHAT CONTENT COORDS
+// (viewport row 0 at the top of the chat panel; the app translated the
+// screen coords over the tab/border chrome). A hit on an expanded worker
+// thread's "┌" header row toggles that agent's thread. Returns true when
+// the click was claimed.
+func (c *Chat) ClickRow(x, y int) bool {
+	if y < 0 || y >= c.vp.Height() {
+		return false
+	}
+	line := y + c.vp.YOffset()
+	name, ok := c.threadRows[line]
+	if !ok {
+		return false
+	}
+	c.ToggleThread(name)
+	return true
+}
+
 // SetDiffsExpanded shows diffs expanded (on) or collapsed (off) —
 // /diffs on|off.
 func (c *Chat) SetDiffsExpanded(on bool) {
@@ -337,6 +424,7 @@ func (c *Chat) SetPermissionHandlers(answer func(response string) tea.Cmd, later
 func (c *Chat) SetPermission(p *PermissionView) {
 	if p != nil {
 		c.closeAttachPicker()
+		c.closeSlashPicker(true) // the modal owns the region now
 	}
 	c.perm = p
 }
@@ -355,7 +443,8 @@ func (c *Chat) SetQuestion(q *QuestionView) {
 	c.question = q
 	if q != nil {
 		c.qInput = ""
-		c.closeAttachPicker() // the modal owns the region now (chips stay)
+		c.closeAttachPicker()     // the modal owns the region now (chips stay)
+		c.closeSlashPicker(true) // same for the slash popover
 	}
 	c.SetSize(c.w, c.h)
 }
@@ -507,10 +596,11 @@ func (c *Chat) SetCompact(on bool) {
 	c.SetSize(c.w, c.h) // viewport takes/relinquishes the extra row
 }
 
-// SetSize implements Tab: splits content height across viewport / spinner /
-// divider / bottom region. The bottom region is the textarea, permission
+// SetSize implements Tab: splits content height across viewport / divider /
+// spinner / bottom region. The typing (spinner) row sits BELOW the divider,
+// one row while pendingSpin. The bottom region is the textarea, permission
 // modal, or question modal (the question modal is the one region with a
-// DIFFERENT row count) — PLUS the attachment surfaces below it: the chips
+// DIFFERENT row count) — PLUS the attachment surfaces above it: the chips
 // row(s) when files are staged, and the @ picker box while open. Chips and
 // picker consume rows exactly like questionModalH does, so the viewport
 // shrinks for them instead of overlapping.
@@ -527,7 +617,7 @@ func (c *Chat) SetSize(w, h int) {
 	if c.question != nil {
 		regionH = c.questionModalH()
 	}
-	regionH += c.chipsH() + c.popoverH()
+	regionH += c.chipsH() + c.popoverH() + c.slashH()
 	vpH := h - regionH - 1 /* divider */ - spH
 	if vpH < 1 {
 		vpH = 1
@@ -535,12 +625,19 @@ func (c *Chat) SetSize(w, h int) {
 	c.vp.SetWidth(w)
 	c.vp.SetHeight(vpH)
 	c.ta.SetWidth(w)
-	c.mdWidth = w - len(bossPrefix) - 1
+	// cellWidth, not len: bossPrefix's "›" is 3 bytes but 1 cell — the
+	// byte count would rob the wrap of 2 columns.
+	c.mdWidth = w - cellWidth(bossPrefix) - 1
 	if c.mdWidth < 10 {
 		c.mdWidth = 10
 	}
 	c.md = nil // rebuilt lazily at the new wrap width
 }
+
+// cellWidth is the display-cell count of s (runes here — prefixes are all
+// single-cell glyphs; lipgloss.Width on a styled/cursed string belongs to
+// the ansi-aware foldStyledLines instead).
+func cellWidth(s string) int { return len([]rune(s)) }
 
 // SetState implements Tab: keeps the latest chat slice, re-renders the
 // conversation when it changed, and keeps scroll pinned to the bottom.
@@ -607,21 +704,16 @@ func (c *Chat) SetState(st state.OfficeState) {
 		rev ^= 0x9e3779b97f4a7c15
 	}
 	rev ^= uint64(uint32(c.delegatingN))
-	// while any think block streams, re-render on EVERY tick (the header
-	// spinner advances with the office clock even when text is unchanged);
-	// same for a streaming boss bubble — its caret blinks with the tick.
-	streamActive := false
-	for _, m := range c.chat {
-		if m.From == "boss" && m.Pending && m.Text != "" {
-			streamActive = true
-			break
-		}
-	}
+	// a streaming boss bubble does NOT need per-tick re-renders: the old
+	// blinking caret is gone — every pixel a pending bubble draws comes
+	// straight from its text, and text changes always land in rev (when a
+	// partial survives into a later tick its own diff re-triggers). Think
+	// streams DO still animate per tick — see len(c.streamingThink) below.
 	// a worker thread within its staleness horizon must re-render every
 	// tick — the auto-collapse boundary is tick-relative, invisible to rev.
 	wtoolRecent := false
 	for _, m := range st.Chat {
-		if m.Kind != wtoolKind {
+		if m.Kind != wtoolKind && m.Kind != wthinkKind {
 			continue
 		}
 		_, tk := parseWtoolMeta(m.Meta)
@@ -630,7 +722,7 @@ func (c *Chat) SetState(st state.OfficeState) {
 			break
 		}
 	}
-	if rev == c.renderRev && len(st.Chat) == len(c.chat) && len(c.streamingThink) == 0 && !streamActive && !wtoolRecent {
+	if rev == c.renderRev && len(st.Chat) == len(c.chat) && len(c.streamingThink) == 0 && !wtoolRecent {
 		return
 	}
 	c.renderRev = rev
@@ -641,10 +733,9 @@ func (c *Chat) SetState(st state.OfficeState) {
 	c.pending, c.pendingSpin = false, false
 	for _, m := range c.chat {
 		if m.From == "boss" && m.Pending {
-			c.pending = true
-			if m.Text == "" {
-				c.pendingSpin = true
-			}
+			// the typing row runs for the WHOLE pending period — the
+			// streaming bubble shows the text, the row shows the life
+			c.pending, c.pendingSpin = true, true
 		}
 	}
 	if c.pending != wasPending {
@@ -653,7 +744,7 @@ func (c *Chat) SetState(st state.OfficeState) {
 		c.refreshPlaceholder()
 	}
 	if c.pendingSpin != wasSpin {
-		c.SetSize(c.w, c.h) // spinner row appears/disappears
+		c.SetSize(c.w, c.h) // typing row appears/disappears
 	}
 
 	c.vp.SetContent(c.renderConversation())
@@ -663,13 +754,22 @@ func (c *Chat) SetState(st state.OfficeState) {
 }
 
 // Update implements Interactive: Enter sends, Shift+Enter newline, wheel +
-// pgup/pgdn + (single-line) arrows scroll the conversation. ctrl+v attaches
-// a clipboard image when there is one (else pastes text); "@" at a word
-// start opens the attach-file popover, which owns ↑/↓/enter/tab/esc while
-// open (the question-modal precedence pattern) — every other key still
-// reaches the textarea. Non-key messages the panel doesn't claim (bracketed
-// paste tea.PasteMsg, the textarea's own clipboard pasteMsgs) fall through
-// the default arm INTO the textarea — the plain-text paste path.
+// pgup/pgdn + (single-line) arrows scroll the conversation. Paste follows
+// the macOS OS defaults: cmd+v is the user's gesture, and it arrives three
+// ways — kitty-protocol terminals report it as a "super+v" key, every
+// other terminal converts it to bracketed paste (tea.PasteMsg), and an
+// image-only clipboard delivers NOTHING in Terminal.app/iTerm2 (the
+// app-side image trigger is the only probe path there). ctrl+v and
+// super+v both probe the clipboard for an image (attach as a chip on a
+// hit, replay text paste on a miss). tea.PasteMsg gets its own smart arm:
+// a Finder file copy pastes as (escaped) path text and stages chips, an
+// empty/whitespace-only paste on darwin probes for an image (the miss
+// re-feeds the original bytes), everything else inserts as plain text.
+// "@" at a word start opens the attach-file popover, which owns
+// ↑/↓/enter/tab/esc while open (the question-modal precedence pattern) —
+// every other key still reaches the textarea. Non-key messages the panel
+// doesn't claim (the textarea's own clipboard pasteMsgs) fall through the
+// default arm INTO the textarea.
 func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
@@ -750,6 +850,24 @@ func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 		// The @ popover owns its nav/attach keys while open (the question-
 		// modal precedence pattern: claimed FIRST, nothing reaches the
 		// textarea); every other key still goes to the textarea below.
+		// The slash popover owns its nav/apply keys while open (claimed
+		// first, like the modal/picker precedence above); every other key
+		// still goes to the textarea below.
+		if c.slashOpen {
+			switch msg.String() {
+			case "up":
+				c.slashMove(-1) // theme mode: arrows PREVIEW live
+				return nil
+			case "down":
+				c.slashMove(1)
+				return nil
+			case "enter", "tab":
+				return c.slashPicked()
+			case "esc":
+				c.closeSlashPicker(true) // keeps the fragment; unwinds a preview
+				return nil
+			}
+		}
 		if c.atOpen {
 			switch msg.String() {
 			case "up":
@@ -766,10 +884,16 @@ func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 			}
 		}
 		switch msg.String() {
-		case "ctrl+v":
+		case "ctrl+v", "super+v":
 			// Image paste probe (async tea.Cmd): a clipboard holding an
 			// image ATTACHES it as a chip; a text/empty clipboard replays
-			// the textarea's own text paste (see onClipPaste).
+			// the textarea's own text paste (see onClipPaste). Two names,
+			// one gesture: "super+v" is cmd+v as reported by kitty-
+			// keyboard-protocol terminals (Terminal.app/iTerm2 swallow
+			// CMD entirely — cmd+v there arrives as tea.PasteMsg below,
+			// or as nothing at all when the clipboard is image-only,
+			// making ctrl+v the only trigger that still reaches us).
+			c.closeSlashPicker(true) // pasting is not fragment typing
 			return c.startImagePaste()
 		case "backspace":
 			if c.atOpen {
@@ -778,6 +902,14 @@ func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 				var cmd tea.Cmd
 				c.ta, cmd = c.ta.Update(msg)
 				c.afterDraftEdit()
+				return cmd
+			}
+			if c.slashOpen {
+				// same tail-recheck contract — backspace over the lone "/"
+				// breaks the match and closes the popover
+				var cmd tea.Cmd
+				c.ta, cmd = c.ta.Update(msg)
+				c.afterSlashEdit()
 				return cmd
 			}
 			// an EMPTY draft + staged chips: backspace pops the newest
@@ -835,21 +967,32 @@ func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 			return cmd
 		default:
 			// "@" at a word boundary opens the attach picker AFTER the
-			// textarea takes the rune (the fragment starts empty). Other
+			// textarea takes the rune (the fragment starts empty); "/" at a
+			// word boundary opens the slash popover the same way. Other
 			// typed keys re-derive the fragment from the draft tail; nav
-			// keys (arrows, ctrl-word ops, home/end) close the picker —
-			// they move the cursor off the tail the picker tracks.
+			// keys (arrows, ctrl-word ops, home/end) close the popovers —
+			// they move the cursor off the tail the popovers track.
 			opening := !c.atOpen && msg.Text == "@" && c.atWordBoundary()
+			slashOpening := !c.slashOpen && msg.Text == "/" && c.atWordBoundary()
 			var cmd tea.Cmd
 			if c.atOpen && msg.Text == "" {
 				c.closeAttachPicker()
+			}
+			if c.slashOpen && msg.Text == "" {
+				c.closeSlashPicker(true)
 			}
 			c.ta, cmd = c.ta.Update(msg)
 			if opening {
 				return tea.Batch(cmd, c.openAttachPicker())
 			}
+			if slashOpening {
+				return tea.Batch(cmd, c.openSlashPicker())
+			}
 			if c.atOpen && msg.Text != "" {
 				c.afterDraftEdit()
+			}
+			if c.slashOpen && msg.Text != "" {
+				c.afterSlashEdit()
 			}
 			return cmd
 		}
@@ -863,32 +1006,63 @@ func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 		c.sp, cmd = c.sp.Update(msg)
 		return cmd
 	case clipPasteMsg:
-		// the ctrl+v image probe answered (chat_attach.go)
+		// the image probe answered (chat_attach.go) — fired by the
+		// ctrl+v/super+v key trigger or the tea.PasteMsg reprobe below
 		return c.onClipPaste(msg)
 	case attachWalkMsg:
 		// the @ picker's file walk answered
 		c.onAttachWalk(msg)
 		return nil
+	case tea.PasteMsg:
+		// Bracketed paste — on macOS this IS cmd+v (Terminal.app/iTerm2
+		// swallow the CMD key and convert the paste themselves). Smart
+		// classification, in order:
+		if paths, ok := pasteFilePaths(msg.Content); ok {
+			// 1) Finder file copy: the terminal delivered the copied
+			//    file(s) as (escaped) path text — stage one chip per
+			//    path, type nothing into the draft.
+			return c.attachPastedFiles(paths)
+		}
+		if runtime.GOOS == "darwin" && strings.TrimSpace(msg.Content) == "" {
+			// 2) Empty/whitespace-only paste on darwin: cmd+v with an
+			//    image-only clipboard has no bytes to send — probe for
+			//    image bytes; a miss re-feeds the ORIGINAL content into
+			//    the textarea (see onClipPaste's reprobe arm).
+			return c.startImagePasteReprobe(msg.Content)
+		}
+		// 3) plain text — the textarea's own bracketed-paste handling
+		//    inserts it cursor-correctly.
+		var cmd tea.Cmd
+		c.ta, cmd = c.ta.Update(msg)
+		return cmd
 	default:
-		// tea.PasteMsg (bracketed paste) and the textarea's own internal
-		// pasteMsg/pasteErrMsg (its ctrl+v clipboard path) are NOT key
-		// presses — everything unclaimed forwards to the textarea so
-		// plain-text paste reaches the input. (This arm is the paste
-		// regression fix: before it, all of the above were dropped here.)
+		// The textarea's own internal pasteMsg/pasteErrMsg (its ctrl+v
+		// clipboard path) are NOT key presses — everything unclaimed
+		// forwards to the textarea so plain-text paste reaches the
+		// input. (This arm is the paste regression fix: before it, all
+		// of the above were dropped here. tea.PasteMsg itself moved UP
+		// into its own smart arm above — Finder copies and image
+		// clipboards now beat plain insertion.)
 		var cmd tea.Cmd
 		c.ta, cmd = c.ta.Update(msg)
 		return cmd
 	}
 }
 
-// View implements Tab. Below the divider (top → bottom): the dim
-// attachment chips row (when files are staged), the @ picker box (while
-// open), then the input region — the question modal, permission modal, or
-// textarea. SetSize budgets exactly the rows this writes.
+// View implements Tab. Below the divider (top → bottom): the typing row
+// (while a boss reply is pending — spinner + "… is typing…", or the dim
+// delegating line), the dim attachment chips row (when files are staged),
+// the @ picker box (while open), then the input region — the question
+// modal, permission modal, or textarea. SetSize budgets exactly the rows
+// this writes.
 func (c *Chat) View() string {
 	var b strings.Builder
 	b.WriteString(c.vp.View())
+	b.WriteString("\n")
+	b.WriteString(chrome.DimText.Render(fitPlain(strings.Repeat("─", c.w), c.w)))
 	if c.pendingSpin {
+		// the typing row — glued to the input, not the transcript: the
+		// viewport holds the words, this row holds the pulse
 		b.WriteString("\n")
 		if c.delegating {
 			// P3 — the boss dispatched out and went quiet: a settled dim
@@ -900,8 +1074,6 @@ func (c *Chat) View() string {
 		}
 	}
 	b.WriteString("\n")
-	b.WriteString(chrome.DimText.Render(fitPlain(strings.Repeat("─", c.w), c.w)))
-	b.WriteString("\n")
 	if chips := c.renderAttachChips(); chips != "" {
 		// staged attachments sit right above the input they will attach to
 		b.WriteString(chips)
@@ -909,6 +1081,10 @@ func (c *Chat) View() string {
 	}
 	if c.atOpen {
 		b.WriteString(c.renderAttachPopover())
+		b.WriteString("\n")
+	}
+	if c.slashOpen {
+		b.WriteString(c.renderSlashPopover())
 		b.WriteString("\n")
 	}
 	if c.question != nil {
@@ -1000,10 +1176,16 @@ func (c *Chat) renderConversation() string {
 	visible := make([]state.ChatMsg, 0, len(c.chat))
 	var workers []workerGroup
 	workerIdx := map[string]int{}
+	c.threadRows = map[int]string{} // mouse hit-map, rebuilt every render
 	for _, m := range c.chat {
-		if m.Kind == wtoolKind {
-			if !c.showTools {
-				continue // /tools off hides the whole workers region too
+		if m.Kind == wtoolKind || m.Kind == wthinkKind {
+			// /tools off hides the whole workers region; /thinking off
+			// takes only the think rows (the tools keep rendering)
+			if m.Kind == wtoolKind && !c.showTools {
+				continue
+			}
+			if m.Kind == wthinkKind && !c.showThinking {
+				continue
 			}
 			idx, ok := workerIdx[m.From]
 			if !ok {
@@ -1041,7 +1223,17 @@ func (c *Chat) renderConversation() string {
 		case m.Kind == thinkKind:
 			c.renderThink(&b, m)
 		case m.Kind == toolKind:
-			b.WriteString(renderTool(m))
+			// boss inline tool one-liner — WRAPPED, never clipped and
+			// never burst mid-glyph by the vp soft-wrap: the first row
+			// flows tight against the bubble above (no leading indent),
+			// continuations hang under the tool text start.
+			toolW := c.w - 1
+			indent := strings.Repeat(" ", cellWidth(toolWrapPrefix))
+			lines := foldStyledRows(renderTool(m), toolW, toolW-cellWidth(toolWrapPrefix))
+			b.WriteString(lines[0])
+			for _, ln := range lines[1:] {
+				b.WriteString("\n" + indent + ln)
+			}
 		case m.Kind == questionKind:
 			c.renderQuestion(&b, m)
 		case m.Kind == diffKind:
@@ -1056,21 +1248,16 @@ func (c *Chat) renderConversation() string {
 				// names in Meta — history shows the dim " · 📎 N" suffix
 				lines[len(lines)-1] += chrome.DimText.Render(" · 📎 " + itoa(len(names)))
 			}
-			writePrefixed(&b, prefix, strings.Repeat(" ", len(userPrefix)), lines)
+			lines = foldStyledLines(lines, c.mdWidth+1)
+			writePrefixed(&b, prefix, strings.Repeat(" ", cellWidth(userPrefix)), lines)
 		default:
 			prefix := chrome.Fg(chrome.Accent, bossPrefix)
 			lines := cleanMarkdown(c.renderMarkdown(m.Text))
-			if m.Pending && c.tick%2 == 0 {
-				// streaming reply: the blinking dim caret lives on its OWN
-				// bottom row of the bubble (hanging at the content indent)
-				// — never glued onto a content line, and only while the
-				// bubble HAS text (an empty placeholder keeps the spinner
-				// row, no caret). Every render rebuilds `lines` from
-				// markdown, so the blink row replaces cleanly between
-				// coalesced updates (no accumulation possible).
-				lines = append(lines, chrome.DimText.Render("▌"))
-			}
-			writePrefixed(&b, prefix, strings.Repeat(" ", len(bossPrefix)), lines)
+			// a streaming reply is just the bubble itself growing — no
+			// caret, no extra row: the typing row below the divider is the
+			// liveness signal for the whole pending period.
+			lines = foldStyledLines(lines, c.mdWidth)
+			writePrefixed(&b, prefix, strings.Repeat(" ", cellWidth(bossPrefix)), lines)
 		}
 	}
 	c.renderWorkers(&b, workers)
@@ -1130,8 +1317,15 @@ func workerToolLine(m state.ChatMsg) string {
 // renderWorkers draws the workers-thread region after the conversation:
 // one group per agent, newest at the bottom. An ACTIVE agent (busy sprite
 // + activity within wtoolStaleTicks) renders its header and merged tool
-// lines; on EvReturned/the quiet horizon it auto-collapses to one dim
-// summary line. ctrl+g re-expands every completed thread at once.
+// lines — employee thoughts join the SAME thread as dim-italic
+// "thinking · N lines" rows (one per merged CallID), in natural chat
+// order among the tool rows. On EvReturned/the quiet horizon the thread
+// auto-collapses to one dim summary line that KEEPS the think count
+// ("· 9 tools · 3 think ✓ done"). ctrl+g re-expands every completed
+// thread at once — and a full expand (ctrl+g or a per-agent mouse
+// override) covers both tools AND thoughts, the thoughts with their
+// body text. Expanded "┌" header rows are recorded in threadRows for
+// the mouse hit-map (click toggles that agent's thread).
 func (c *Chat) renderWorkers(b *strings.Builder, groups []workerGroup) {
 	for _, g := range groups {
 		task := c.workerTasks[g.name] // sticky: a returned agent keeps its task
@@ -1142,24 +1336,106 @@ func (c *Chat) renderWorkers(b *strings.Builder, groups []workerGroup) {
 				task = av.task
 			}
 		}
+		// expanded = whether the thread renders its rows at all; full =
+		// whether think entries show their BODIES (ctrl+g / a full mouse
+		// expand). A set per-agent override wins OUTRIGHT over the
+		// live/ctrl+g default (a mouse-collapsed live thread stays
+		// collapsed until re-clicked).
 		expanded := (active && c.tick-g.lastTick <= wtoolStaleTicks) || c.threadsExpanded
+		full := c.threadsExpanded
+		if v, ok := c.threadExpand[g.name]; ok {
+			expanded = v
+			full = v
+		}
 		head := g.name
 		if task != "" {
 			head += " · " + task
 		}
 		if expanded {
-			b.WriteString("\n" + chrome.DimText.Render(clipPlain("┌ "+head, c.w)))
+			if c.threadRows != nil {
+				// the header row under construction is the NEXT line of b
+				c.threadRows[strings.Count(b.String(), "\n")+1] = g.name
+			}
+			// long threads WRAP with aligned continuations — never
+			// truncate a path the user might need to read
+			for j, ln := range foldStyledRows("┌ "+head, c.w, c.w-2) {
+				if j == 0 {
+					b.WriteString("\n" + chrome.DimText.Render(ln))
+				} else {
+					b.WriteString("\n" + chrome.DimText.Render("  "+ln))
+				}
+			}
 			for _, m := range g.lines {
-				b.WriteString("\n" + chrome.ToolStyle.Render(clipPlain("│ "+workerToolLine(m), c.w)))
+				if m.Kind == wthinkKind {
+					c.renderWThink(b, m, full)
+					continue
+				}
+				for j, ln := range foldStyledRows("│ "+workerToolLine(m), c.w, c.w-2) {
+					if j == 0 {
+						b.WriteString("\n" + chrome.ToolStyle.Render(ln))
+					} else {
+						b.WriteString("\n" + chrome.ToolStyle.Render("│ "+ln))
+					}
+				}
 			}
 			continue
 		}
+		tools, thinks := 0, 0
+		for _, m := range g.lines {
+			if m.Kind == wthinkKind {
+				thinks++
+			} else {
+				tools++
+			}
+		}
 		unit := "tool calls"
-		if len(g.lines) == 1 {
+		if tools == 1 {
 			unit = "tool call"
 		}
-		b.WriteString("\n" + chrome.DimText.Render(clipPlain(
-			head+" (· "+itoa(len(g.lines))+" "+unit+" ✓ done)", c.w)))
+		summary := head + " (· " + itoa(tools) + " " + unit
+		if thinks > 0 {
+			// the collapsed summary KEEPS the think count ("· 3 think");
+			// a summary without thoughts renders byte-identical to before
+			summary += " · " + itoa(thinks) + " think"
+		}
+		summary += " ✓ done)"
+		if c.threadRows != nil {
+			// the collapsed summary IS the thread's header — clickable too
+			// (click a collapsed thread to re-expand it)
+			c.threadRows[strings.Count(b.String(), "\n")+1] = g.name
+		}
+		for j, ln := range foldStyledRows(summary, c.w, c.w-2) {
+			if j == 0 {
+				b.WriteString("\n" + chrome.DimText.Render(ln))
+			} else {
+				b.WriteString("\n" + chrome.DimText.Render("  "+ln))
+			}
+		}
+	}
+}
+
+// renderWThink renders one merged employee thinking entry inside a work
+// thread. In the LIVE view (thread expanded because the agent is working)
+// it is a single dim-italic "│ thinking · N lines" row; on a FULL expand
+// (ctrl+g / per-agent mouse override) the body renders too — the same
+// collapsed-vs-expanded shape as the boss's thinking blocks, capped to
+// the stream tail (the freshest thinkStreamLines lines).
+func (c *Chat) renderWThink(b *strings.Builder, m state.ChatMsg, full bool) {
+	think := chrome.DimText.Italic(true)
+	// fold at the FULL body budget ("│   " is 4 cells) so no row clips
+	lines := foldStyledRows(m.Text, c.w-4, c.w-4)
+	if !full {
+		b.WriteString("\n" + think.Render(clipPlain("│ thinking · "+countLines(lines)+" lines", c.w)))
+		return
+	}
+	b.WriteString("\n" + think.Render(clipPlain("│ thinking", c.w)))
+	shown := lines
+	if more := len(lines) - thinkStreamLines; more > 0 {
+		b.WriteString("\n" + think.Render(clipPlain("│   … "+itoa(more)+" more above", c.w)))
+		shown = lines[more:]
+	}
+	for _, ln := range shown {
+		b.WriteString("\n" + chrome.DimText.Render("│   "+ln))
 	}
 }
 
@@ -1233,10 +1509,17 @@ func itoa(n int) string {
 	return string(rune('0' + n%10))
 }
 
+// toolWrapPrefix starts every boss inline tool one-liner — continuation
+// rows of a wrapped line hang exactly this many cells in (under the text).
+const toolWrapPrefix = "[tool] "
+
 // renderTool renders one Kind="tool" one-liner, merged by CallID upstream:
 // "[tool] read · src/main.go ✓" (done) / "… running" / red "✗" (error).
+// The whole line comes out as ONE styled blob; the call site folds it with
+// foldStyledRows — escape sequences are consumed atomically there, so a
+// fold boundary never shreds one.
 func renderTool(m state.ChatMsg) string {
-	line := "[tool] " + m.Text
+	line := toolWrapPrefix + m.Text
 	switch m.Meta {
 	case "done":
 		return chrome.ToolStyle.Render(line + " ✓")
@@ -1259,16 +1542,23 @@ func (c *Chat) renderQuestion(b *strings.Builder, m state.ChatMsg) {
 		options, answered = parts[0], true
 	}
 	qPrefix := "boss asks › "
-	indent := strings.Repeat(" ", len(qPrefix))
-	wrapW := c.w - len(qPrefix) - 1 // prefix + panel padding, before vp soft-wrap
+	indent := strings.Repeat(" ", cellWidth(qPrefix))
+	// cellWidth, not len — "›" is 3 bytes but 1 cell; the byte count would
+	// shave 2 columns off the wrap budget and misalign the hanging indent
+	wrapW := c.w - cellWidth(qPrefix) - 1 // prefix + panel padding
 	lines := strings.Split(strings.TrimRight(wrapPlain(m.Text, wrapW), "\n"), "\n")
 	for i := range lines {
 		lines[i] = chrome.QuestionText.Render(lines[i])
 	}
+	lines = foldStyledLines(lines, wrapW)
 	writePrefixed(b, chrome.QuestionText.Bold(true).Render(qPrefix), indent, lines)
 	if options != "" {
-		for _, ln := range strings.Split(strings.TrimRight(wrapPlain("("+options+")", wrapW), "\n"), "\n") {
-			b.WriteString(indent + chrome.DimText.Render(ln) + "\n")
+		optLines := strings.Split(strings.TrimRight(wrapPlain("("+options+")", wrapW), "\n"), "\n")
+		for i := range optLines {
+			optLines[i] = chrome.DimText.Render(optLines[i])
+		}
+		for _, ln := range foldStyledLines(optLines, wrapW) {
+			b.WriteString(indent + ln + "\n")
 		}
 	}
 	if answered {
@@ -1687,7 +1977,8 @@ func (c *Chat) renderNotice(b *strings.Builder, m state.ChatMsg) {
 	for i := range lines {
 		lines[i] = style.Render(lines[i])
 	}
-	writePrefixed(b, style.Render("office › "), strings.Repeat(" ", len("office › ")), lines)
+	lines = foldStyledLines(lines, c.mdWidth+1)
+	writePrefixed(b, style.Render("office › "), strings.Repeat(" ", cellWidth("office › ")), lines)
 }
 
 // renderMarkdown runs a boss turn through glamour with the sidebar wrap and
@@ -1739,35 +2030,208 @@ func writePrefixed(b *strings.Builder, prefix, indent string, lines []string) {
 	}
 }
 
-// wrapPlain greedy word-wraps plain (member-typed) text to w cells. No
-// semantics — just a visual fold for the user side of the transcript.
+// wrapPlain greedy word-wraps text to w cells. No semantics — just a
+// visual fold (user turns, question/options rows, think bodies, modals).
+// ANSI-aware (foldWrap inside): styled text is safe — escapes are
+// consumed atomically and never counted against the width, and a token
+// that alone busts the row hard-splits at the cell edge (never overflow,
+// never clip: every glyph survives on some row).
 func wrapPlain(s string, w int) string {
-	if w < 4 {
-		w = 4
-	}
+	return foldWrap(s, w, w)
+}
+
+// foldStyledLines hard-folds every line of an ALREADY-SHAPED block (one
+// glamour-rendered boss turn, post cleanMarkdown) to w display cells,
+// ANSI-aware. Glamour's own word wrap misses code fences and unbreakable
+// URLs — without this pass those rows overflow the bubble, and the
+// viewport's soft wrap would burst them mid-word/mid-glyph with no
+// hanging indent. Word boundaries are kept where they exist; unbreakable
+// tokens hard-split at the cell edge. Lines that fit pass through
+// VERBATIM (fence indentation survives).
+func foldStyledLines(lines []string, w int) []string {
 	var out []string
-	for _, para := range strings.Split(s, "\n") {
-		var cur strings.Builder
-		curW := 0
-		for _, word := range strings.Fields(para) {
-			ww := lipgloss.Width(word)
-			switch {
-			case curW == 0:
-				cur.WriteString(word)
-				curW = ww
-			case curW+1+ww <= w:
-				cur.WriteString(" " + word)
-				curW += 1 + ww
-			default:
-				out = append(out, cur.String())
-				cur.Reset()
-				cur.WriteString(word)
-				curW = ww
-			}
-		}
-		out = append(out, cur.String())
+	for _, ln := range lines {
+		out = append(out, foldStyledRows(ln, w, w)...)
 	}
+	if len(out) == 0 {
+		return []string{""}
+	}
+	return out
+}
+
+// foldStyledRows folds ONE visual line to firstW cells for the first row
+// and contW for every continuation row — write the first row after the
+// bubble/hanging prefix and continuations under a matching indent so
+// prefix + row cells stay inside the panel. ANSI-aware; each returned row
+// is a clean single row (no newlines).
+func foldStyledRows(line string, firstW, contW int) []string {
+	rows := strings.Split(foldWrap(line, firstW, contW), "\n")
+	if len(rows) == 0 {
+		return []string{""}
+	}
+	return rows
+}
+
+// foldWrap greedy word-wraps one visual line (or '\n'-joined paragraphs)
+// to firstW cells, continuation rows to contW. ANSI escape sequences cost
+// 0 cells and are copied through atomically (see seqLen); wide glyphs are
+// measured and split at grapheme-cluster boundaries. A paragraph that
+// fits is kept VERBATIM (code-fence indentation survives the pass).
+func foldWrap(s string, firstW, contW int) string {
+	if firstW < 1 {
+		firstW = 1
+	}
+	if contW < 1 {
+		contW = 1
+	}
+	width := firstW
+	var out []string
+	var cur strings.Builder
+	curW := 0
+	flush := func() {
+		out = append(out, cur.String())
+		cur.Reset()
+		curW = 0
+		width = contW
+	}
+	for pi, para := range strings.Split(s, "\n") {
+		if pi > 0 {
+			flush() // an explicit newline always owns a row boundary
+		}
+		if pw := ansi.StringWidth(para); pw <= width {
+			cur.WriteString(para)
+			curW = pw
+			continue
+		}
+		for _, word := range splitStyledWords(para) {
+			ww := ansi.StringWidth(word)
+			if curW > 0 {
+				if curW+1+ww <= width {
+					cur.WriteString(" " + word)
+					curW += 1 + ww
+					continue
+				}
+				flush()
+			}
+			// the word heads a row; an unbreakable token that busts the
+			// budget on its own hard-splits at the cell edge
+			for ww > width {
+				head, rest := cutStyled(word, width)
+				if head == "" {
+					break // unsplittable glyph wider than the row: overflow it whole, never clip
+				}
+				out = append(out, head)
+				width = contW
+				word = rest
+				ww = ansi.StringWidth(word)
+			}
+			cur.WriteString(word)
+			curW = ww
+		}
+	}
+	flush()
 	return strings.Join(out, "\n")
+}
+
+// splitStyledWords cuts a styled line into whitespace-separated words;
+// escape sequences ride with the word they style (they split atomically
+// via seqLen, so a fold never shreds one). Whitespace itself is always a
+// separator — fold boundaries own the spacing.
+func splitStyledWords(s string) []string {
+	var words []string
+	var cur strings.Builder
+	flush := func() {
+		if cur.Len() > 0 {
+			words = append(words, cur.String())
+			cur.Reset()
+		}
+	}
+	for i := 0; i < len(s); {
+		if n := seqLen(s, i); n > 0 {
+			cur.WriteString(s[i : i+n])
+			i += n
+			continue
+		}
+		if s[i] == ' ' || s[i] == '\t' {
+			flush()
+			i++
+			continue
+		}
+		cur.WriteByte(s[i])
+		i++
+	}
+	flush()
+	return words
+}
+
+// cutStyled takes the longest HEAD of word that fits budget display cells
+// (escape sequences always ride along, 0 cells; graphemes stay whole —
+// ansi.FirstGraphemeCluster measures them). Returns ("", word) when the
+// FIRST printable glyph alone busts the budget: there is nothing to cut,
+// and the caller must overflow the glyph rather than destroy it.
+func cutStyled(word string, budget int) (head, rest string) {
+	i, cells := 0, 0
+	for i < len(word) {
+		if n := seqLen(word, i); n > 0 {
+			i += n
+			continue
+		}
+		cl, w := ansi.FirstGraphemeCluster(word[i:], ansi.GraphemeWidth)
+		if cells+w > budget {
+			if cells == 0 {
+				return "", word
+			}
+			return word[:i], word[i:]
+		}
+		cells += w
+		i += len(cl)
+	}
+	return word, ""
+}
+
+// seqLen returns the byte length of the escape sequence starting at s[i]
+// when s[i] is ESC/CSI, 0 otherwise — CSI (ESC [ / 0x9b), OSC (ESC ],
+// BEL/ST-terminated), and plain two-byte ESC·final forms. Our rendered
+// content is lipgloss SGR, but the splitter must not trip over a
+// pasted-content sequence either.
+func seqLen(s string, i int) int {
+	if s[i] != 0x1b && s[i] != 0x9b {
+		return 0
+	}
+	j := i + 1
+	if j >= len(s) {
+		return 1
+	}
+	csi := s[i] == 0x9b
+	if !csi && s[j] == '[' {
+		csi, j = true, j+1
+	}
+	if csi {
+		for j < len(s) && s[j] >= 0x30 && s[j] <= 0x3f {
+			j++ // parameter bytes
+		}
+		for j < len(s) && s[j] >= 0x20 && s[j] <= 0x2f {
+			j++ // intermediate bytes
+		}
+		if j < len(s) {
+			j++ // final byte
+		}
+		return j - i
+	}
+	if s[j] == ']' { // OSC — runs to BEL or ST
+		j++
+		for j < len(s) {
+			if s[j] == 0x07 {
+				return j + 1 - i
+			}
+			if s[j] == 0x1b && j+1 < len(s) && s[j+1] == '\\' {
+				return j + 2 - i
+			}
+			j++
+		}
+		return len(s) - i
+	}
+	return 2 // ESC + one final byte
 }
 
 // revision is a cheap FNV-1a over every rendered field of the chat slice —
