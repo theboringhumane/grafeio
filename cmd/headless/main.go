@@ -73,6 +73,11 @@ func main() {
 	// Per-CallID thought counters make a STREAMING thought obvious: the same
 	// CallID reappears with a growing (accum N chars) figure until done=true.
 	thoughtCounts := make(map[string]int)
+	// Per-Msg.ID boss-bubble counters make the STREAMING chat answer just as
+	// obvious: the same ID ("bossmsg-"+messageID / demo "boss-N") reappears
+	// Pending:true with a growing (accum N chars) figure, then one
+	// [boss-final] line pins it.
+	bossStreamCounts := make(map[string]int)
 	emit := func(e state.Event) {
 		// --answer: capture the first pending permission id now; the actual
 		// backend call happens OUTSIDE the emit lock (demo emits
@@ -100,10 +105,28 @@ func main() {
 			mu.Unlock()
 			return
 		}
-		if e.Kind == state.EvChatBoss && !e.Msg.Pending {
-			select {
-			case bossCh <- e.Msg.Text:
-			default:
+		if e.Kind == state.EvChatBoss {
+			if !e.Msg.Pending {
+				select {
+				case bossCh <- e.Msg.Text:
+				default:
+				}
+			}
+			switch {
+			case e.Msg.Pending:
+				// Stream update (delta growth or the Send placeholder): one
+				// line per emit, same ID, growing accum — NEVER a new bubble.
+				bossStreamCounts[e.Msg.ID]++
+				n := bossStreamCounts[e.Msg.ID]
+				fmt.Printf("[boss-stream#%d (accum %d chars)] id=%s %q\n",
+					n, len([]rune(e.Msg.Text)), e.Msg.ID, tail(e.Msg.Text, 80))
+				mu.Unlock()
+				return
+			case strings.HasPrefix(e.Msg.ID, "bossmsg-") || e.Msg.Kind == "boss":
+				// The completion pin (or an interrupted-stream flush).
+				fmt.Printf("[boss-final] %s %q\n", e.Msg.ID, trunc(e.Msg.Text, 120))
+				mu.Unlock()
+				return
 			}
 		}
 		printEvent(e)

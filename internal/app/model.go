@@ -362,7 +362,11 @@ func (m *Model) applyEvent(ev state.Event) tea.Cmd {
 	}
 	m.tabs.SetState(m.st)
 
-	if ev.Kind != state.EvTick {
+	// activity: mid-stream deltas are visual growth of ONE bubble — logging
+	// each would spam the log (the placeholder's "typing…" and the final's
+	// "reply" already bracket the turn). Skip pending-with-text events.
+	isStreamDelta := ev.Kind == state.EvChatBoss && ev.Msg.Pending && ev.Msg.Text != ""
+	if ev.Kind != state.EvTick && !isStreamDelta {
 		m.activity.Add(m.describeEvent(ev))
 	}
 
@@ -713,15 +717,47 @@ func reducer(st state.OfficeState, ev state.Event) state.OfficeState {
 		return st
 
 	case state.EvChatBoss:
-		// a real answer (or a fresh pending) replaces the old typing placeholder
-		var rest []state.ChatMsg
+		st.BossThinking = false // a boss turn ends the thinking affordance
+
+		// typingPlaceholder — the Send-sequenced "boss-N" pending bubble.
+		// Real bubbles (stream deltas + the pinned final) carry their own
+		// stable ID ("bossmsg-"+messageID) and are never placeholders.
+		isPlaceholder := func(m state.ChatMsg) bool {
+			return m.From == "boss" && m.Pending && strings.HasPrefix(m.ID, "boss-")
+		}
+		msg := ev.Msg
+
+		// (a) replace-in-place by ID: streaming deltas land on their stable
+		// ID and grow the same bubble; the final re-emits that ID with
+		// Pending=false; a duplicated completed event is idempotent. The
+		// swap is one atomic slice — the chat count never inflates mid-stream.
+		if msg.ID != "" {
+			for i, m := range st.Chat {
+				if m.ID == msg.ID {
+					next := append([]state.ChatMsg(nil), st.Chat...)
+					next[i] = msg
+					st.Chat = capChat(next)
+					return st
+				}
+			}
+		}
+
+		// (b) a fresh typing placeholder appends as-is; it gets replaced by
+		// the FIRST real bubble of its reply cycle (branch below).
+		if isPlaceholder(msg) {
+			st.Chat = capChat(appendChat(st.Chat, msg))
+			return st
+		}
+
+		// (c) a new real boss bubble: strip every remaining "boss-N" typing
+		// placeholder of the send cycle, then append.
+		rest := make([]state.ChatMsg, 0, len(st.Chat)+1)
 		for _, mgr := range st.Chat {
-			if !(mgr.From == "boss" && mgr.Pending) {
+			if !isPlaceholder(mgr) {
 				rest = append(rest, mgr)
 			}
 		}
-		st.BossThinking = false // a boss turn ends the thinking affordance
-		st.Chat = capChat(append(rest, ev.Msg))
+		st.Chat = capChat(append(rest, msg))
 		return st
 
 	case state.EvThought:

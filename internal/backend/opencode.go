@@ -32,6 +32,15 @@
 // most one emit every thoughtMinGapMs, keeping the LAST update in flight
 // and dropping intermediates (coalesce, never reorder). A Done=true always
 // flushes immediately so the block collapses on completion, not 150ms late.
+//
+// Chat streaming: TEXT parts of the primary session delta on the same
+// channel. events.go registers streaming text parts and accumulates their
+// deltas; emitChatStream coalesces the growing EvChatBoss updates per
+// bubble ID ("bossmsg-"+messageID, Pending:true) exactly like the thought
+// gate. The message.updated completion pin emits the pinned full text on
+// the SAME ID with Pending:false (it stops the stream first). Stop() and
+// session.error flush any still-open stream as Pending:false with a
+// "[grafeio] stream interrupted" note.
 package backend
 
 import (
@@ -72,6 +81,7 @@ type liveBackend struct {
 	pendingBoss   []string
 	bossCompleted map[string]bool
 	thoughtSlots  map[string]*thoughtSlot // CallID -> coalescing slot (thought stream gate)
+	chatSlots     map[string]*thoughtSlot // boss bubble Msg.ID -> coalescing slot (text delta stream gate)
 	am            *amHandle
 	amTasks       map[string]string // id -> dedupe key
 	amMails       map[string]bool
@@ -87,6 +97,7 @@ func newLiveBackend(baseURL, directory string) *liveBackend {
 		ctx:           newNormCtx(),
 		bossCompleted: make(map[string]bool),
 		thoughtSlots:  make(map[string]*thoughtSlot),
+		chatSlots:     make(map[string]*thoughtSlot),
 		amTasks:       make(map[string]string),
 		amMails:       make(map[string]bool),
 		client:        &http.Client{Timeout: 15 * time.Second},
@@ -234,6 +245,20 @@ func (b *liveBackend) Stop() error {
 	if b.fl.isStopped() {
 		return nil
 	}
+	// Graceful stream shutdown: a boss answer still mid-delta never gets
+	// its completion pin, so flush whatever accumulated as a Pending=false
+	// bubble (update-in-place on the same ID) with an interruption note.
+	// Must run BEFORE fl.stop() seals the emit callback.
+	b.mu.Lock()
+	streamEvs := interruptedStreamEvents(b.ctx, "[grafeio] stream interrupted")
+	for id := range b.chatSlots {
+		delete(b.chatSlots, id)
+	}
+	b.mu.Unlock()
+	for _, e := range streamEvs {
+		b.fl.emit(e)
+	}
+
 	b.fl.stop() // seals emit, kills timers + pollers
 
 	b.mu.Lock()
@@ -762,6 +787,64 @@ func (b *liveBackend) flushThought(callID string) {
 	}
 }
 
+// ---------------------------------------------------------------- chat stream gate
+
+// emitChatStream gates the boss text-delta bursts per bubble ID, identical
+// to the thought gate: at most one emit every thoughtMinGapMs, trailing
+// flush keeps the LAST update. The completion pin (maybeBossCompleted) owns
+// the final emit and deletes the slot, so no stale trailing update can land
+// after the pinned text.
+func (b *liveBackend) emitChatStream(e state.Event) {
+	if e.Msg.ID == "" {
+		b.fl.emit(e)
+		return
+	}
+	now := nowMs()
+	b.mu.Lock()
+	slot := b.chatSlots[e.Msg.ID]
+	if slot == nil {
+		slot = &thoughtSlot{}
+		b.chatSlots[e.Msg.ID] = slot
+	}
+	if now-slot.lastAt >= thoughtMinGapMs {
+		slot.lastAt = now
+		b.mu.Unlock()
+		b.fl.emit(e)
+		return
+	}
+	pending := e
+	slot.pending = &pending
+	if slot.ticking {
+		b.mu.Unlock()
+		return
+	}
+	slot.ticking = true
+	wait := time.Duration(thoughtMinGapMs-(now-slot.lastAt)) * time.Millisecond
+	b.mu.Unlock()
+	b.fl.at(wait, func() { b.flushChatStream(e.Msg.ID) })
+}
+
+// flushChatStream ships the coalesced trailing chat update for a bubble ID.
+// A deleted slot (completion pin or Stop) makes this a no-op.
+func (b *liveBackend) flushChatStream(id string) {
+	b.mu.Lock()
+	slot := b.chatSlots[id]
+	if slot == nil {
+		b.mu.Unlock()
+		return
+	}
+	slot.ticking = false
+	pending := slot.pending
+	slot.pending = nil
+	if pending != nil {
+		slot.lastAt = nowMs()
+	}
+	b.mu.Unlock()
+	if pending != nil {
+		b.fl.emit(*pending)
+	}
+}
+
 // onEvent normalizes via events.go, then runs the I/O-needing branches.
 func (b *liveBackend) onEvent(raw ocSSEEvent) error {
 	b.mu.Lock()
@@ -771,6 +854,12 @@ func (b *liveBackend) onEvent(raw ocSSEEvent) error {
 	for _, e := range events {
 		if e.Kind == state.EvThought {
 			b.emitThought(e)
+			continue
+		}
+		// Streaming boss chat updates (Pending:true, "bossmsg-"+messageID)
+		// coalesce at ~7fps like thoughts; placeholders and finals pass.
+		if e.Kind == state.EvChatBoss && e.Msg.Pending && strings.HasPrefix(e.Msg.ID, "bossmsg-") {
+			b.emitChatStream(e)
 			continue
 		}
 		b.fl.emit(e)
@@ -866,13 +955,19 @@ func (b *liveBackend) maybeChildReturned(sessionID string) {
 // maybeBossCompleted: boss replied — emit a chat-boss bubble pinned to the
 // COMPLETING message's own text.
 //
-// Identity + dedupe: bubble ID is "bossmsg-"+<messageID> (deterministic);
-// bossCompleted remembers every completion seen, so a repeated
-// message.updated for the same ID is swallowed before any re-emit (the
-// reducer would otherwise append a second copy). Pending placeholders keep
-// their swap semantics: any EvChatBoss strips the pending bubble, so the
-// first completed bubble after a Send replaces it and later completions of
-// the same turn append as their own distinct bubbles.
+// Identity + dedupe: bubble ID is "bossmsg-"+<messageID> (deterministic) —
+// the SAME ID the text-delta stream grew under, so one bubble identity
+// spans stream + completion and the UI replaces the growing bubble with
+// this pinned text. bossCompleted remembers every completion seen, so a
+// repeated message.updated for the same ID is swallowed before any re-emit
+// (the reducer would otherwise append a second copy). Pending placeholders
+// keep their swap semantics: any EvChatBoss strips the pending bubble, so
+// the first completed bubble after a Send replaces it and later
+// completions of the same turn append as their own distinct bubbles.
+//
+// Stream handoff: completion STOPS the delta stream for this message
+// (parts unregistered, accumulator freed, any coalesced trailing update
+// dropped) — the pinned fetch text supersedes the accumulated deltas.
 //
 // Text selection: ONLY the completing message's own text parts
 // (messageText), NEVER the session-latest assistant text — on a reused
@@ -888,6 +983,11 @@ func (b *liveBackend) maybeBossCompleted(info ocMessage) {
 		return
 	}
 	b.bossCompleted[info.ID] = true
+	// Stop the delta stream for this message: unregister its text parts,
+	// free the accumulator, and drop any coalesced trailing update still
+	// in flight — the pinned text below replaces the growing bubble.
+	unregisterTextStream(b.ctx, info.ID)
+	delete(b.chatSlots, "bossmsg-"+info.ID)
 	primaryID := b.primaryID
 	b.mu.Unlock()
 
@@ -910,7 +1010,7 @@ func (b *liveBackend) maybeBossCompleted(info ocMessage) {
 	b.mu.Unlock()
 
 	b.fl.emit(state.Event{Kind: state.EvChatBoss, Msg: state.ChatMsg{
-		ID: "bossmsg-" + info.ID, From: "boss", Text: text, At: nowMs(), Pending: false,
+		ID: "bossmsg-" + info.ID, From: "boss", Kind: "boss", Text: text, At: nowMs(), Pending: false,
 	}})
 }
 

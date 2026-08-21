@@ -22,6 +22,15 @@
 //	                    [--think-stop mid|done] (with --think: print just ONE
 //	                                frame — mid = streaming, done = collapsed —
 //	                                for the gallery freeze shot)
+//	                    [--stream]  (chat-stream proof: one "bossmsg-m1" bubble
+//	                                streamed as 5 ACCUMULATED pending updates
+//	                                300ms apart, then the pinned final; prints
+//	                                frame mid-stream (partial bubble + caret,
+//	                                spinner row gone) and after done (one single
+//	                                settled bubble — replace-in-place, no dup).
+//	                                A message is typed mid-stream to prove the
+//	                                queue holds until the final bubble; the
+//	                                ordering trace prints enqueue/done/flush.)
 package main
 
 import (
@@ -30,6 +39,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -129,9 +139,12 @@ type stubBackend struct {
 	emit       func(state.Event)
 	done       chan struct{}
 	start      time.Time
-	flushQueue bool   // --debug: script resolves the round-2 pending boss
-	thinkMode  bool   // --think: script streams one think CallID instead
-	permAnswer string // recorded by AnswerPermission for the final print
+	flushQueue bool              // --debug: script resolves the round-2 pending boss
+	thinkMode  bool              // --think: script streams one think CallID instead
+	streamMode bool              // --stream: script streams one "bossmsg-" reply instead
+	permAnswer string            // recorded by AnswerPermission for the final print
+	sendSeq    int               // unique reply IDs per Send (replace-by-ID safety)
+	trace      func(line string) // --stream: ordering-trace sink
 }
 
 func mail(id, from, to, subject, body string, kind state.MailKind) state.MailItem {
@@ -159,6 +172,10 @@ func (b *stubBackend) script() {
 		b.scriptThink(at)
 		return
 	}
+	if b.streamMode {
+		b.scriptStream(at)
+		return
+	}
 
 	at(50, state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — stub backend online"})
 	at(100, state.Event{Kind: state.EvHire, Employee: state.Employee{
@@ -172,7 +189,7 @@ func (b *stubBackend) script() {
 	// answers with markdown — with a boss tool chain merging running → done.
 	at(550, state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
 		"make hello.html — dark navy, white text", false)})
-	at(600, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("b0", "boss", "", true)})
+	at(600, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-1", "boss", "", true)})
 	at(650, state.Event{Kind: state.EvThought, EmployeeID: "boss", EmployeeName: "boss",
 		Text: "single file, no build step.\ndark navy bg, white text — keep it simple.", Done: false})
 	at(720, state.Event{Kind: state.EvThought, EmployeeID: "dev-1", EmployeeName: "tekton-1",
@@ -233,7 +250,7 @@ func (b *stubBackend) script() {
 	// unless flushQueue, which resolves it so the queue drains.
 	at(3000, state.Event{Kind: state.EvChatUser, Msg: chatMsg("u2", "user",
 		"and add a footer please", false)})
-	at(3050, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("b2", "boss", "", true)})
+	at(3050, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-2", "boss", "", true)})
 	at(3300, state.Event{Kind: state.EvMail, Mail: mail("m3", "hr", "all",
 		"roster synced", "3 agents seated.", state.MailNotice)})
 	if b.flushQueue {
@@ -279,7 +296,7 @@ func (b *stubBackend) scriptThink(at func(ms int, ev state.Event)) {
 	at(50, state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — think-stream stub online"})
 	at(150, state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
 		"sketch the leaderboard flow", false)})
-	at(200, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("b0", "boss", "", true)})
+	at(200, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-1", "boss", "", true)})
 	// an older, already-complete thought — collapsed in BOTH frames
 	at(350, thought("th-old",
 		"weekly beats daily — less noise.\nboss only sees the rollout row.", true))
@@ -300,12 +317,62 @@ func (b *stubBackend) Start(emit func(state.Event)) error {
 	return nil
 }
 
-// Send answers any interactive prompt deterministically (600ms ack).
-func (b *stubBackend) Send(_ string) error {
+// streamReply — the --stream bubble's full pinned text; streamParts are its
+// accumulated prefixes (what the backend's deltas accumulate to). Kept ≤ one
+// sidebar wrap per prefix so the mid-stream frame is deterministic.
+const streamReply = "Honey never spoils — jars buried 3,000 years ago were " +
+	"still **good to eat**. It crystallizes over time, but a warm water " +
+	"bath brings it right back."
+
+var streamParts = []string{
+	"Honey never",
+	"Honey never spoils — jars buried",
+	"Honey never spoils — jars buried 3,000 years ago were still **good to",
+	"Honey never spoils — jars buried 3,000 years ago were still **good to eat**. It crystallizes over time,",
+	streamReply,
+}
+
+// scriptStream (--stream) — the live-typing proof, matching the backend's
+// streaming contract: Send stages ONE "boss-N" placeholder; the reply
+// arrives as 5 ACCUMULATED pending updates on the STABLE ID "bossmsg-m1"
+// (300ms apart), then the pinned final (same ID, Pending=false). The mid
+// frame (t=1.25s) shows the grown bubble + caret with the spinner row gone;
+// the done frame (t=2.8s) shows exactly ONE settled bubble — deltas merged
+// in place, never appended. Done also flushes the message typed mid-stream.
+func (b *stubBackend) scriptStream(at func(ms int, ev state.Event)) {
+	trace := func(line string) {
+		if b.trace != nil {
+			b.trace(line)
+		}
+	}
+	at(50, state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — chat-stream stub online"})
+	at(150, state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
+		"tell me about honey", false)})
+	at(200, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-1", "boss", "", true)})
+	for i, part := range streamParts {
+		at(500+i*300, state.Event{Kind: state.EvChatBoss,
+			Msg: chatMsg("bossmsg-m1", "boss", part, true)})
+	}
+	// the final pinned update — same stable ID, Pending=false
+	at(2000, state.Event{Kind: state.EvChatBoss,
+		Msg: chatMsg("bossmsg-m1", "boss", streamReply, false)})
+	trace("[stream] done: bossmsg-m1 → pending=false")
+}
+
+// Send answers any interactive prompt deterministically (600ms ack). Reply
+// IDs are UNIQUE per call ("bx-N") — with replace-by-ID in the reducer, a
+// recycled ID would collapse consecutive flushed replies into one bubble.
+func (b *stubBackend) Send(text string) error {
 	if b.emit != nil {
+		b.sendSeq++
+		id := fmt.Sprintf("bx-%d", b.sendSeq)
+		reply := "Roger that."
+		if b.streamMode {
+			reply = "flushed follow-up handled: " + text
+		}
 		time.AfterFunc(600*time.Millisecond, func() {
 			b.emit(state.Event{Kind: state.EvChatBoss,
-				Msg: chatMsg("bx", "boss", "Roger that.", false)})
+				Msg: chatMsg(id, "boss", reply, false)})
 		})
 	}
 	return nil
@@ -412,6 +479,81 @@ func runThinkShot(tab string, dur time.Duration) (string, error) {
 	return fm.Frame(), nil
 }
 
+// streamWorkload (--stream) types ONE message and hits Enter mid-stream —
+// the deltas run 500–1700ms and the placeholder went pending at 200ms, so
+// Enter lands while the boss reply is outstanding: it must ENQUEUE, and the
+// flush must fire only after the done bubble (2000ms). The trace lines
+// (enqueued / done / flush, all timestamped) prove the order.
+func streamWorkload(p *tea.Program) {
+	typeLine := func(s string) {
+		for _, r := range s {
+			p.Send(tea.KeyPressMsg(tea.Key{Code: r, Text: string(r)}))
+			time.Sleep(8 * time.Millisecond)
+		}
+		p.Send(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	}
+	time.Sleep(900 * time.Millisecond)
+	typeLine("how do bees make it")
+}
+
+// traceLog collects timestamped ordering lines for the --stream proof
+// (enqueue / done / flush), written from the script goroutine, the tea
+// update loop (via app.QueueDebugf) and the shot runner.
+type traceLog struct {
+	mu    sync.Mutex
+	start time.Time
+	lines []string
+}
+
+func (t *traceLog) add(line string) {
+	t.mu.Lock()
+	t.lines = append(t.lines, fmt.Sprintf("%s @+%dms", line, time.Since(t.start).Milliseconds()))
+	t.mu.Unlock()
+}
+
+// runStreamShot runs one fresh app+program against a stream-mode stub for
+// `dur`, then returns the final frame plus the ordering trace. Two calls
+// with different durations = the deterministic mid-stream/after-done pair.
+func runStreamShot(dur time.Duration) (string, []string, error) {
+	tl := &traceLog{start: time.Now()}
+	backend := &stubBackend{done: make(chan struct{}), streamMode: true, trace: tl.add}
+	m := app.New(backend)
+	if !m.SelectTab("chat") {
+		return "", nil, fmt.Errorf("unknown tab %q", "chat")
+	}
+	p := tea.NewProgram(m,
+		tea.WithWindowSize(shotCols, shotRows),
+		tea.WithoutRenderer(),
+		tea.WithInput(nil),
+		tea.WithOutput(io.Discard),
+	)
+	app.QueueDebugf = func(format string, args ...any) {
+		tl.add("[queue] " + fmt.Sprintf(format, args...))
+	}
+	emit := func(ev state.Event) { p.Send(ev) }
+	if err := backend.Start(emit); err != nil {
+		return "", nil, err
+	}
+	go streamWorkload(p)
+	go func() {
+		time.Sleep(dur)
+		p.Quit()
+	}()
+	final, err := p.Run()
+	if err != nil {
+		return "", nil, err
+	}
+	fm, ok := final.(app.Model)
+	if !ok {
+		return "", nil, fmt.Errorf("unexpected final model type %T", final)
+	}
+	app.QueueDebugf = nil
+	tl.mu.Lock()
+	lines := append([]string(nil), tl.lines...)
+	tl.mu.Unlock()
+	return fm.Frame(), lines, nil
+}
+
 func main() {
 	tab := flag.String("tab", defaultTab, "active tab: chat|agents|board|mail|activity")
 	theme := flag.String("theme", "", "force a ui theme: "+strings.Join(chrome.ThemeNames(), "|"))
@@ -421,6 +563,7 @@ func main() {
 	debug := flag.Bool("debug", false, "queue flush proof: resolves the pending boss so the queue drains; prints [queue] trace lines")
 	think := flag.Bool("think", false, "think-stream proof: one CallID streamed in accumulated updates, prints BOTH frames (t=2.0s mid-stream expanded, t=3.2s collapsed after Done)")
 	thinkStop := flag.String("think-stop", "", "with --think: print ONE frame only (mid = t=2.0s streaming, done = t=3.2s collapsed) for the gallery shot")
+	stream := flag.Bool("stream", false, "chat-stream proof: one \"bossmsg-m1\" reply streamed as 5 accumulated pending updates then pinned; prints frame mid-stream (bubble + caret, spinner gone) and after done (single settled bubble) plus the enqueue/done/flush ordering trace")
 	flag.Parse()
 
 	// keystroke workloads only reach the textarea / prompt on the chat tab
@@ -468,6 +611,31 @@ func main() {
 			}
 			fmt.Println(frame)
 			fmt.Println("===== UI SHOT =====")
+		}
+		return
+	}
+
+	if *stream {
+		stops := []struct {
+			at    time.Duration
+			label string
+		}{
+			{1250 * time.Millisecond, "frame 1 — t=1.25s (MID-STREAM: grown bubble + caret, spinner row gone, one message enqueued)"},
+			{2800 * time.Millisecond, "frame 2 — t=2.8s (AFTER DONE: one settled bubble — replace-in-place, no dup — queue flushed)"},
+		}
+		for _, s := range stops {
+			frame, trace, err := runStreamShot(s.at)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "uishot: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("===== UI SHOT · %s =====\n", s.label)
+			fmt.Println(frame)
+			fmt.Println("===== UI SHOT =====")
+			fmt.Println("--- ordering trace ---")
+			for _, ln := range trace {
+				fmt.Println(ln)
+			}
 		}
 		return
 	}
@@ -530,10 +698,6 @@ func main() {
 	fmt.Println("===== UI SHOT =====")
 	fmt.Println(fm.Frame())
 	fmt.Println("===== UI SHOT =====")
-
-	if *perm {
-		fmt.Printf("perm answered: %s\n", backend.permAnswer)
-	}
 
 	if *slash {
 		// persist proof: the /theme slash run must have written the file

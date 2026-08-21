@@ -30,6 +30,11 @@ locks you out while the boss types.
 
 ![diffs](docs/shots-go/chat-diff.png)
 
+Everything live-streams: the boss's replies type out character-by-character on
+one bubble, and thinking transcripts unfold in real time before auto-collapsing.
+
+![streaming](docs/shots-go/chat-stream.png)
+
 ## Keys
 
 | key | does |

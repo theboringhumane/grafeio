@@ -14,7 +14,12 @@
 //	            Kind "tool" entries render as dim one-liners merged by CallID;
 //	            From "office" entries render as dim local notices (red when
 //	            Meta == "error").
-//	spinner   — shown only while a boss reply is pending (" boss is typing…")
+//	spinner   — shown only while a boss reply is pending WITH NO TEXT YET
+//	            (" boss is typing…"). A pending boss bubble WITH text renders
+//	            in the viewport itself as a streaming "boss ›" turn: glamour
+//	            markdown re-rendered per delta plus a blinking dim caret "▌"
+//	            at the tail (blink follows the office tick) — the spinner row
+//	            disappears once the bubble speaks for itself.
 //	divider
 //	textarea  — multiline input; Enter sends, Shift+Enter (or Ctrl+J) is a
 //	            newline, placeholder "talk to the boss…". NEVER locked: while
@@ -105,7 +110,12 @@ type Chat struct {
 
 	chat    []state.ChatMsg // rendered snapshot
 	pending bool
-	follow  bool // stick to the bottom unless the user scrolled up
+	// pendingSpin — the " boss is typing…" spinner row shows ONLY while a
+	// boss reply is outstanding with no streamed text yet (the typing
+	// placeholder). Once a streaming boss bubble has text, the bubble
+	// itself (with its blinking caret) replaces the spinner row.
+	pendingSpin bool
+	follow      bool // stick to the bottom unless the user scrolled up
 
 	showThinking  bool // /thinking on|off — collected blocks visible (default true)
 	showTools     bool // /tools on|off    — tool one-liners visible (default true)
@@ -313,7 +323,7 @@ func (c *Chat) SetSize(w, h int) {
 	}
 	c.w, c.h = w, h
 	spH := 0
-	if c.pending {
+	if c.pendingSpin {
 		spH = 1
 	}
 	vpH := h - textareaH - 1 /* divider */ - spH
@@ -348,24 +358,38 @@ func (c *Chat) SetState(st state.OfficeState) {
 	}
 	rev ^= srev
 	// while any think block streams, re-render on EVERY tick (the header
-	// spinner advances with the office clock even when text is unchanged)
-	if rev == c.renderRev && len(st.Chat) == len(c.chat) && len(c.streamingThink) == 0 {
+	// spinner advances with the office clock even when text is unchanged);
+	// same for a streaming boss bubble — its caret blinks with the tick.
+	streamActive := false
+	for _, m := range c.chat {
+		if m.From == "boss" && m.Pending && m.Text != "" {
+			streamActive = true
+			break
+		}
+	}
+	if rev == c.renderRev && len(st.Chat) == len(c.chat) && len(c.streamingThink) == 0 && !streamActive {
 		return
 	}
 	c.renderRev = rev
 	c.chat = cloneChat(st.Chat)
 
 	wasPending := c.pending
-	c.pending = false
+	wasSpin := c.pendingSpin
+	c.pending, c.pendingSpin = false, false
 	for _, m := range c.chat {
 		if m.From == "boss" && m.Pending {
 			c.pending = true
+			if m.Text == "" {
+				c.pendingSpin = true
+			}
 		}
 	}
 	if c.pending != wasPending {
 		// the textarea NEVER locks — typing while the boss works is the
-		// whole point of the queue; only the placeholder + spinner row react
+		// whole point of the queue; only the placeholder text reacts
 		c.refreshPlaceholder()
+	}
+	if c.pendingSpin != wasSpin {
 		c.SetSize(c.w, c.h) // spinner row appears/disappears
 	}
 
@@ -472,7 +496,7 @@ func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 func (c *Chat) View() string {
 	var b strings.Builder
 	b.WriteString(c.vp.View())
-	if c.pending {
+	if c.pendingSpin {
 		b.WriteString("\n")
 		b.WriteString(c.sp.View())
 		b.WriteString(chrome.AccentText.Render(" boss is typing…"))
@@ -515,8 +539,9 @@ func (c *Chat) renderPermission() string {
 func (c *Chat) renderConversation() string {
 	visible := make([]state.ChatMsg, 0, len(c.chat))
 	for _, m := range c.chat {
-		if m.From == "boss" && m.Pending {
-			continue // the spinner line speaks for the typing placeholder
+		if m.From == "boss" && m.Pending && m.Text == "" {
+			continue // the spinner line speaks for the EMPTY typing placeholder;
+			// a pending bubble WITH text renders below (streaming reply)
 		}
 		if m.Kind == thinkKind && !c.showThinking {
 			continue
@@ -551,8 +576,15 @@ func (c *Chat) renderConversation() string {
 			writePrefixed(&b, prefix, strings.Repeat(" ", len(userPrefix)), lines)
 		default:
 			prefix := chrome.Fg(chrome.Accent, bossPrefix)
-			writePrefixed(&b, prefix, strings.Repeat(" ", len(bossPrefix)),
-				cleanMarkdown(c.renderMarkdown(m.Text)))
+			lines := cleanMarkdown(c.renderMarkdown(m.Text))
+			if m.Pending {
+				// streaming reply: blinking dim caret pinned to the last
+				// line — it grows mark-by-mark as deltas land
+				if c.tick%2 == 0 {
+					lines[len(lines)-1] += " " + chrome.DimText.Render("▌")
+				}
+			}
+			writePrefixed(&b, prefix, strings.Repeat(" ", len(bossPrefix)), lines)
 		}
 	}
 	return strings.TrimRight(b.String(), "\n")

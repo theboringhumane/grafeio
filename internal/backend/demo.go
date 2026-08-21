@@ -262,8 +262,10 @@ func (b *demoBackend) Start(emit func(state.Event)) error {
 
 // ---------------------------------------------------------------- send
 
-// Send: the demo boss always answers cheerily (600ms ack), and one ad-hoc
-// dispatch cycle (900ms) proves the request landed.
+// Send: the demo boss always answers cheerily — the ack STREAMS (four
+// accumulated updates on one bubble id over 500ms, final pin at 600ms,
+// mirroring the live text-delta stream), and one ad-hoc dispatch cycle
+// (900ms) proves the request landed.
 func (b *demoBackend) Send(text string) error {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" || b.fl.isStopped() {
@@ -278,14 +280,29 @@ func (b *demoBackend) Send(text string) error {
 		ID: "user-" + itoa(seq), From: "user", Text: trimmed, At: nowMs(),
 	}})
 
-	// The demo boss always answers cheerily, naming the request.
+	// The demo boss always answers cheerily, naming the request — and it
+	// STREAMS the ack exactly like a live text-part delta stream: four
+	// growing EvChatBoss updates on ONE bubble id (Pending:true) inside a
+	// 500ms window, then the final Pending:false bubble at 600ms. The UI
+	// watches one bubble grow, then pin.
+	ack := `On it: "` + shortTitle(trimmed, 40) + `" is on the board - watch the floor.`
+	ackRunes := []rune(ack)
+	bossID := "boss-" + itoa(seq)
+	streamBeats := []time.Duration{100, 250, 400, 500}
+	for i, at := range streamBeats {
+		i, at := i, at
+		b.fl.at(at*time.Millisecond, func() {
+			n := len(ackRunes) * (i + 1) / len(streamBeats)
+			b.fl.emit(state.Event{Kind: state.EvChatBoss, Msg: state.ChatMsg{
+				ID: bossID, From: "boss", Kind: "boss",
+				Text: string(ackRunes[:n]), At: nowMs(), Pending: true,
+			}})
+		})
+	}
 	b.fl.at(600*time.Millisecond, func() {
 		b.fl.emit(state.Event{Kind: state.EvChatBoss, Msg: state.ChatMsg{
-			ID:      "boss-" + itoa(seq),
-			From:    "boss",
-			Text:    `On it: "` + shortTitle(trimmed, 40) + `" is on the board - watch the floor.`,
-			At:      nowMs(),
-			Pending: false,
+			ID: bossID, From: "boss", Kind: "boss",
+			Text: ack, At: nowMs(), Pending: false,
 		}})
 	})
 

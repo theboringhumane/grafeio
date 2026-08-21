@@ -81,6 +81,16 @@ type ChatMsg struct {
 	Pending bool   `json:"pending,omitempty"`
 	// Kind — "user" | "boss" | "think" | "tool". Empty "" keeps existing
 	// literals valid (classic user/boss chat).
+	//
+	// "boss" STREAMING contract (live text-part deltas): while the boss's
+	// final answer streams in, EvChatBoss carries Msg{ID:"bossmsg-"+<messageID>,
+	// Kind:"boss", Pending:true, Text:accumulated-so-far} — repeated updates
+	// of the SAME Msg.ID grow the one bubble. The completion pin re-emits the
+	// same ID with Pending:false and the pinned full text; the UI replaces
+	// the streaming bubble with it. A stream that dies before completion
+	// (abort/error/stop) ends Pending:false with a "[grafeio] stream
+	// interrupted" note appended. UI: update-in-place by Msg.ID, never
+	// append a streaming update as a new bubble.
 	Kind string `json:"kind,omitempty"`
 	// Meta — short decoration, e.g. "read · src/main.go". Empty for plain chat.
 	Meta string `json:"meta,omitempty"`

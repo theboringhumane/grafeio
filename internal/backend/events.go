@@ -7,6 +7,7 @@ package backend
 
 import (
 	"encoding/json"
+	"sort"
 	"strings"
 	"unicode"
 
@@ -136,8 +137,9 @@ type ocSessionErrorProps struct {
 // (see cmd/headless probes): a reasoning part's message.part.updated only
 // ever arrives as start (empty text, time.end=0) and completion (full text,
 // time.end!=0) — all intermediate growth rides these deltas, appended in
-// order to the same partID. Text parts delta too, so deltas are only
-// surfaced for parts a message.part.updated has classified as reasoning.
+// order to the same partID. Text parts delta the same way: a delta is
+// surfaced (as thought growth or boss-bubble growth) only after a
+// message.part.updated has classified its part, else it buffers.
 type ocPartDelta struct {
 	SessionID string `json:"sessionID"`
 	MessageID string `json:"messageID"`
@@ -170,12 +172,21 @@ type normCtx struct {
 	reasoningParts map[string]bool     // part id -> a message.part.updated said "reasoning"
 	reasoningAccum map[string]string   // part id -> delta-accumulated transcript so far
 	deltaBuffer    map[string]string   // part id -> deltas seen BEFORE the part was classified
+	textParts      map[string]bool     // part id -> message.part.updated classified a STREAMING text part (primary only)
+	textPartMsg    map[string]string   // text part id -> its messageID (deltas key the boss bubble)
+	textAccum      map[string]string   // messageID -> delta-accumulated answer text so far
+	textStart      map[string]int64    // messageID -> stream start (ms; Msg.At for every update of the bubble)
 }
 
 // thoughtCapRunes bounds a thought transcript. Raised from the old 400 (a
 // summary) to 3000: EvThought carries the GROWING transcript now, so the UI
 // can render a live expanding block.
 const thoughtCapRunes = 3000
+
+// bossTextCapRunes bounds a streaming boss chat bubble's accumulated text.
+// The pinned completion text (messageText fetch) is NOT capped here — UI
+// trims for display; the cap only guards the delta accumulator.
+const bossTextCapRunes = 6000
 
 // permHold remembers a pending permission/question request so its reply
 // event can be turned into a "resolved" follow-up on the same id.
@@ -200,6 +211,10 @@ func newNormCtx() *normCtx {
 		reasoningParts: make(map[string]bool),
 		reasoningAccum: make(map[string]string),
 		deltaBuffer:    make(map[string]string),
+		textParts:      make(map[string]bool),
+		textPartMsg:    make(map[string]string),
+		textAccum:      make(map[string]string),
+		textStart:      make(map[string]int64),
 	}
 }
 
@@ -399,6 +414,140 @@ func mapReasoningDelta(d ocPartDelta, ctx *normCtx, primaryID string) []state.Ev
 		CallID:       d.PartID,
 		Done:         false,
 	}}
+}
+
+// ---------------- boss text streaming (final-answer deltas) ----------------
+
+// mapTextPart registers a STREAMING text part of the PRIMARY session
+// (message.part.updated, part.type=="text", time.end==0): the boss's
+// final-answer channel opens. Only the primary registers — children keep
+// their part.updated text frames on the throttled-working path. Any deltas
+// that arrived before classification (deltaBuffer) seed the accumulator.
+// Emits nothing itself; the EvChatBoss stream rides the delta frames.
+// A completed part frame (time.end!=0) just unregisters — the pinned text
+// is emitted by the message.updated completion pin, never from here.
+func mapTextPart(part ocPart, ctx *normCtx, now int64) []state.Event {
+	if part.Time.End != 0 {
+		delete(ctx.textParts, part.ID)
+		delete(ctx.textPartMsg, part.ID)
+		return nil
+	}
+	if part.MessageID == "" {
+		return nil
+	}
+	if !ctx.textParts[part.ID] {
+		ctx.textParts[part.ID] = true
+		ctx.textPartMsg[part.ID] = part.MessageID
+		if ctx.textStart[part.MessageID] == 0 {
+			start := part.Time.Start
+			if start == 0 {
+				start = now
+			}
+			ctx.textStart[part.MessageID] = start
+		}
+		if buffered := ctx.deltaBuffer[part.ID]; buffered != "" {
+			ctx.textAccum[part.MessageID] = capBossText(ctx.textAccum[part.MessageID] + buffered)
+			delete(ctx.deltaBuffer, part.ID)
+		}
+	}
+	return nil
+}
+
+// mapTextDelta turns one message.part.delta frame on a registered text part
+// into a GROWING EvChatBoss: same Msg.ID ("bossmsg-"+messageID) as the
+// eventual completion bubble, Pending:true, accumulated-so-far text. One
+// bubble identity spans stream + completion; the UI replaces in place.
+// Emission rate is coalesced by the backend (chatSlots gate, 150ms).
+func mapTextDelta(d ocPartDelta, ctx *normCtx) []state.Event {
+	if d.PartID == "" || d.Field != "text" || d.Delta == "" {
+		return nil
+	}
+	msgID := ctx.textPartMsg[d.PartID]
+	if msgID == "" {
+		// Unregistered part on a message that is ALREADY streaming (a second
+		// text part whose updated raced its deltas): late-register inline.
+		if d.MessageID == "" || ctx.textStart[d.MessageID] == 0 {
+			return nil
+		}
+		msgID = d.MessageID
+		ctx.textParts[d.PartID] = true
+		ctx.textPartMsg[d.PartID] = msgID
+	}
+	accumulated := capBossText(ctx.textAccum[msgID] + d.Delta)
+	ctx.textAccum[msgID] = accumulated
+	at := ctx.textStart[msgID]
+	return []state.Event{{
+		Kind: state.EvChatBoss,
+		Msg: state.ChatMsg{
+			ID:      "bossmsg-" + msgID,
+			From:    "boss",
+			Kind:    "boss",
+			Text:    accumulated,
+			At:      at,
+			Pending: true,
+		},
+	}}
+}
+
+// capBossText rune-caps an accumulated boss answer at bossTextCapRunes. No
+// trimming and no ellipsis — mid-stream text keeps leading/trailing space
+// so later deltas append cleanly; the prefix cap simply freezes growth.
+func capBossText(text string) string {
+	return sliceMax(text, bossTextCapRunes)
+}
+
+// interruptedStreamEvents flushes every open boss text stream as a final
+// Pending=false bubble carrying the accumulated text plus an interruption
+// note (abort/error/stop), then frees ALL stream state. Only the primary
+// session ever registers text streams, so every open stream belongs to the
+// interrupted run. Deltas that stream cleanly into a completion are
+// unaffected: their state was already freed by unregisterTextStream.
+func interruptedStreamEvents(ctx *normCtx, note string) []state.Event {
+	var ids []string
+	for msgID, accum := range ctx.textAccum {
+		if strings.TrimSpace(accum) != "" {
+			ids = append(ids, msgID)
+		}
+	}
+	sort.Strings(ids) // deterministic emit order
+	var evs []state.Event
+	for _, msgID := range ids {
+		evs = append(evs, state.Event{Kind: state.EvChatBoss, Msg: state.ChatMsg{
+			ID:      "bossmsg-" + msgID,
+			From:    "boss",
+			Kind:    "boss",
+			Text:    ctx.textAccum[msgID] + "\n" + note,
+			At:      ctx.textStart[msgID],
+			Pending: false,
+		}})
+	}
+	for partID := range ctx.textParts {
+		delete(ctx.textParts, partID)
+	}
+	for partID := range ctx.textPartMsg {
+		delete(ctx.textPartMsg, partID)
+	}
+	for msgID := range ctx.textAccum {
+		delete(ctx.textAccum, msgID)
+	}
+	for msgID := range ctx.textStart {
+		delete(ctx.textStart, msgID)
+	}
+	return evs
+}
+
+// unregisterTextStream stops the delta stream for one message (completion
+// pin): its parts go, the accumulator and start stamp are freed. The pinned
+// completion bubble text supersedes whatever the deltas accumulated.
+func unregisterTextStream(ctx *normCtx, messageID string) {
+	for partID, msgID := range ctx.textPartMsg {
+		if msgID == messageID {
+			delete(ctx.textParts, partID)
+			delete(ctx.textPartMsg, partID)
+		}
+	}
+	delete(ctx.textAccum, messageID)
+	delete(ctx.textStart, messageID)
 }
 
 // mapToolPart surfaces a ToolPart (read/grep/glob/bash/write/edit/task/...)
@@ -705,8 +854,12 @@ func diffEvent(sessionID, empID, empName string, d ocSnapshotFileDiff, ctx *norm
 //	message.part.updated (reasoning, primary) -> thought (boss mind)
 //	message.part.updated (reasoning, child)   -> thought (employee mind)
 //	message.part.delta (reasoning part, any)  -> thought, growing transcript
-//		(serve streams growth ONLY via deltas: updated lands at start
-//		empty and completion full — verified 1.18.19)
+//	(serve streams growth ONLY via deltas: updated lands at start
+//	empty and completion full — verified 1.18.19)
+//	message.part.updated (text, primary, streaming) -> register boss stream
+//	message.part.delta (text part, primary)  -> chat-boss, growing bubble
+//	("bossmsg-"+messageID, Pending:true; the completion pin reuses the
+//	same ID with Pending:false so one bubble spans stream + final)
 //	message.part.updated (tool, any)       -> tool run/done/error (+ child working pulse)
 //	message.part.updated (child, other)    -> working (throttled 500ms/employee)
 //	message.updated (primary, ANY role)    -> [] — the primary's own user
@@ -779,6 +932,13 @@ func mapOCEvent(raw ocSSEEvent, ctx *normCtx, primaryID string, now int64) []sta
 		switch part.Type {
 		case "reasoning":
 			return mapReasoningPart(part, ctx, primaryID)
+		case "text":
+			// The boss's final answer streams too — register the part so
+			// its deltas grow the "bossmsg-"+messageID chat bubble.
+			// Children stay on the old working-pulse path below.
+			if part.SessionID == primaryID {
+				return mapTextPart(part, ctx, now)
+			}
 		case "tool":
 			ev, ok := mapToolPart(part, ctx, primaryID)
 			if !ok {
@@ -801,6 +961,12 @@ func mapOCEvent(raw ocSSEEvent, ctx *normCtx, primaryID string, now int64) []sta
 		if json.Unmarshal(raw.Properties, &p) != nil {
 			return nil
 		}
+		// Registered text parts stream the boss's chat bubble; reasoning
+		// parts stream the thought block; unclassified parts buffer until
+		// their message.part.updated classifies them.
+		if ctx.textParts[p.PartID] || (p.MessageID != "" && !ctx.reasoningParts[p.PartID] && ctx.textStart[p.MessageID] != 0) {
+			return mapTextDelta(p, ctx)
+		}
 		return mapReasoningDelta(p, ctx, primaryID)
 
 	case "message.updated":
@@ -815,6 +981,12 @@ func mapOCEvent(raw ocSSEEvent, ctx *normCtx, primaryID string, now int64) []sta
 			// Boss completion needs a fetch — the backend handles it.
 			// User-role messages on the primary are the member's own chat,
 			// already echoed exactly once by Send() — NEVER echoed here.
+			if info.Role == "user" {
+				// A user message can carry text parts too (the prompt echo);
+				// it never streams. Purge any stream registration so its
+				// parts never open a boss bubble.
+				unregisterTextStream(ctx, info.ID)
+			}
 			return nil
 		}
 		emp, ok := ctx.employees[info.SessionID]
@@ -883,7 +1055,11 @@ func mapOCEvent(raw ocSSEEvent, ctx *normCtx, primaryID string, now int64) []sta
 		if p.Error != nil && p.Error.Data.Message != "" {
 			message = p.Error.Data.Message
 		}
-		return []state.Event{{
+		// Any boss text still streaming dies with the run: flush whatever
+		// accumulated as a final Pending=false bubble (update-in-place on
+		// the same ID), then the error line.
+		evs := interruptedStreamEvents(ctx, "[grafeio] stream interrupted")
+		return append(evs, state.Event{
 			Kind: state.EvChatBoss,
 			Msg: state.ChatMsg{
 				ID:      "boss-error-" + itoa64(now),
@@ -892,7 +1068,7 @@ func mapOCEvent(raw ocSSEEvent, ctx *normCtx, primaryID string, now int64) []sta
 				At:      now,
 				Pending: false,
 			},
-		}}
+		})
 
 	default:
 		return nil
