@@ -1,0 +1,153 @@
+// Package state — the ONE contract backend and UI both speak.
+// Port of node-legacy/src/state.ts. UI never calls SDK/HTTP directly;
+// backend never renders.
+package state
+
+// SpriteState — where an employee is / what they're doing (drives glyphs+walkers).
+type SpriteState string
+
+const (
+	SpriteAtDesk    SpriteState = "at-desk"
+	SpriteWorking   SpriteState = "working"
+	SpriteToManager SpriteState = "to-manager"
+	SpriteMeeting   SpriteState = "meeting"
+	SpriteToDesk    SpriteState = "to-desk"
+	SpriteToCoffee  SpriteState = "to-coffee"
+	SpriteCoffee    SpriteState = "coffee"
+	SpriteAtMailbox SpriteState = "at-mailbox"
+)
+
+// EmployeeRole — the office seat.
+type EmployeeRole string
+
+const (
+	RoleManager   EmployeeRole = "manager"
+	RoleHR        EmployeeRole = "hr"
+	RoleDeveloper EmployeeRole = "developer"
+	RoleScout     EmployeeRole = "scout"
+	RoleReviewer  EmployeeRole = "reviewer"
+	RoleRunner    EmployeeRole = "runner"
+)
+
+type Employee struct {
+	ID     string       `json:"id"`
+	Name   string       `json:"name"`
+	Role   EmployeeRole `json:"role"`
+	Seat   string       `json:"seat"`
+	Sprite SpriteState  `json:"sprite"`
+	Task   string       `json:"task,omitempty"`
+}
+
+type TaskStatus string
+
+const (
+	TaskPending    TaskStatus = "pending"
+	TaskInProgress TaskStatus = "in-progress"
+	TaskDone       TaskStatus = "done"
+)
+
+type BoardTask struct {
+	ID    string     `json:"id"`
+	Title string     `json:"title"`
+	Status TaskStatus `json:"status"`
+	Owner string     `json:"owner,omitempty"`
+	At    int64      `json:"at"`
+}
+
+type MailKind string
+
+const (
+	MailBrief  MailKind = "brief"
+	MailReturn MailKind = "return"
+	MailNotice MailKind = "notice"
+	MailUser   MailKind = "user"
+)
+
+type MailItem struct {
+	ID      string   `json:"id"`
+	From    string   `json:"from"`
+	To      string   `json:"to"`
+	At      int64    `json:"at"`
+	Subject string   `json:"subject"`
+	Body    string   `json:"body"`
+	Kind    MailKind `json:"kind"`
+}
+
+type ChatMsg struct {
+	ID      string `json:"id"`
+	From    string `json:"from"` // "user" | "boss"
+	Text    string `json:"text"`
+	At      int64  `json:"at"`
+	Pending bool   `json:"pending,omitempty"`
+}
+
+// SpeechBubble — ambient office chatter balloon, expires after ttl ticks.
+type SpeechBubble struct {
+	ID         string `json:"id"`
+	EmployeeID string `json:"employeeId"`
+	Text       string `json:"text"`
+	UntilTick  int    `json:"untilTick"`
+}
+
+type Mode string
+
+const (
+	ModeLive Mode = "live"
+	ModeDemo Mode = "demo"
+)
+
+type OfficeState struct {
+	Employees  []Employee     `json:"employees"`
+	Tasks      []BoardTask    `json:"tasks"`
+	Mails      []MailItem     `json:"mails"`
+	Chat       []ChatMsg      `json:"chat"`
+	Bubbles    []SpeechBubble `json:"bubbles"`
+	Mode       Mode           `json:"mode"`
+	StatusLine string         `json:"statusLine"`
+	Tick       int            `json:"tick"`
+}
+
+// EventKind — Go has no tagged unions; one Event struct with a Kind + optional fields.
+type EventKind string
+
+const (
+	EvHire      EventKind = "hire"
+	EvFire      EventKind = "fire"
+	EvDispatch  EventKind = "dispatch"
+	EvWorking   EventKind = "working"
+	EvReturned  EventKind = "returned"
+	EvIdleDrift EventKind = "idle-drift"
+	EvBlocked   EventKind = "blocked"
+	EvTask      EventKind = "task"
+	EvMail      EventKind = "mail"
+	EvChatUser  EventKind = "chat-user"
+	EvChatBoss  EventKind = "chat-boss"
+	EvBubble    EventKind = "bubble"
+	EvStatus    EventKind = "status"
+	EvTick      EventKind = "tick"
+)
+
+// Event — the wire between backend and the tea.Model. Only fields relevant
+// to Kind are populated.
+type Event struct {
+	Kind       EventKind `json:"kind"`
+	Employee   Employee  `json:"employee,omitempty"`   // hire
+	EmployeeID string    `json:"employeeId,omitempty"` // fire/dispatch/working/returned/idle/blocked/bubble
+	Task       BoardTask `json:"task,omitempty"`       // dispatch/task + returned.TaskID via Task.ID
+	TaskID     string    `json:"taskId,omitempty"`     // working/returned
+	Mail       MailItem  `json:"mail,omitempty"`       // returned/mail
+	Msg        ChatMsg   `json:"msg,omitempty"`        // chat-user/chat-boss
+	Text       string    `json:"text,omitempty"`       // status note / bubble text
+	TTL        int       `json:"ttl,omitempty"`        // bubble
+}
+
+// Backend — one per run. Demo scripted, live via opencode serve + agentmemory.
+type Backend interface {
+	Mode() Mode
+	// Start wires events; f MUST be safe to call from backend goroutines
+	// (the app hands it tea.Program.Send).
+	Start(emit func(Event)) error
+	// Send pushes user chat to the boss.
+	Send(text string) error
+	Stop() error
+}

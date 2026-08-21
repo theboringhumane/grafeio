@@ -1,7 +1,13 @@
-# Grafeio — Architecture (γραφείο, "the office")
+# Grafeio — Architecture (γραφείο, "the office") — v2 (Go)
 
 A terminal office run by a real agent manager. Everything on screen is backed
 by a real system; nothing on screen is fake except the coffee.
+
+> v2 note: the UI is Go + [charmbracelet](https://charm.land) — bubbletea v2
+> (alt-screen, mouse), bubbles v2 (viewport / textarea / spinner / help),
+> glamour v2 (markdown), lipgloss v2 (theme). The Ink/Node v0.1 app is frozen
+> in `node-legacy/`. Backend and floor are literal ports of the verified v1
+> behaviors (same event contract, same zones/walkers).
 
 ```
 +------------------------- GRAFEIO (Ink TUI) -------------------------+
