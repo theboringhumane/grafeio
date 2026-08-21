@@ -76,3 +76,21 @@ func TopBar(st state.OfficeState, width int) string {
 	}
 	return Bar.Width(width).Render(line)
 }
+
+// TopBarCompact — the /compact layout's compressed top bar: the segment
+// budget drops mode and cwd, keeping the app name, agents count and clock.
+func TopBarCompact(st state.OfficeState, width int) string {
+	agents := fmt.Sprintf("%d", len(st.Employees))
+	clock := OfficeClock(st.Tick)
+
+	line := OnBarBold(White, " grafeio "+AppVersion) +
+		OnBar(White, " | agents ") +
+		OnBar(Info, agents) +
+		OnBar(White, " | ") +
+		OnBar(Dim, clock+" ")
+
+	if lipgloss.Width(line) > width {
+		line = ansi.Truncate(line, width, "")
+	}
+	return Bar.Width(width).Render(line)
+}

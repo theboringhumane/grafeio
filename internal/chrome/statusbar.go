@@ -36,6 +36,23 @@ func statusLineColor(line string) (c color.Color, dim bool) {
 	}
 }
 
+// StatusBarZen — the /zen fullscreen-floor status line: a minimal bar with
+// just the zen marker, the office clock and the exit hint (any key leaves
+// zen; ctrl+q quits the app).
+func StatusBarZen(st state.OfficeState, width int) string {
+	left := OnBar(Dim, " zen · "+OfficeClock(st.Tick)+" ")
+	right := OnBar(Dim, "any key exits · ctrl+q quits ")
+	gap := width - lipgloss.Width(left) - lipgloss.Width(right)
+	if gap < 1 {
+		gap = 1
+	}
+	line := left + strings.Repeat(" ", gap) + right
+	if lipgloss.Width(line) > width {
+		line = ansi.Truncate(line, width, "")
+	}
+	return Bar.Width(width).Render(line)
+}
+
 // StatusBar renders the full-width status bar for one frame.
 // hint is the pre-rendered keymap segment (gray), e.g. from
 // app keys: "tab:panels · ↑↓:scroll · enter:send · q:quit".

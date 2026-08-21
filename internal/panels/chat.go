@@ -156,6 +156,7 @@ type Chat struct {
 	showTools     bool // /tools on|off    — tool one-liners visible (default true)
 	thinkExpanded bool // ctrl+t — thinking expanded; DEFAULT false (collapsed)
 	diffExpanded  bool // ctrl+d or /diffs on|off — diffs expanded; DEFAULT false
+	compactRows   bool // /compact layout — the textarea trims to 2 visible rows
 
 	// streamingThink — CallIDs with an OPEN boss EvThought stream (set by
 	// the app from its model-owned active set). Streaming blocks always
@@ -404,6 +405,27 @@ func (c *Chat) Pending() bool { return c.pending }
 // calls this when pending flips false → true.
 func (c *Chat) SpinnerKick() tea.Cmd { return c.sp.Tick }
 
+// inputRows is the textarea's visible height: textareaH normally, trimmed
+// to 2 rows in the /compact layout. The permission modal always renders
+// textareaH rows (it is sized for them), so it keeps the full region.
+func (c *Chat) inputRows() int {
+	if c.compactRows && c.perm == nil {
+		return 2
+	}
+	return textareaH
+}
+
+// SetCompact switches the input region between the full 3-row textarea and
+// the compact 2-row one (the app calls it on /compact + /mode changes).
+func (c *Chat) SetCompact(on bool) {
+	if c.compactRows == on {
+		return
+	}
+	c.compactRows = on
+	c.ta.SetHeight(c.inputRows())
+	c.SetSize(c.w, c.h) // viewport takes/relinquishes the extra row
+}
+
 // SetSize implements Tab: splits content height across viewport / spinner /
 // divider / bottom region (textarea, permission modal, or question modal —
 // the question modal is the one region with a DIFFERENT row count).
@@ -416,7 +438,7 @@ func (c *Chat) SetSize(w, h int) {
 	if c.pendingSpin {
 		spH = 1
 	}
-	regionH := textareaH
+	regionH := c.inputRows()
 	if c.question != nil {
 		regionH = c.questionModalH()
 	}

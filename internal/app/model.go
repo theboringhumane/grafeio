@@ -2,7 +2,11 @@
 // (exact port of node-legacy/src/app.tsx officeReducer + initialState),
 // layout, key routing, the power governor, and the backend event seam.
 //
-// Layout: topbar (1) | middle (floor left flex | right sidebar 44) | statusbar (1).
+// Layout: topbar (1) | middle (floor left flex | right sidebar) | statusbar (1).
+// The sidebar holds six tabs — chat | terminal | agents | board | mail |
+// activity — and its width is configurable (brain.json ui.sidebarWidth,
+// 26..60 clamp, 0 = default 44; /compact mode narrows it to 30). /zen is a
+// transient fullscreen-floor mode (sidebar hidden, any key exits).
 // Events arrive as state.Event tea.Msgs (backend goroutine → tea.Program.Send);
 // the animation tick is a re-arming tea.Tick loop governed by the brain.json
 // power posture (power.go): busy = smooth (180ms/150ms/400ms), idle = cheap
@@ -12,6 +16,7 @@ package app
 import (
 	"fmt"
 	"math/rand"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -32,7 +37,15 @@ const (
 	thinkCap     = 20  // thinking blocks kept in chat
 	toolCap      = 20  // tool one-liners kept in chat
 	bubbleCap    = 3   // never more than 3 concurrent balloons (drop oldest)
-	sidebarW     = 44  // right tab sidebar, when the terminal is wide enough
+
+	// Sidebar sizing: the default is 44 cols; brain.json ui.sidebarWidth is
+	// clamped to 26..60 (explicit config wins over /compact); the compact
+	// layout mode (/compact, ui.compact) narrows the default to 30.
+	defaultSidebarW = 44
+	compactSidebarW = 30
+	sidebarMin      = 26
+	sidebarMax      = 60
+
 	degradeCols  = 100 // below this, the sidebar shrinks instead of the floor
 	minCols      = 40
 	minRows      = 12
@@ -125,7 +138,17 @@ type Model struct {
 	tabs          *panels.Tabs
 	chat          *panels.Chat
 	activity      *panels.Activity
+	termTab       *termTabWrap // tab 2: the real OS-shell (lazy PTY, terminal.go)
 	keys          KeyMap
+
+	// zen — transient fullscreen-floor mode: sidebar hidden entirely, topbar
+	// stays, statusbar minimal; any key exits. Never persisted (the ruling:
+	// /zen is a focus session, not a preference).
+	zen bool
+	// compactLive — the /compact session override: 0 = inherit
+	// brain.json ui.compact, 1 = compact on, 2 = normal on. /mode
+	// normal|compact writes cfg.UI.Compact (persisted) and clears this.
+	compactLive int
 
 	// frameNonce — bumped on every message that can mutate panel ephemera
 	// the state digest can't see (textarea draft, scroll, spinner, theme
@@ -261,6 +284,7 @@ func New(b state.Backend, cfg *config.Config) Model {
 		bossShort = bossShort[:i]
 	}
 
+	termTab := newTermTabWrap()
 	chat := panels.NewChat(func(text string) tea.Cmd {
 		return func() tea.Msg {
 			// Slash commands dispatch locally, never touch the backend, and
@@ -289,11 +313,13 @@ func New(b state.Backend, cfg *config.Config) Model {
 		st:          initialState(b.Mode()),
 		chat:        chat,
 		activity:    activity,
+		termTab:     termTab,
 		activeThink: map[string]bool{},
 		social:           newSocialClock(),
 		lastDispatchTick: -1,
 		tabs: panels.NewTabs(
 			chat,
+			termTab,
 			agents,
 			panels.NewBoard(),
 			panels.NewMail(),
@@ -323,14 +349,21 @@ func New(b state.Backend, cfg *config.Config) Model {
 			return func() tea.Msg { return questionLaterMsg{} }
 		},
 	)
+	m.tabs.SetCompact(m.compact())
+	m.chat.SetCompact(m.compact())
 	m.tabs.SetState(m.st)
 	return m
 }
 
-// SelectTab activates a sidebar tab by name ("chat", "agents", …).
-// Used by harnesses (uishot) before the run starts.
+// SelectTab activates a sidebar tab by name ("chat", "terminal", "agents",
+// …). Used by harnesses (uishot) before the run starts; selecting the
+// terminal tab lazy-spawns its shell on this first visit.
 func (m *Model) SelectTab(name string) bool {
-	return m.tabs.SetActiveByTitle(name)
+	ok := m.tabs.SetActiveByTitle(name)
+	if ok {
+		m.maybeSpawnTerminal()
+	}
+	return ok
 }
 
 // SetSoundBus injects the sound engine's bus (nil disables sound). The app
@@ -548,33 +581,96 @@ func (m Model) Frame() string {
 	}
 	m.gov.frameMisses++
 	top := chrome.TopBar(m.st, m.width)
-	floor := lipgloss.NewStyle().Width(m.floorW).Height(m.middleH).
-		Render(office.CachedStyled(m.st, m.floorW, m.middleH))
-	side := lipgloss.NewStyle().Width(m.sidebar).Height(m.middleH).
-		Render(m.tabs.View())
-	mid := lipgloss.JoinHorizontal(lipgloss.Top, floor, side)
-	bot := chrome.StatusBar(m.st, m.keys.HintLine(), len(m.queue), m.width)
+	if m.compact() {
+		top = chrome.TopBarCompact(m.st, m.width)
+	}
+	var mid, bot string
+	if m.zen {
+		// zen (/zen · /focus floor) — transient fullscreen floor: sidebar
+		// hidden entirely, topbar stays, chat gone, statusline minimal.
+		mid = lipgloss.NewStyle().Width(m.width).Height(m.middleH).
+			Render(office.CachedStyled(m.st, m.width, m.middleH))
+		bot = chrome.StatusBarZen(m.st, m.width)
+	} else {
+		floor := lipgloss.NewStyle().Width(m.floorW).Height(m.middleH).
+			Render(office.CachedStyled(m.st, m.floorW, m.middleH))
+		side := lipgloss.NewStyle().Width(m.sidebar).Height(m.middleH).
+			Render(m.tabs.View())
+		mid = lipgloss.JoinHorizontal(lipgloss.Top, floor, side)
+		hint := m.keys.HintLine()
+		if m.terminalActive() {
+			hint = termHint
+		}
+		bot = chrome.StatusBar(m.st, hint, len(m.queue), m.width)
+	}
 	frame := lipgloss.JoinVertical(lipgloss.Left, top, mid, bot)
 	m.gov.frameKey, m.gov.frameCached = digest, frame
 	return frame
 }
 
 // handleKey implements the global keymap; unclaimed keys go to the tabs.
+//
+// The terminal tab has the tightest claim: when it is focused the ONLY keys
+// the app keeps are the tab switches (1..6/tab/shift+tab), ctrl+o (the
+// release-the-focus badge back to chat) and ctrl+q — every other key, q and
+// ctrl+c included, forwards to the REAL shell (term maps ctrl+c to 0x03 →
+// SIGINT of the shell's foreground process, not an app quit).
 func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
+	key := msg.String()
 	chatActive := m.tabs.ActiveIndex() == 0
-	switch msg.String() {
-	case "ctrl+c":
+	termActive := m.terminalActive()
+
+	switch {
+	case key == "ctrl+q":
+		// app quit works EVERYWHERE — terminal focus included
+		m.closeTerminal()
 		return tea.Quit
-	case "q":
-		if !chatActive {
-			return tea.Quit
-		}
+	case m.zen:
+		// any key exits zen (transient fullscreen floor); the key does
+		// nothing else this press
+		m.zen = false
+		return nil
+	}
+
+	// tab-switch keys work from EVERY tab, terminal included
+	switch key {
 	case "tab":
 		m.tabs.Next()
+		m.maybeSpawnTerminal()
 		return nil
 	case "shift+tab":
 		m.tabs.Prev()
+		m.maybeSpawnTerminal()
 		return nil
+	case "ctrl+o":
+		// release the terminal focus badge → back to chat
+		if termActive {
+			m.tabs.SetActive(0)
+			return nil
+		}
+	}
+	if !chatActive {
+		if idx := m.keys.TabJump(key); idx >= 0 {
+			m.tabs.SetActive(idx)
+			m.maybeSpawnTerminal()
+			return nil
+		}
+	}
+
+	if termActive {
+		// everything else belongs to the shell
+		return m.tabs.Update(msg)
+	}
+
+	switch key {
+	case "ctrl+c":
+		m.closeTerminal()
+		return tea.Quit
+	case "q":
+		if !chatActive {
+			m.closeTerminal()
+			return tea.Quit
+		}
 	case "ctrl+t":
 		if chatActive {
 			m.chat.ToggleThink()
@@ -585,15 +681,46 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 			m.chat.ToggleDiffs()
 			return nil
 		}
-	default:
-		if !chatActive {
-			if idx := m.keys.TabJump(msg.String()); idx >= 0 {
-				m.tabs.SetActive(idx)
-				return nil
-			}
-		}
 	}
 	return m.tabs.Update(msg)
+}
+
+// terminalActive reports whether the focused tab is the OS-shell tab.
+func (m *Model) terminalActive() bool {
+	return m.tabs.ActiveIndex() == terminalIndex
+}
+
+// maybeSpawnTerminal lazy-spawns the terminal tab's shell on the first
+// visit (battery: no PTY until the member asks for one). A spawn failure is
+// a soft landing: office notice "terminal spawn failed: <err>" + fallback
+// to the chat tab — never a crash.
+func (m *Model) maybeSpawnTerminal() {
+	if !m.terminalActive() || m.termTab == nil {
+		return
+	}
+	if err := m.termTab.ensure(); err != nil {
+		m.playSound("error")
+		m.noticeErr(fmt.Sprintf("terminal spawn failed: %v", err))
+		m.tabs.SetActive(0)
+	}
+}
+
+// closeTerminal kills the spawned shell on the app quit path (Close is
+// idempotent; a never-visited tab has no PTY to kill).
+func (m *Model) closeTerminal() {
+	if m.termTab != nil {
+		m.termTab.close()
+	}
+}
+
+// CloseTerminal is the exported quit-path hook for cmd/grafeio (the runtime
+// intercepts tea.QuitMsg before Update, so an external p.Quit skips
+// handleKey — call CloseTerminal alongside to never leak a shell process).
+func (m *Model) CloseTerminal() { m.closeTerminal() }
+
+// LayoutInfo reports the computed frame geometry (uisshot --layout asserts).
+func (m Model) LayoutInfo() (width, height, sidebar, floor int) {
+	return m.width, m.height, m.sidebar, m.floorW
 }
 
 // applyEvent reduces one backend event, feeds panels + activity log, and
@@ -974,6 +1101,49 @@ func hasQuestionID(ids []string, id string) bool {
 	return false
 }
 
+// compact — the live layout mode: the /compact session override beats
+// brain.json ui.compact; compactLive=0 inherits the config.
+func (m Model) compact() bool {
+	switch m.compactLive {
+	case 1:
+		return true
+	case 2:
+		return false
+	}
+	return m.cfg.UI.Compact
+}
+
+// applyLayout pushes the current mode/UI config into every affected
+// surface: tab-bar label density, the chat input rows, and the sidebar
+// width. Called at build time and after /compact, /mode and /wide.
+func (m *Model) applyLayout() {
+	compact := m.compact()
+	m.tabs.SetCompact(compact)
+	m.chat.SetCompact(compact)
+	if m.width > 0 {
+		m.resize(m.width, m.height)
+	}
+}
+
+// sidebarBase — the configured sidebar width before the narrow-terminal
+// degrade: ui.sidebarWidth clamped to 26..60 wins outright; else the
+// compact layout takes 30; else the 44-col default.
+func (m Model) sidebarBase() int {
+	if n := m.cfg.UI.SidebarWidth; n != 0 {
+		if n < sidebarMin {
+			n = sidebarMin
+		}
+		if n > sidebarMax {
+			n = sidebarMax
+		}
+		return n
+	}
+	if m.compact() {
+		return compactSidebarW
+	}
+	return defaultSidebarW
+}
+
 func (m *Model) resize(w, h int) {
 	if w < minCols {
 		w = minCols
@@ -986,15 +1156,16 @@ func (m *Model) resize(w, h int) {
 	if m.middleH < 1 {
 		m.middleH = 1
 	}
-	sw := sidebarW
+	base := m.sidebarBase()
+	sw := base
 	if w < degradeCols {
 		// degrade gracefully: narrow terminals get a narrow sidebar
 		sw = w / 3
 		if sw < 20 {
 			sw = 20
 		}
-		if sw > sidebarW {
-			sw = sidebarW
+		if sw > base {
+			sw = base
 		}
 	}
 	if w-sw < 8 {
@@ -1455,6 +1626,11 @@ const slashHelp = `commands:
   /thinking on|off   show/hide thinking blocks
   /tools on|off      show/hide tool one-liners
   /diffs on|off      expand/collapse file diffs (ctrl+d toggles)
+  /compact on|off    compact layout this session (narrow sidebar, short tabs)
+  /mode normal|compact  layout mode (persists)
+  /wide <n>          sidebar width 26..60 (0 = default 44, persists)
+  /zen               fullscreen floor, any key exits (transient)
+  /focus floor       alias of /zen
   /queue             show the backlog (numbered items batched on flush)
   /queue clear       drop all queued backlog items
   /route             force-dispatch the backlog now (bypasses the busy gate)
@@ -1539,6 +1715,68 @@ func (m *Model) applySlash(input string) tea.Cmd {
 		m.applyToggle("/diffs", fields, func(on bool) {
 			m.chat.SetDiffsExpanded(on)
 		})
+	case "/compact":
+		// live toggle — session override only (/mode persists the choice)
+		if len(fields) < 2 || (fields[1] != "on" && fields[1] != "off") {
+			m.noticeErr("/compact: usage /compact on|off  (/mode normal|compact persists)")
+			return nil
+		}
+		if fields[1] == "on" {
+			m.compactLive = 1
+		} else {
+			m.compactLive = 2
+		}
+		m.applyLayout()
+		m.notice(fmt.Sprintf("compact → %s (this session · /mode %s persists)",
+			fields[1], fields[1]))
+	case "/mode":
+		if len(fields) < 2 || (fields[1] != "normal" && fields[1] != "compact") {
+			m.noticeErr("/mode: usage /mode normal|compact")
+			return nil
+		}
+		m.cfg.UI.Compact = fields[1] == "compact"
+		m.compactLive = 0 // cfg is the source again
+		m.applyLayout()
+		m.notice(fmt.Sprintf("layout mode → %s · %s", fields[1], m.persistCfg()))
+	case "/wide":
+		if len(fields) < 2 {
+			m.noticeErr(fmt.Sprintf("/wide: usage /wide <%d..%d> (0 = default %d)", sidebarMin, sidebarMax, defaultSidebarW))
+			return nil
+		}
+		n, err := strconv.Atoi(fields[1])
+		if err != nil {
+			m.noticeErr(fmt.Sprintf("/wide: %q is not a number (26..60, 0 = default)", fields[1]))
+			return nil
+		}
+		if n < 0 {
+			n = 0
+		}
+		if n > sidebarMax {
+			m.notice(fmt.Sprintf("/wide: %d over the %d-col cap — clamped", n, sidebarMax))
+			n = sidebarMax
+		} else if n != 0 && n < sidebarMin {
+			m.notice(fmt.Sprintf("/wide: %d under the %d-col floor — clamped", n, sidebarMin))
+			n = sidebarMin
+		}
+		m.cfg.UI.SidebarWidth = n
+		m.applyLayout()
+		shown := n
+		if n == 0 {
+			shown = defaultSidebarW
+			if m.compact() {
+				shown = compactSidebarW
+			}
+		}
+		m.notice(fmt.Sprintf("sidebar → %d cols · %s", shown, m.persistCfg()))
+	case "/zen":
+		// transient focus session — intentionally NOT persisted
+		m.zen = true
+	case "/focus":
+		if len(fields) < 2 || fields[1] != "floor" {
+			m.noticeErr("/focus: usage /focus floor  (alias of /zen)")
+			return nil
+		}
+		m.zen = true
 	case "/queue":
 		if len(fields) >= 2 {
 			if fields[1] == "clear" {
@@ -1623,6 +1861,7 @@ func (m *Model) applySlash(input string) tea.Cmd {
 			m.st.Mode, chrome.CurrentTheme().Name, PowerMode(m.cfg), len(m.st.Employees),
 			pend, doing, done, m.st.StatusLine))
 	case "/quit":
+		m.closeTerminal()
 		return tea.Quit
 	default:
 		m.noticeErr(fmt.Sprintf("/ %s: no such command (/help)", strings.TrimPrefix(cmd, "/")))

@@ -50,7 +50,8 @@ defaults on first run; inspect anytime with `grafeio --print-default-config`).
   "boss":    { "name": "boss (oikonomos)", "model": "anthropic/claude-sonnet-4-5" },
   "roles":   { "developer": { "namePrefix": "tekton" }, "scout": { "namePrefix": "skopos" },
                "reviewer": { "namePrefix": "dikastes" }, "runner": { "namePrefix": "hemerodromos" } },
-  "ui":      { "theme": "noir", "power": "auto", "tickMs": 0, "ambientChatter": true },
+  "ui":      { "theme": "noir", "power": "auto", "tickMs": 0, "ambientChatter": true,
+               "sounds": "on", "sidebarWidth": 0, "compact": false },
   "backend": { "agentmemoryUrl": "http://localhost:3111", "server": "", "agentmemoryPollS": 5 }
 }
 ```
@@ -72,26 +73,41 @@ bubbles. Renders are memoized (frame digest on the app, `(size, planGen, tick,
 renderRev)` on the floor), the agentmemory board poll backs off 2× after five
 quiet syncs (cap 4×, reset on change). The office goes cheap when nothing moves.
 
+## The sidebar is a cockpit
+
+Six tabs with a real terminal in the middle:
+
+- **terminal** — an OS shell (`$SHELL`) on a real PTY, by `creack/pty`:
+  lazily spawned on first visit, resizes with the panel, mouse scrolls the
+  scrollback, `r` respawns when dead, `ctrl+o` releases focus, `ctrl+q` still
+  quits everything.
+- **chat** — the boss conversation; **agents** / **board** / **mail** /
+  **activity** — office telemetry.
+
+Layout lives in the config *and* in the app:
+
+```text
+/compact on|off     narrow sidebar (30) + short tab letters + 2-row input
+/mode normal|compact   same, persisted to brain.json
+/wide <n>           sidebar width 26..60 (0 = default 44), persisted
+/zen                fullscreen floor, minimal chrome — any key exits
+```
+
+Sounds: `ui.sounds = on | bell | off` (or `GRAFEIO_MUTE=1`).
+
 ## Keys
 
 | key | does |
 |---|---|
-| `tab` / `shift+tab` / `1..5` | switch panel: chat · agents · board · mail · activity |
+| `tab` / `shift+tab` / `1..6` | switch panel: chat · **terminal** · agents · board · mail · activity |
 | `↑` `↓` `pgup` `pgdn` / wheel | scroll the active panel |
 | `enter` | send to the boss (chat) |
 | `shift+enter` | newline |
 | `ctrl+t` | expand/collapse completed thinking blocks |
 | `ctrl+d` | expand/collapse diff blocks |
+| `ctrl+o` | release the embedded terminal's focus back to the panels |
+| `ctrl+q` | quit (works inside the embedded terminal too) |
 | `y` `a` `n` `esc` | answer a permission prompt |
-| `q` / `ctrl+c` | quit |
-
-
-| key | does |
-|---|---|
-| `tab` / `shift+tab` / `1..5` | switch panel: chat · agents · board · mail · activity |
-| `↑` `↓` `pgup` `pgdn` / wheel | scroll the active panel |
-| `enter` | send to the boss (chat) |
-| `shift+enter` | newline |
 | `q` / `ctrl+c` | quit |
 
 ## What v2 (Go) changed

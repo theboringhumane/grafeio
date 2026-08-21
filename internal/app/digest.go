@@ -47,6 +47,9 @@ func (m *Model) frameDigest() uint64 {
 	}
 	// activity lines are appended per processed event even when the event
 	// leaves OfficeState untouched (child permissions/questions) — count them.
-	fmt.Fprintf(h, "|%d|%s|%s", m.activityAdds, m.bossName, PowerMode(m.cfg))
+	// zen (sidebar-hidden fullscreen) and the compact layout change pixels
+	// the digest's geometry terms (sidebar/floorW) only see AFTER a resize —
+	// fold the mode flags in directly so the first toggled frame re-renders.
+	fmt.Fprintf(h, "|%d|%s|%s|%t|%t", m.activityAdds, m.bossName, PowerMode(m.cfg), m.zen, m.compact())
 	return h.Sum64()
 }

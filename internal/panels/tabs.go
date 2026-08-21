@@ -1,10 +1,12 @@
-// Package panels — the right-hand sidebar tab strip and its five tab
-// panels: chat, agents, board, mail, activity.
+// Package panels — the right-hand sidebar tab strip and its six tab
+// panels: chat, terminal, agents, board, mail, activity.
 //
 // tabs.go — the strip itself: a one-row tab bar (active tab accent bg,
 // others gray) above a rounded-border panel holding the active tab's
 // content. Keys (handled by the app via the keymap): tab/shift+tab cycles,
-// 1..5 jumps straight to a tab.
+// 1..6 jumps straight to a tab. A compact display mode shortens the tab
+// labels to single letters (/compact — the canonical Title() is untouched,
+// so SetActiveByTitle keeps matching the full names).
 package panels
 
 import (
@@ -36,11 +38,28 @@ type Interactive interface {
 }
 
 // Tabs is the sidebar strip: tab bar row + active tab in a bordered box.
+// compact shortens the bar labels to single letters (display only).
 type Tabs struct {
-	tabs   []Tab
-	active int
-	w, h   int
+	tabs    []Tab
+	active  int
+	w, h    int
+	compact bool
 }
+
+// compactLabels — the /compact sidebar's short tab labels, keyed by the
+// canonical Title(). Unknown titles keep their full name.
+var compactLabels = map[string]string{
+	"chat":     "c",
+	"terminal": "t",
+	"agents":   "a",
+	"board":    "b",
+	"mail":     "m",
+	"activity": "x",
+}
+
+// SetCompact switches the tab-bar label density (the app re-calls it on
+// /compact and /mode changes; panel state and titles are untouched).
+func (t *Tabs) SetCompact(on bool) { t.compact = on }
 
 // NewTabs wires the strip in tab order. Index 0 is the default active tab.
 func NewTabs(tabs ...Tab) *Tabs {
@@ -114,16 +133,22 @@ func (t *Tabs) View() string {
 		return ""
 	}
 
-	// tab bar: " 1 chat " segments; active accent bg, others gray. When the
-	// numbered labels overflow, fall back to bare titles so all five fit.
-	bar := t.tabBar(true)
-	if lipgloss.Width(bar) > t.w {
-		bar = t.tabBar(false)
+	// tab bar: " 1 chat " segments; active accent bg, others gray. Fall back
+	// in three tiers so all six tabs stay readable before we ever clip:
+	// numbered " 1 chat " → padded bare " chat " → tight "chat terminal …"
+	// (41 cells at six tabs — fits the default 44-col sidebar).
+	var barFinal string
+	for _, barKind := range []barPad{padNumbered, padBare, padTight} {
+		if bar := t.tabBar(barKind); lipgloss.Width(bar) <= t.w {
+			barFinal = bar
+			break
+		}
 	}
-	if lipgloss.Width(bar) > t.w {
+	if barFinal == "" {
 		// narrower still: hard ansi-aware clip (never overflow the strip)
-		bar = ansi.Truncate(bar, t.w, "")
+		barFinal = ansi.Truncate(t.tabBar(padTight), t.w, "")
 	}
+	bar := barFinal
 
 	content := t.tabs[t.active].View()
 	ch := t.h - 1
@@ -135,13 +160,33 @@ func (t *Tabs) View() string {
 	return lipgloss.JoinVertical(lipgloss.Left, bar, box)
 }
 
-// tabBar composes the strip row; numbered=true prefixes "1 "…"5 ".
-func (t *Tabs) tabBar(numbered bool) string {
+// barPad — label density tiers for the tab bar, widest first.
+type barPad int
+
+const (
+	padNumbered barPad = iota // " 1 chat " — full labels + jump numbers
+	padBare                   // " chat "   — padded bare titles
+	padTight                  // "chat"     — single-space separators (last resort)
+)
+
+// tabBar composes the strip row at the given label density.
+func (t *Tabs) tabBar(pad barPad) string {
 	var segs []string
 	for i, tb := range t.tabs {
-		label := " " + tb.Title() + " "
-		if numbered {
-			label = fmt.Sprintf(" %d %s ", i+1, tb.Title())
+		title := tb.Title()
+		if t.compact {
+			if short, ok := compactLabels[title]; ok {
+				title = short
+			}
+		}
+		var label string
+		switch pad {
+		case padNumbered:
+			label = fmt.Sprintf(" %d %s ", i+1, title)
+		case padBare:
+			label = " " + title + " "
+		default:
+			label = title
 		}
 		if i == t.active {
 			segs = append(segs, chrome.TabActive.Render(label))
@@ -149,7 +194,11 @@ func (t *Tabs) tabBar(numbered bool) string {
 			segs = append(segs, chrome.TabInactive.Render(label))
 		}
 	}
-	return strings.Join(segs, " ")
+	bar := strings.Join(segs, " ")
+	if pad == padTight {
+		bar = " " + bar // one leading cell keeps the box border readable
+	}
+	return bar
 }
 
 // --- shared panel helpers -------------------------------------------------

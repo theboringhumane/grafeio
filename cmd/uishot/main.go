@@ -78,6 +78,17 @@
 //	                                question-modal gate assert (nothing fires
 //	                                while a modal is open), and a two-run
 //	                                determinism check over the frame triplet.)
+//	                    [--layout]  (layout-modes proof: THREE frames over the
+//	                                same scripted window — NORMAL (sidebar 44),
+//	                                compact (sidebar 30, short tab labels, 2-row
+//	                                chat input, compressed topbar) and wide 56 —
+//	                                each with its computed width asserts)
+//	                    [--terminal] (terminal-tab proof: the stub TermPanel
+//	                                (terminal_panel_stub.go — uishot ONLY)
+//	                                wires through app.SpawnTerminal; selecting
+//	                                the "terminal" tab lazy-spawns it, typed
+//	                                keys route into the shell surface, and
+//	                                CloseTerminal kills it — frame + asserts)
 package main
 
 import (
@@ -1465,9 +1476,167 @@ func runSocialProof() error {
 	fmt.Println("asserts: OK — modal gate held, tea co-walk fired, gossip 3-beat chain fired, tick-seeded runs byte-identical")
 	return nil
 }
+// --- layout-modes proof (--layout) ------------------------------------------
+// THREE frames over the identical scripted window + identical config base,
+// differing ONLY by the layout knobs: NORMAL (defaults, sidebar 44),
+// compact (ui.compact → sidebar 30, short tab labels, 2-row chat input,
+// compressed topbar) and wide 56 (ui.sidebarWidth). Each frame prints its
+// computed geometry and passes width/label asserts.
+
+type layoutLeg struct {
+	name        string
+	mutate      func(cfg *config.Config)
+	wantSidebar int
+	compact     bool
+}
+
+func runLayoutProof() error {
+	legs := []layoutLeg{
+		{"NORMAL", func(*config.Config) {}, 44, false},
+		{"compact", func(c *config.Config) { c.UI.Compact = true }, 30, true},
+		{"wide 56", func(c *config.Config) { c.UI.SidebarWidth = 56 }, 56, false},
+	}
+	fail := func(format string, args ...any) error { return fmt.Errorf(format, args...) }
+	for _, leg := range legs {
+		cfg := config.Default()
+		leg.mutate(cfg)
+		b := &stubBackend{done: make(chan struct{})}
+		fm, err := runManualLoop(cfg, b, "chat", 2200*time.Millisecond, nil)
+		if err != nil {
+			return err
+		}
+		w, h, side, floor := fm.LayoutInfo()
+		frame := fm.Frame()
+		fmt.Printf("===== UI SHOT · layout %s =====\n", leg.name)
+		fmt.Println(frame)
+		fmt.Println("===== UI SHOT =====")
+		fmt.Printf("computed: cols=%d rows=%d sidebar=%d floorW=%d\n", w, h, side, floor)
+		if w != shotCols || h != shotRows {
+			return fail("[%s] geometry drift: cols=%d rows=%d (want %dx%d)", leg.name, w, h, shotCols, shotRows)
+		}
+		if side != leg.wantSidebar {
+			return fail("[%s] sidebar=%d, want %d", leg.name, side, leg.wantSidebar)
+		}
+		if floor != shotCols-leg.wantSidebar {
+			return fail("[%s] floorW=%d, want %d (sidebar %d)", leg.name, floor, shotCols-leg.wantSidebar, leg.wantSidebar)
+		}
+		if leg.compact {
+			// the 30-col sidebar drops to padded bare short labels
+			// (" c  t  a  b  m  x ") — numbers never fit six tabs at 30.
+			for _, short := range []string{" c ", " t ", " x "} {
+				if !strings.Contains(frame, short) {
+					return fail("[compact] tab bar missing short label %q", short)
+				}
+			}
+			if strings.Contains(frame, "chat") || strings.Contains(frame, "terminal") {
+				return fail("[compact] tab bar still shows a full tab name")
+			}
+			if strings.Contains(frame, "DEMO") {
+				return fail("[compact] topbar still carries the mode segment (should compress to agents + clock)")
+			}
+			fmt.Println("asserts: OK — sidebar 30, compact tab labels (c t a b m x), compressed topbar, 2-row chat input")
+		} else {
+			if !strings.Contains(frame, "terminal") || !strings.Contains(frame, "activity") {
+				return fail("[%s] tab bar missing full tab labels (want \"terminal\" + \"activity\" visible — six tabs must never clip)", leg.name)
+			}
+			if !strings.Contains(frame, "DEMO") {
+				return fail("[%s] normal topbar lost the mode segment", leg.name)
+			}
+			fmt.Printf("asserts: OK — sidebar %d, all six full tab labels visible, full topbar (mode segment present)\n", leg.wantSidebar)
+		}
+	}
+	fmt.Println("asserts: OK — 44 (default) / 30 (compact) / 56 (wide 56) sidebars; floor = 130 - sidebar in every leg")
+	return nil
+}
+
+// --- terminal-tab proof (--terminal) ----------------------------------------
+// The stub TermPanel (uisshot ONLY) wires through app.SpawnTerminal — the
+// production wiring point where cmd/grafeio will plug panels.NewTerminal.
+
+func runTerminalShot() (app.Model, *terminalPanelStub, int, error) {
+	var zero app.Model
+	calls := 0
+	var stub *terminalPanelStub
+	app.SpawnTerminal = func(cols, rows int) (app.TerminalTab, error) {
+		calls++
+		stub = newTerminalPanelStub(cols, rows)
+		return stub, nil
+	}
+	backend := &stubBackend{done: make(chan struct{})}
+	m := app.New(backend, config.Default())
+	if !m.SelectTab("terminal") {
+		return zero, nil, 0, fmt.Errorf("unknown tab %q", "terminal")
+	}
+	p := tea.NewProgram(m,
+		tea.WithWindowSize(shotCols, shotRows),
+		tea.WithoutRenderer(),
+		tea.WithInput(nil),
+		tea.WithOutput(io.Discard),
+	)
+	emit := func(ev state.Event) { p.Send(ev) }
+	if err := backend.Start(emit); err != nil {
+		return zero, nil, 0, err
+	}
+	go queueWorkload(p) // types 3 lines at ~3s — must land in the "shell"
+	go func() {
+		time.Sleep(shotDur)
+		p.Quit()
+	}()
+	final, err := p.Run()
+	if err != nil {
+		return zero, nil, 0, err
+	}
+	fm, ok := final.(app.Model)
+	if !ok {
+		return zero, nil, 0, fmt.Errorf("unexpected final model type %T", final)
+	}
+	return fm, stub, calls, nil
+}
+
+func runTerminalProof() error {
+	fm, stub, calls, err := runTerminalShot()
+	if err != nil {
+		return err
+	}
+	frame := fm.Frame()
+	app.SpawnTerminal = nil
+	fail := func(format string, args ...any) error { return fmt.Errorf(format, args...) }
+	fmt.Println("===== UI SHOT · terminal tab (uisshot stub TermPanel) =====")
+	fmt.Println(frame)
+	fmt.Println("===== UI SHOT =====")
+	if calls != 1 {
+		return fail("lazy-spawn violated: SpawnTerminal factory called %d times (want exactly 1, on first visit)", calls)
+	}
+	if stub == nil {
+		return fail("no stub panel was spawned")
+	}
+	if !strings.Contains(frame, "uisshot STUB shell") {
+		return fail("frame missing the stub terminal's content marker")
+	}
+	if !strings.Contains(frame, "terminal") {
+		return fail("frame missing the \"terminal\" tab label")
+	}
+	fmt.Printf("lazy-spawn: OK — SpawnTerminal called exactly once, on the first visit\n")
+	fmt.Printf("key routing: %d keystrokes routed into the shell surface (queue workload typing at ~3s)\n", stub.received)
+	if stub.received == 0 {
+		return fail("no keystrokes reached the terminal panel — routing broken")
+	}
+	if stub.closed {
+		return fail("stub already closed before CloseTerminal — quit hook ran early")
+	}
+	// quit hook: cmd/grafeio calls CloseTerminal after p.Run returns (the
+	// runtime intercepts tea.QuitMsg before Update, so p.Quit() never
+	// reached handleKey here — the explicit close is the leak guard)
+	fm.CloseTerminal()
+	if !stub.closed {
+		return fail("CloseTerminal did not close the shell panel")
+	}
+	fmt.Printf("quit hook: OK — CloseTerminal closed the spawned shell (alive→false)\n")
+	return nil
+}
 
 func main() {
-	tab := flag.String("tab", defaultTab, "active tab: chat|agents|board|mail|activity")
+	tab := flag.String("tab", defaultTab, "active tab: chat|terminal|agents|board|mail|activity")
 	theme := flag.String("theme", "", "force a ui theme: "+strings.Join(chrome.ThemeNames(), "|"))
 	slash := flag.Bool("slash", false, "simulate typing /theme dracula + /themes (exercises slash dispatch + theme persist)")
 	perm := flag.Bool("perm", false, "auto-answer the boss permission prompt with 'once' at 3s (open → answered)")
@@ -1483,7 +1652,25 @@ func main() {
 	batchRespawn := flag.Bool("batch-respawn", false, "failure-respawn proof: the first batch Send is rejected once — the app must ResetPrimary(true) and resend the SAME batch exactly once")
 	power := flag.String("power", "", "power-governor proof: 6s scripted window per mode (auto|saver|performance|all) — tick counts, floor frame-cache hit %, TickDelay table, /power + /model slash demo, custom boss-name frame")
 	social := flag.Bool("social", false, "social-clock proof: synchronous tick pump — three frames (tea ask / both walking / gossip chain), banter chain trace, question-modal gate assert, tick-seeded determinism check")
+	layout := flag.Bool("layout", false, "layout-modes proof: three frames over the same window — NORMAL (sidebar 44), compact (sidebar 30, short tab labels, 2-row chat input, compressed topbar), wide 56 — with computed width asserts per frame")
+	terminal := flag.Bool("terminal", false, "terminal-tab proof: the stub TermPanel wires through app.SpawnTerminal — lazy-spawn on first visit, keys routed into the shell surface, frame + asserts")
 	flag.Parse()
+
+	if *layout {
+		if err := runLayoutProof(); err != nil {
+			fmt.Fprintf(os.Stderr, "uishot: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *terminal {
+		if err := runTerminalProof(); err != nil {
+			fmt.Fprintf(os.Stderr, "uishot: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *social {
 		if err := runSocialProof(); err != nil {

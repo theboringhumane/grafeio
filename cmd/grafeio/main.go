@@ -20,6 +20,7 @@ import (
 	"github.com/theboringhumane/grafeio/internal/chrome"
 	"github.com/theboringhumane/grafeio/internal/config"
 	"github.com/theboringhumane/grafeio/internal/office"
+	"github.com/theboringhumane/grafeio/internal/panels"
 	"github.com/theboringhumane/grafeio/internal/sound"
 	"github.com/theboringhumane/grafeio/internal/state"
 )
@@ -75,6 +76,10 @@ func main() {
 		b = backend.NewLive(*server, mustGetwd(), cfg)
 	}
 
+	app.SpawnTerminal = func(cols, rows int) (app.TerminalTab, error) {
+		return panels.NewTerminal(cols, rows)
+	}
+
 	model := app.New(b, cfg)
 	if cfg.UI.Sounds != "" && cfg.UI.Sounds != "off" {
 		model.SetSoundBus(sndBus{sound.NewBus(cfg.UI.Sounds, "")})
@@ -97,9 +102,11 @@ func main() {
 	}
 
 	if _, err := p.Run(); err != nil {
+		model.CloseTerminal() // external p.Quit() bypasses Update — reap the PTY
 		fmt.Fprintf(os.Stderr, "[grafeio] fatal: %v\n", err)
 		os.Exit(1)
 	}
+	model.CloseTerminal()
 	_ = b.Stop()
 }
 

@@ -49,6 +49,8 @@ type UIConfig struct {
 	TickMs         int       `json:"tickMs"`         // 0 = power-mode default base (180/500)
 	AmbientChatter bool      `json:"ambientChatter"` // office banter bubbles
 	Sounds         string    `json:"sounds"`         // "on" | "bell" (terminal bell only) | "off"
+	SidebarWidth   int       `json:"sidebarWidth"`   // right panel cols, 0 = default 44 (26..60)
+	Compact        bool      `json:"compact"`        // compact layout mode
 }
 
 type BackendConfig struct {
@@ -83,6 +85,8 @@ func Default() *Config {
 			TickMs:         0,
 			AmbientChatter: true,
 			Sounds:         "on",
+			SidebarWidth:   0,
+			Compact:        false,
 		},
 		Backend: BackendConfig{
 			AgentmemoryURL:   "http://localhost:3111",
