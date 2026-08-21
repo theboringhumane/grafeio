@@ -39,7 +39,9 @@ func statusLineColor(line string) (c color.Color, dim bool) {
 // StatusBar renders the full-width status bar for one frame.
 // hint is the pre-rendered keymap segment (gray), e.g. from
 // app keys: "tab:panels · ↑↓:scroll · enter:send · q:quit".
-func StatusBar(st state.OfficeState, hint string, width int) string {
+// queueN > 0 appends an amber queue badge ("· qN") — messages enqueued
+// while the boss reply is pending.
+func StatusBar(st state.OfficeState, hint string, queueN, width int) string {
 	var pending, doing, done int
 	for _, t := range st.Tasks {
 		switch t.Status {
@@ -73,10 +75,14 @@ func StatusBar(st state.OfficeState, hint string, width int) string {
 		OnBar(ModeColor(st.Mode), string(st.Mode)) +
 		OnBar(White, " ")
 
-	right := counts
-	if hint != "" {
-		right = OnBar(Dim, hint) + OnBar(Dim, " · ") + counts
+	segs := []string{counts}
+	if queueN > 0 {
+		segs = append([]string{OnBarBold(Warn, fmt.Sprintf("q%d", queueN))}, segs...)
 	}
+	if hint != "" {
+		segs = append([]string{OnBar(Dim, hint)}, segs...)
+	}
+	right := strings.Join(segs, OnBar(Dim, " · "))
 
 	// shrink from the left edge: trim the status line first, then the hint
 	leftW := lipgloss.Width(left)

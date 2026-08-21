@@ -61,9 +61,53 @@ type ocPart struct {
 	} `json:"time"`
 }
 
-type ocPermission struct {
-	SessionID string `json:"sessionID"`
-	Title     string `json:"title"`
+// ocPermissionReq covers permission.asked / permission.updated (legacy) and
+// permission.replied properties. The modern server sends permission.asked
+// with id/permission/patterns/always; the legacy updated variant sent title.
+type ocPermissionReq struct {
+	ID         string         `json:"id"`
+	RequestID  string         `json:"requestID"`
+	SessionID  string         `json:"sessionID"`
+	Permission string         `json:"permission"`
+	Title      string         `json:"title"`
+	Patterns   []string       `json:"patterns"`
+	Always     []string       `json:"always"`
+	Metadata   map[string]any `json:"metadata"`
+	Reply      string         `json:"reply"`
+}
+
+// ocQuestionReq covers question.asked / question.replied / question.rejected
+// properties (see /doc QuestionRequest schema).
+type ocQuestionReq struct {
+	ID        string           `json:"id"`
+	RequestID string           `json:"requestID"`
+	SessionID string           `json:"sessionID"`
+	Questions []ocQuestionInfo `json:"questions"`
+	Answers   [][]string       `json:"answers"`
+}
+
+type ocQuestionInfo struct {
+	Question string `json:"question"`
+	Header   string `json:"header"`
+	Options  []struct {
+		Label       string `json:"label"`
+		Description string `json:"description"`
+	} `json:"options"`
+}
+
+// ocSnapshotFileDiff is the SnapshotFileDiff schema (events + GET diff).
+type ocSnapshotFileDiff struct {
+	File      string `json:"file"`
+	Path      string `json:"path"`
+	Patch     string `json:"patch"`
+	Additions int    `json:"additions"`
+	Deletions int    `json:"deletions"`
+	Status    string `json:"status"`
+}
+
+type ocSessionDiffProps struct {
+	SessionID string               `json:"sessionID"`
+	Diff      []ocSnapshotFileDiff `json:"diff"`
 }
 
 type ocSessionStatusProps struct {
@@ -99,9 +143,21 @@ type normCtx struct {
 	tasks         map[string]state.BoardTask
 	nameCounts    map[state.EmployeeRole]int // role -> last issued number
 	seatSeq       int
-	lastWorkingAt map[string]int64 // child id -> last "working" emit time (ms)
-	returned      map[string]bool  // child sessions that already returned
-	fired         map[string]bool  // dedupe delete-event vs delete-call
+	lastWorkingAt map[string]int64    // child id -> last "working" emit time (ms)
+	returned      map[string]bool     // child sessions that already returned
+	fired         map[string]bool     // dedupe delete-event vs delete-call
+	pendingPerms  map[string]permHold // permission/question request id -> hold
+	diffSeen      map[string]bool     // sessionID|path -> already surfaced
+}
+
+// permHold remembers a pending permission/question request so its reply
+// event can be turned into a "resolved" follow-up on the same id.
+type permHold struct {
+	SessionID    string
+	EmployeeID   string
+	EmployeeName string
+	Title        string
+	Summary      string
 }
 
 func newNormCtx() *normCtx {
@@ -112,6 +168,8 @@ func newNormCtx() *normCtx {
 		lastWorkingAt: make(map[string]int64),
 		returned:      make(map[string]bool),
 		fired:         make(map[string]bool),
+		pendingPerms:  make(map[string]permHold),
+		diffSeen:      make(map[string]bool),
 	}
 }
 
@@ -251,6 +309,11 @@ func mapReasoningPart(part ocPart, ctx *normCtx, primaryID string) []state.Event
 // "running", completed -> "done", error -> "error". The part's callID is
 // the dedupe key — running and done updates share it.
 func mapToolPart(part ocPart, ctx *normCtx, primaryID string) (state.Event, bool) {
+	// The "question" tool call surfaces via the dedicated question.asked
+	// SSE event (EvQuestion) — a bare tool glyph would only duplicate it.
+	if part.Tool == "question" {
+		return state.Event{}, false
+	}
 	toolState := "running"
 	switch part.State.Status {
 	case "completed":
@@ -312,6 +375,229 @@ func toolSummary(part ocPart) string {
 	return shortTitle(s, 60)
 }
 
+// actorFor resolves the floor actor for a session id: the primary session
+// is "boss", a known child is its employee row; anything else is skipped.
+func actorFor(sessionID string, ctx *normCtx, primaryID string) (empID, empName string, ok bool) {
+	if sessionID == primaryID {
+		return "boss", "boss", true
+	}
+	if emp, found := ctx.employees[sessionID]; found {
+		return emp.ID, emp.Name, true
+	}
+	return "", "", false
+}
+
+// permissionSummary picks a one-liner for a permission request: the first
+// pattern it gates, else the most descriptive metadata string, else "".
+func permissionSummary(p ocPermissionReq) string {
+	for _, pat := range p.Patterns {
+		if s := shortTitle(pat, 60); s != "untitled brief" {
+			return s
+		}
+	}
+	for _, key := range []string{"command", "filepath", "filePath", "path", "pattern"} {
+		if v, ok := p.Metadata[key].(string); ok && strings.TrimSpace(v) != "" {
+			return shortTitle(strings.TrimSpace(v), 60)
+		}
+	}
+	return "permission needed"
+}
+
+// mapPermissionAsked: permission.asked (modern) / permission.updated (legacy),
+// for ANY session. The boss gets ONLY the EvPermission (the UI renders a
+// modal; the manager glyph stays at its desk); a child additionally emits
+// the EvBlocked it always did so the floor stays correct.
+func mapPermissionAsked(p ocPermissionReq, ctx *normCtx, primaryID string, now int64) []state.Event {
+	empID, empName, ok := actorFor(p.SessionID, ctx, primaryID)
+	if !ok {
+		return nil
+	}
+	id := p.ID
+	if id == "" {
+		id = p.RequestID
+	}
+	title := p.Permission
+	if title == "" {
+		title = p.Title
+	}
+	if title == "" {
+		title = "permission"
+	}
+	summary := permissionSummary(p)
+	ctx.pendingPerms[id] = permHold{
+		SessionID: p.SessionID, EmployeeID: empID, EmployeeName: empName,
+		Title: title, Summary: summary,
+	}
+	evs := []state.Event{{
+		Kind:         state.EvPermission,
+		PermissionID: id,
+		SessionID:    p.SessionID,
+		EmployeeID:   empID,
+		EmployeeName: empName,
+		ToolName:     shortTitle(title, 60),
+		ToolSummary:  summary,
+		ToolState:    "pending",
+	}}
+	if empID != "boss" {
+		evs = append(evs, state.Event{
+			Kind: state.EvBlocked, EmployeeID: empID,
+			Text: shortTitle("permission: "+title+" "+summary, 60),
+		})
+	}
+	return evs
+}
+
+// mapPermissionReplied: permission.replied clears the pending hold and emits
+// a "resolved" EvPermission on the same id so the UI can drop the modal.
+// Children also get their forced working pulse (the old behavior).
+func mapPermissionReplied(p ocPermissionReq, ctx *normCtx, primaryID string, now int64) []state.Event {
+	id := p.RequestID
+	if id == "" {
+		id = p.ID
+	}
+	empID, empName, _ := actorFor(p.SessionID, ctx, primaryID)
+	if hold, ok := ctx.pendingPerms[id]; ok {
+		if empID == "" {
+			empID, empName = hold.EmployeeID, hold.EmployeeName
+		}
+		delete(ctx.pendingPerms, id)
+		evs := []state.Event{{
+			Kind: state.EvPermission, PermissionID: id, SessionID: hold.SessionID,
+			EmployeeID: empID, EmployeeName: empName,
+			ToolName: hold.Title, ToolSummary: p.Reply, ToolState: "resolved",
+		}}
+		emp, isEmp := ctx.employees[p.SessionID]
+		if isEmp && !ctx.returned[p.SessionID] {
+			evs = append(evs, ctx.throttledWorking(emp.ID, ctx.tasks[p.SessionID].ID, now, true)...)
+		}
+		return evs
+	}
+	// Unknown id (backend restarted etc.): keep the old child pulse alive.
+	emp, ok := ctx.employees[p.SessionID]
+	if !ok || ctx.returned[p.SessionID] {
+		return nil
+	}
+	return ctx.throttledWorking(emp.ID, ctx.tasks[p.SessionID].ID, now, true)
+}
+
+// mapQuestionAsked: question.asked, for ANY session. The full question text
+// rides in Text; options collapse into ToolSummary ("a | b | c").
+func mapQuestionAsked(p ocQuestionReq, ctx *normCtx, primaryID string) []state.Event {
+	empID, empName, ok := actorFor(p.SessionID, ctx, primaryID)
+	if !ok {
+		return nil
+	}
+	id := p.ID
+	if id == "" {
+		id = p.RequestID
+	}
+	var texts, options []string
+	for _, q := range p.Questions {
+		if s := strings.TrimSpace(q.Question); s != "" {
+			texts = append(texts, s)
+		}
+		for _, opt := range q.Options {
+			if s := strings.TrimSpace(opt.Label); s != "" {
+				options = append(options, s)
+			}
+		}
+	}
+	text := strings.Join(texts, " ")
+	if text == "" {
+		text = "question from the floor"
+	}
+	summary := strings.Join(options, " | ")
+	if summary == "" {
+		summary = "free-form answer"
+	}
+	ctx.pendingPerms[id] = permHold{
+		SessionID: p.SessionID, EmployeeID: empID, EmployeeName: empName,
+		Title: "question", Summary: summary,
+	}
+	return []state.Event{{
+		Kind:         state.EvQuestion,
+		QuestionID:   id,
+		SessionID:    p.SessionID,
+		EmployeeID:   empID,
+		EmployeeName: empName,
+		Text:         shortTitle(text, 240),
+		ToolSummary:  shortTitle(summary, 120),
+		ToolState:    "pending",
+	}}
+}
+
+// mapQuestionResolved: question.replied / question.rejected clear the hold
+// and emit a "resolved" EvQuestion on the same id.
+func mapQuestionResolved(p ocQuestionReq, ctx *normCtx, primaryID string) []state.Event {
+	id := p.RequestID
+	if id == "" {
+		id = p.ID
+	}
+	hold, ok := ctx.pendingPerms[id]
+	if !ok {
+		return nil
+	}
+	delete(ctx.pendingPerms, id)
+	return []state.Event{{
+		Kind: state.EvQuestion, QuestionID: id, SessionID: hold.SessionID,
+		EmployeeID: hold.EmployeeID, EmployeeName: hold.EmployeeName,
+		ToolSummary: "answered", ToolState: "resolved",
+	}}
+}
+
+// diffBody compacts a unified patch for the panel: strips the hunk-noise
+// headers, keeps +/- context, capped at 2000 runes.
+func diffBody(patch string) string {
+	var keep []string
+	for _, line := range strings.Split(patch, "\n") {
+		if strings.HasPrefix(line, "diff --git ") || strings.HasPrefix(line, "index ") {
+			continue
+		}
+		keep = append(keep, line)
+	}
+	return sliceMax(strings.Join(keep, "\n"), 2000)
+}
+
+// mapSessionDiff: session.diff carries the full SnapshotFileDiff list inline.
+// One EvFileDiff per file (deduped against paths already surfaced, e.g. by a
+// completion-time GET in the backend).
+func mapSessionDiff(p ocSessionDiffProps, ctx *normCtx, primaryID string) []state.Event {
+	empID, empName, _ := actorFor(p.SessionID, ctx, primaryID)
+	var evs []state.Event
+	for _, d := range p.Diff {
+		if ev, ok := diffEvent(p.SessionID, empID, empName, d, ctx); ok {
+			evs = append(evs, ev)
+		}
+	}
+	return evs
+}
+
+// diffEvent builds the per-file EvFileDiff, skipping empties and repeats.
+func diffEvent(sessionID, empID, empName string, d ocSnapshotFileDiff, ctx *normCtx) (state.Event, bool) {
+	path := d.File
+	if path == "" {
+		path = d.Path
+	}
+	if path == "" || (d.Additions == 0 && d.Deletions == 0 && strings.TrimSpace(d.Patch) == "") {
+		return state.Event{}, false
+	}
+	key := sessionID + "|" + path
+	if ctx.diffSeen[key] {
+		return state.Event{}, false
+	}
+	ctx.diffSeen[key] = true
+	return state.Event{
+		Kind:         state.EvFileDiff,
+		SessionID:    sessionID,
+		EmployeeID:   empID,
+		EmployeeName: empName,
+		DiffPath:     path,
+		DiffBody:     diffBody(d.Patch),
+		DiffAdd:      d.Additions,
+		DiffDel:      d.Deletions,
+	}, true
+}
+
 // mapOCEvent is the ONE pure mapping entry point. primaryID identifies the
 // boss session; everything with parentID == primaryID is an employee.
 //
@@ -328,8 +614,11 @@ func toolSummary(part ocPart) string {
 //		chat-user echo; kids' briefs are not chat)
 //	message.updated (child, assistant)     -> working
 //	session.status idle (child)            -> [] here (backend fetches -> returned+mail)
-//	permission.updated (child)             -> blocked {note}
-//	permission.replied (child)             -> working (forced)
+//	permission.asked/.updated (any)        -> permission (+ blocked for children)
+//	permission.replied (any)               -> permission resolved (+ forced working)
+//	question.asked (any)                   -> question (text + compact options)
+//	question.replied/rejected (any)        -> question resolved
+//	session.diff (any)                     -> diff events, one per file
 //	session.deleted (child)                -> fire
 //	message.updated (primary, completed)   -> [] here (backend fetches -> chat-boss)
 //	session.error (primary)                -> chat-boss error line
@@ -427,33 +716,40 @@ func mapOCEvent(raw ocSSEEvent, ctx *normCtx, primaryID string, now int64) []sta
 		}
 		return ctx.throttledWorking(emp.ID, ctx.tasks[info.SessionID].ID, now, false)
 
-	case "permission.updated":
-		var p ocPermission
+	case "permission.asked", "permission.updated":
+		var p ocPermissionReq
 		if json.Unmarshal(raw.Properties, &p) != nil {
 			return nil
 		}
-		emp, ok := ctx.employees[p.SessionID]
-		if !ok {
-			return nil
-		}
-		note := p.Title
-		if note == "" {
-			note = "permission needed"
-		}
-		return []state.Event{{Kind: state.EvBlocked, EmployeeID: emp.ID, Text: shortTitle(note, 60)}}
+		return mapPermissionAsked(p, ctx, primaryID, now)
 
 	case "permission.replied":
-		var p struct {
-			SessionID string `json:"sessionID"`
-		}
+		var p ocPermissionReq
 		if json.Unmarshal(raw.Properties, &p) != nil {
 			return nil
 		}
-		emp, ok := ctx.employees[p.SessionID]
-		if !ok || ctx.returned[p.SessionID] {
+		return mapPermissionReplied(p, ctx, primaryID, now)
+
+	case "question.asked":
+		var p ocQuestionReq
+		if json.Unmarshal(raw.Properties, &p) != nil {
 			return nil
 		}
-		return ctx.throttledWorking(emp.ID, ctx.tasks[p.SessionID].ID, now, true)
+		return mapQuestionAsked(p, ctx, primaryID)
+
+	case "question.replied", "question.rejected":
+		var p ocQuestionReq
+		if json.Unmarshal(raw.Properties, &p) != nil {
+			return nil
+		}
+		return mapQuestionResolved(p, ctx, primaryID)
+
+	case "session.diff":
+		var p ocSessionDiffProps
+		if json.Unmarshal(raw.Properties, &p) != nil {
+			return nil
+		}
+		return mapSessionDiff(p, ctx, primaryID)
 
 	case "session.deleted":
 		var p struct {

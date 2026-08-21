@@ -119,22 +119,25 @@ type OfficeState struct {
 type EventKind string
 
 const (
-	EvHire      EventKind = "hire"
-	EvFire      EventKind = "fire"
-	EvDispatch  EventKind = "dispatch"
-	EvWorking   EventKind = "working"
-	EvReturned  EventKind = "returned"
-	EvIdleDrift EventKind = "idle-drift"
-	EvBlocked   EventKind = "blocked"
-	EvTask      EventKind = "task"
-	EvMail      EventKind = "mail"
-	EvChatUser  EventKind = "chat-user"
-	EvChatBoss  EventKind = "chat-boss"
-	EvThought   EventKind = "thought"
-	EvTool      EventKind = "tool"
-	EvBubble    EventKind = "bubble"
-	EvStatus    EventKind = "status"
-	EvTick      EventKind = "tick"
+	EvHire       EventKind = "hire"
+	EvFire       EventKind = "fire"
+	EvDispatch   EventKind = "dispatch"
+	EvWorking    EventKind = "working"
+	EvReturned   EventKind = "returned"
+	EvIdleDrift  EventKind = "idle-drift"
+	EvBlocked    EventKind = "blocked"
+	EvTask       EventKind = "task"
+	EvMail       EventKind = "mail"
+	EvChatUser   EventKind = "chat-user"
+	EvChatBoss   EventKind = "chat-boss"
+	EvThought    EventKind = "thought"
+	EvTool       EventKind = "tool"
+	EvBubble     EventKind = "bubble"
+	EvStatus     EventKind = "status"
+	EvTick       EventKind = "tick"
+	EvPermission EventKind = "permission"
+	EvQuestion   EventKind = "question"
+	EvFileDiff   EventKind = "diff"
 )
 
 // Event — the wire between backend and the tea.Model. Only fields relevant
@@ -159,6 +162,17 @@ type Event struct {
 	ToolState   string `json:"toolState,omitempty"`   // "running" | "done" | "error"
 	CallID      string `json:"callId,omitempty"`      // part/call id for dedupe
 	Done        bool   `json:"done,omitempty"`        // thought completion
+	// Permission/question/diff fields (EvPermission/EvQuestion/EvFileDiff).
+	// SessionID is the opencode session the event belongs to ("boss"-side
+	// events carry the primary id); PermissionID/QuestionID are the wire
+	// request ids (per…/que…) the UI hands back to AnswerPermission.
+	PermissionID string `json:"permissionId,omitempty"`
+	SessionID    string `json:"sessionId,omitempty"`
+	QuestionID   string `json:"questionId,omitempty"`
+	DiffPath     string `json:"diffPath,omitempty"` // file path relative to the working dir
+	DiffBody     string `json:"diffBody,omitempty"` // compact unified diff, capped by the backend
+	DiffAdd      int    `json:"diffAdd,omitempty"`
+	DiffDel      int    `json:"diffDel,omitempty"`
 }
 
 // Backend — one per run. Demo scripted, live via opencode serve + agentmemory.
@@ -169,5 +183,8 @@ type Backend interface {
 	Start(emit func(Event)) error
 	// Send pushes user chat to the boss.
 	Send(text string) error
+	// AnswerPermission replies to a pending permission prompt. response is
+	// "once" | "always" | "reject" (opencode serve permission.reply enum).
+	AnswerPermission(permissionID, response string) error
 	Stop() error
 }

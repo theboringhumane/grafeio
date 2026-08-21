@@ -15,12 +15,17 @@
 //	spinner   — shown only while a boss reply is pending (" boss is typing…")
 //	divider
 //	textarea  — multiline input; Enter sends, Shift+Enter (or Ctrl+J) is a
-//	            newline, placeholder "talk to the boss…". Locked while the
-//	            boss is typing (placeholder swaps to "boss is typing…").
+//	            newline, placeholder "talk to the boss…". NEVER locked: while
+//	            the boss is typing, Enter ENQUEUES (the app owns the queue)
+//	            and the placeholder reads "boss is typing… · N queued".
+//	            While a permission prompt is open, the prompt MODAL replaces
+//	            this region: y/a/n answers, esc defers; every other key still
+//	            types into the (hidden) textarea.
 //
 // Scroll: mouse wheel + PgUp/PgDn always scroll the conversation; ↑/↓ move
 // inside a multi-line draft and scroll the conversation otherwise. ctrl+t
-// expands/collapses ALL thinking blocks (handled by the app keymap).
+// expands/collapses ALL thinking blocks, ctrl+d expands/collapses ALL diff
+// entries (both handled by the app keymap).
 package panels
 
 import (
@@ -49,15 +54,34 @@ const (
 	textareaH = 3 // rows of multiline input at the bottom of the tab
 )
 
-// thinkKind / toolKind / officeFrom / errMeta — chat entry markers the app
-// reducer tags onto state.ChatMsg so this panel can style them without
-// touching the user/boss turn paths.
+// thinkKind / toolKind / questionKind / diffKind / officeFrom / errMeta —
+// chat entry markers the app reducer tags onto state.ChatMsg so this panel
+// can style them without touching the user/boss turn paths.
 const (
-	thinkKind  = "think"
-	toolKind   = "tool"
-	officeFrom = "office"
-	errMeta    = "error"
+	thinkKind    = "think"
+	toolKind     = "tool"
+	questionKind = "question"
+	diffKind     = "diff"
+	officeFrom   = "office"
+	errMeta      = "error"
 )
+
+// diffMetaSep splits the diff ChatMsg.Meta carrier: path ␟ +adds ␟ -dels
+// (unit separator — paths may contain spaces). Written by the app reducer,
+// read only here.
+const diffMetaSep = "\x1f"
+
+// diffClip is the max body lines shown in an expanded diff before
+// "+N more" truncation.
+const diffClip = 30
+
+// PermissionView is the open permission prompt the chat panel renders in
+// place of the textarea (set/cleared by the app via SetPermission).
+type PermissionView struct {
+	ID       string
+	ToolName string
+	Summary  string
+}
 
 // Chat is the chat tab panel.
 type Chat struct {
@@ -66,6 +90,13 @@ type Chat struct {
 	sp     spinner.Model
 	onSend func(text string) tea.Cmd
 
+	// Queue + permission seams (set by the app at build time).
+	onEnqueue    func(text string) tea.Cmd // Enter while boss pending
+	onPermAnswer func(response string) tea.Cmd
+	onPermLater  func() tea.Cmd // esc defers the prompt
+	perm         *PermissionView
+	queueLen     int
+
 	chat    []state.ChatMsg // rendered snapshot
 	pending bool
 	follow  bool // stick to the bottom unless the user scrolled up
@@ -73,6 +104,7 @@ type Chat struct {
 	showThinking  bool // /thinking on|off — collected blocks visible (default true)
 	showTools     bool // /tools on|off    — tool one-liners visible (default true)
 	thinkExpanded bool // ctrl+t — thinking expanded; DEFAULT false (collapsed)
+	diffExpanded  bool // ctrl+d or /diffs on|off — diffs expanded; DEFAULT false
 
 	w, h      int
 	md        *glamour.TermRenderer
@@ -140,6 +172,61 @@ func (c *Chat) RefreshTheme() {
 func (c *Chat) ToggleThink() {
 	c.thinkExpanded = !c.thinkExpanded
 	c.forceRender()
+}
+
+// ToggleDiffs expands/collapses ALL diff entries in the conversation
+// (ctrl+d, routed by the app keymap).
+func (c *Chat) ToggleDiffs() {
+	c.diffExpanded = !c.diffExpanded
+	c.forceRender()
+}
+
+// SetDiffsExpanded shows diffs expanded (on) or collapsed (off) —
+// /diffs on|off.
+func (c *Chat) SetDiffsExpanded(on bool) {
+	if c.diffExpanded == on {
+		return
+	}
+	c.diffExpanded = on
+	c.forceRender()
+}
+
+// DiffsExpanded reports whether diff entries render expanded.
+func (c *Chat) DiffsExpanded() bool { return c.diffExpanded }
+
+// SetEnqueue wires the app's enqueue callback (Enter while a boss reply is
+// pending enqueues instead of sending).
+func (c *Chat) SetEnqueue(fn func(text string) tea.Cmd) { c.onEnqueue = fn }
+
+// SetPermissionHandlers wires the app's permission answer/defer callbacks
+// for the y/a/n/esc keys captured while a prompt is open.
+func (c *Chat) SetPermissionHandlers(answer func(response string) tea.Cmd, later func() tea.Cmd) {
+	c.onPermAnswer, c.onPermLater = answer, later
+}
+
+// SetPermission opens (non-nil) or closes (nil) the permission prompt that
+// replaces the textarea region.
+func (c *Chat) SetPermission(p *PermissionView) { c.perm = p }
+
+// SetQueueLen updates the queue count shown in the busy placeholder
+// ("boss is typing… · N queued"). The queue itself lives in the app model.
+func (c *Chat) SetQueueLen(n int) {
+	c.queueLen = n
+	c.refreshPlaceholder()
+}
+
+// refreshPlaceholder recomputes the textarea placeholder from pending +
+// queue state.
+func (c *Chat) refreshPlaceholder() {
+	if !c.pending {
+		c.ta.Placeholder = placeholderIdle
+		return
+	}
+	if c.queueLen > 0 {
+		c.ta.Placeholder = placeholderBusy + " · " + itoa(c.queueLen) + " queued"
+		return
+	}
+	c.ta.Placeholder = placeholderBusy
 }
 
 // SetShowThinking shows/hides collected thinking blocks (/thinking on|off).
@@ -228,13 +315,9 @@ func (c *Chat) SetState(st state.OfficeState) {
 		}
 	}
 	if c.pending != wasPending {
-		if c.pending {
-			c.ta.Blur()
-			c.ta.Placeholder = placeholderBusy
-		} else {
-			c.ta.Focus()
-			c.ta.Placeholder = placeholderIdle
-		}
+		// the textarea NEVER locks — typing while the boss works is the
+		// whole point of the queue; only the placeholder + spinner row react
+		c.refreshPlaceholder()
 		c.SetSize(c.w, c.h) // spinner row appears/disappears
 	}
 
@@ -249,11 +332,35 @@ func (c *Chat) SetState(st state.OfficeState) {
 func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
-		switch msg.String() {
-		case "enter":
-			if c.pending {
+		// While a permission prompt is open, y/a/n/esc are RESERVED (they
+		// never reach the textarea); every other key keeps typing normally
+		// — the prompt is non-modal to text.
+		if c.perm != nil {
+			switch msg.String() {
+			case "y":
+				if c.onPermAnswer != nil {
+					return c.onPermAnswer("once")
+				}
+				return nil
+			case "a":
+				if c.onPermAnswer != nil {
+					return c.onPermAnswer("always")
+				}
+				return nil
+			case "n":
+				if c.onPermAnswer != nil {
+					return c.onPermAnswer("reject")
+				}
+				return nil
+			case "esc":
+				if c.onPermLater != nil {
+					return c.onPermLater()
+				}
 				return nil
 			}
+		}
+		switch msg.String() {
+		case "enter":
 			text := strings.TrimSpace(c.ta.Value())
 			if text == "" {
 				return nil
@@ -261,6 +368,17 @@ func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 			c.ta.Reset()
 			c.follow = true
 			c.vp.GotoBottom()
+			if strings.HasPrefix(text, "/") {
+				// slash commands are local and always immediate — /queue
+				// and /perm must work while the boss is typing
+				if c.onSend != nil {
+					return c.onSend(text)
+				}
+				return nil
+			}
+			if c.pending && c.onEnqueue != nil {
+				return c.onEnqueue(text)
+			}
 			if c.onSend != nil {
 				return c.onSend(text)
 			}
@@ -314,8 +432,35 @@ func (c *Chat) View() string {
 	b.WriteString("\n")
 	b.WriteString(chrome.DimText.Render(fitPlain(strings.Repeat("─", c.w), c.w)))
 	b.WriteString("\n")
-	b.WriteString(c.ta.View())
+	if c.perm != nil {
+		// the permission modal REPLACES the textarea region, full width
+		b.WriteString(c.renderPermission())
+	} else {
+		b.WriteString(c.ta.View())
+	}
 	return b.String()
+}
+
+// renderPermission draws the permission prompt modal in the textarea
+// region (textareaH rows, full width): amber bold header with the tool
+// request, then the key hint wrapped over the remaining rows.
+func (c *Chat) renderPermission() string {
+	head := "PERMISSION: boss wants " + c.perm.ToolName
+	if c.perm.Summary != "" {
+		head += " · " + c.perm.Summary
+	}
+	lines := [textareaH]string{}
+	lines[0] = chrome.WarnBold.Render(fitPlain(head, c.w))
+	hint := strings.Split(strings.TrimRight(wrapPlain(
+		"[y] allow once  [a] always  [n] reject  [esc] later", c.w), "\n"), "\n")
+	for i := 1; i < textareaH; i++ {
+		if i-1 < len(hint) {
+			lines[i] = chrome.DimText.Render(fitPlain(hint[i-1], c.w))
+		} else {
+			lines[i] = fitPlain("", c.w)
+		}
+	}
+	return strings.Join(lines[:], "\n")
 }
 
 // renderConversation rebuilds the full glamour-rendered transcript.
@@ -346,6 +491,10 @@ func (c *Chat) renderConversation() string {
 			c.renderThink(&b, m)
 		case m.Kind == toolKind:
 			b.WriteString(renderTool(m))
+		case m.Kind == questionKind:
+			c.renderQuestion(&b, m)
+		case m.Kind == diffKind:
+			c.renderDiff(&b, m)
 		case m.From == officeFrom:
 			c.renderNotice(&b, m)
 		case m.From == "user":
@@ -411,6 +560,77 @@ func renderTool(m state.ChatMsg) string {
 	default: // running (or anything unexpected)
 		return chrome.ToolStyle.Render(line + " … running")
 	}
+}
+
+// renderQuestion renders one Kind="question" entry (boss question tool):
+// yellow "boss asks › <text>", dim options inline when present, and the
+// "(answer by typing below)" hint.
+func (c *Chat) renderQuestion(b *strings.Builder, m state.ChatMsg) {
+	qPrefix := "boss asks › "
+	indent := strings.Repeat(" ", len(qPrefix))
+	wrapW := c.w - len(qPrefix) - 1 // prefix + panel padding, before vp soft-wrap
+	lines := strings.Split(strings.TrimRight(wrapPlain(m.Text, wrapW), "\n"), "\n")
+	for i := range lines {
+		lines[i] = chrome.QuestionText.Render(lines[i])
+	}
+	writePrefixed(b, chrome.QuestionText.Bold(true).Render(qPrefix), indent, lines)
+	if m.Meta != "" {
+		for _, ln := range strings.Split(strings.TrimRight(wrapPlain("("+m.Meta+")", wrapW), "\n"), "\n") {
+			b.WriteString(indent + chrome.DimText.Render(ln) + "\n")
+		}
+	}
+	b.WriteString(indent + chrome.DimText.Italic(true).Render("(answer by typing below)"))
+}
+
+// renderDiff renders one Kind="diff" entry. Collapsed (default): a single
+// header line "diff · path +A -D". Expanded (ctrl+d / /diffs on): the body
+// under a tinted left border — deletions red (-), additions green (+),
+// context gray — clipped to diffClip lines with a "+N more" trailer.
+func (c *Chat) renderDiff(b *strings.Builder, m state.ChatMsg) {
+	path, adds, dels := parseDiffMeta(m.Meta)
+	header := chrome.DimText.Render("diff · "+path)
+	if adds != "" {
+		header += " " + chrome.OKText.Render(adds)
+	}
+	if dels != "" {
+		header += " " + chrome.ErrText.Render(dels)
+	}
+	b.WriteString(header)
+	if !c.diffExpanded {
+		return
+	}
+	body := strings.Split(strings.TrimRight(m.Text, "\n"), "\n")
+	shown := body
+	more := 0
+	if len(body) > diffClip {
+		shown = body[:diffClip]
+		more = len(body) - diffClip
+	}
+	rule := chrome.Fg(chrome.Dim, "▎")
+	for _, ln := range shown {
+		ln = strings.ReplaceAll(ln, "\t", "    ") // vp soft-wrap expands tabs
+		style := chrome.DimText // context
+		switch {
+		case strings.HasPrefix(ln, "+"):
+			style = chrome.OKText
+		case strings.HasPrefix(ln, "-"):
+			style = chrome.ErrText
+		}
+		b.WriteString("\n" + rule + style.Render(clipPlain(ln, c.w-3)))
+	}
+	if more > 0 {
+		b.WriteString("\n" + rule + chrome.DimText.Italic(true).Render("+"+itoa(more)+" more"))
+	}
+}
+
+// parseDiffMeta decodes the diff Meta carrier (path ␟ +adds ␟ -dels)
+// written by the app reducer.
+func parseDiffMeta(meta string) (path, adds, dels string) {
+	parts := strings.Split(meta, diffMetaSep)
+	if len(parts) == 3 {
+		return parts[0], parts[1], parts[2]
+	}
+	return meta, "", ""
 }
 
 // renderNotice renders a local From="office" notice (slash-command output):

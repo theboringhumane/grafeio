@@ -10,6 +10,8 @@
 package backend
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -29,8 +31,9 @@ type demoBackend struct {
 	mu          sync.Mutex // guards the demo board state below
 	roster      []state.Employee
 	taskByID    map[string]state.BoardTask
-	active      []string        // employees on a brief (receives pulses)
-	blockedIDs  map[string]bool // waving at the mailbox, not typing
+	active      []string            // employees on a brief (receives pulses)
+	blockedIDs  map[string]bool     // waving at the mailbox, not typing
+	pendingPerm map[string]permHold // permission request id -> hold
 	pulseIdx    int
 	ambientBeat int
 	adHocSeq    int
@@ -39,9 +42,10 @@ type demoBackend struct {
 
 func newDemoBackend() *demoBackend {
 	return &demoBackend{
-		fl:         newFlow(),
-		taskByID:   make(map[string]state.BoardTask),
-		blockedIDs: make(map[string]bool),
+		fl:          newFlow(),
+		taskByID:    make(map[string]state.BoardTask),
+		blockedIDs:  make(map[string]bool),
+		pendingPerm: make(map[string]permHold),
 	}
 }
 
@@ -54,11 +58,12 @@ func demoEmployee(id string, role state.EmployeeRole, seat string) state.Employe
 // ---------------------------------------------------------------- start
 
 // Start replays the office day: floor opens at t0, first briefs at 400ms,
-// a third hire at 1s, a boss thought at 1.6s (done 2.2s), a boss grep at
-// 2.4s, returns at 2.5s/4s/6.5s, a permission block at 5.5s, tekton-1's
-// read at 5.8s (done 6.2s), ambient chatter bubbles at 3s/5s, coffee drift
-// at 7s, then the ambient loop forever. Working pulses fire round-robin
-// every 700ms.
+// a third hire at 1s, a boss thought at 1.6s (done 2.2s), a boss question
+// at 2s, a boss grep at 2.4s, tekton-2's file diff at 4.5s, returns at
+// 2.5s/4s/6.5s, tekton-1's read at 5.2s (done 5.6s) ahead of the permission
+// gate at 6s (Write /tmp/x — stays until AnswerPermission or the scripted
+// return), ambient chatter bubbles at 3s/5s, coffee drift at 7s, then the
+// ambient loop forever. Working pulses fire round-robin every 700ms.
 func (b *demoBackend) Start(emit func(state.Event)) error {
 	b.fl.setEmit(emit)
 
@@ -91,18 +96,47 @@ func (b *demoBackend) Start(emit func(state.Event)) error {
 			Text: "planning the dispatch...", CallID: "demo-thought-1", Done: true})
 	})
 
+	// t+2s: the boss wants a steer — a real question request (the UI would
+	// answer it in a question modal).
+	b.fl.at(2*time.Second, func() {
+		b.fl.emit(state.Event{Kind: state.EvQuestion, QuestionID: "que-demo-1", SessionID: "boss",
+			EmployeeID: "boss", EmployeeName: "boss",
+			Text:        "Which file should I touch first?",
+			ToolSummary: "internal/app/model.go | internal/state/state.go",
+			ToolState:   "pending"})
+	})
+
 	// t+2.4s: the boss's own grep lands, done in the same beat.
 	b.fl.at(2400*time.Millisecond, func() {
 		b.fl.emit(state.Event{Kind: state.EvTool, EmployeeID: "boss", EmployeeName: "boss",
 			ToolName: "grep", ToolSummary: "GRAFEIO_*, 12 hits", ToolState: "done", CallID: "demo-call-1"})
 	})
 
-	// t+5.8s -> t+6.2s: tekton-1 reads the file they were blocked on earlier.
-	b.fl.at(5800*time.Millisecond, func() {
+	// t+4.5s: tekton-2's edits land inline — one file diff beside the brief.
+	b.fl.at(4500*time.Millisecond, func() {
+		b.fl.emit(state.Event{Kind: state.EvFileDiff, SessionID: "tekton-2",
+			EmployeeID: "tekton-2", EmployeeName: "tekton-2",
+			DiffPath: "internal/app/model.go", DiffAdd: 40, DiffDel: 12,
+			DiffBody: "--- a/internal/app/model.go\n" +
+				"+++ b/internal/app/model.go\n" +
+				"@@ -10,7 +10,9 @@\n" +
+				" func newOfficeModel() officeModel {\n" +
+				"-\treturn officeModel{floor: newFloor()}\n" +
+				"+\tm := officeModel{floor: newFloor()}\n" +
+				"+\tm.floor.loadSeats(defaultRoster())\n" +
+				"+\tm.connectBackend(newLiveBackend())\n" +
+				"@@ -44,5 +46,9 @@\n" +
+				"-\treturn m\n" +
+				"+\tm.diffView = newDiffView()\n" +
+				"+\treturn m\n"})
+	})
+
+	// t+5.2s -> t+5.6s: tekton-1 reads the file before hitting the write gate.
+	b.fl.at(5200*time.Millisecond, func() {
 		b.fl.emit(state.Event{Kind: state.EvTool, EmployeeID: "tekton-1", EmployeeName: "tekton-1",
 			ToolName: "read", ToolSummary: "src/index.ts", ToolState: "running", CallID: "demo-call-2"})
 	})
-	b.fl.at(6200*time.Millisecond, func() {
+	b.fl.at(5600*time.Millisecond, func() {
 		b.fl.emit(state.Event{Kind: state.EvTool, EmployeeID: "tekton-1", EmployeeName: "tekton-1",
 			ToolName: "read", ToolSummary: "src/index.ts", ToolState: "done", CallID: "demo-call-2"})
 	})
@@ -159,12 +193,23 @@ func (b *demoBackend) Start(emit func(state.Event)) error {
 		b.fl.emit(state.Event{Kind: state.EvBubble, EmployeeID: "skopos-1", Text: "nice catch in review."})
 	})
 
-	// t+5.5s: tekton-1 hits a permission gate and waves at the mailbox...
-	b.fl.at(5500*time.Millisecond, func() {
+	// t+6s: tekton-1 hits a real permission gate (Write /tmp/x). EvPermission
+	// opens the answer modal AND the floor still shows them blocked at the
+	// mailbox — and there they stay until the UI calls AnswerPermission (or
+	// the scripted return at 6.5s auto-resolves it as an implicit approval).
+	b.fl.at(6*time.Second, func() {
+		hold := permHold{
+			SessionID: "tekton-1", EmployeeID: "tekton-1", EmployeeName: "tekton-1",
+			Title: "Write", Summary: "/tmp/x",
+		}
 		b.mu.Lock()
+		b.pendingPerm["perm-demo-1"] = hold
 		b.blockedIDs["tekton-1"] = true
 		b.mu.Unlock()
-		b.fl.emit(state.Event{Kind: state.EvBlocked, EmployeeID: "tekton-1", Text: "permission: write src/app.tsx"})
+		b.fl.emit(state.Event{Kind: state.EvPermission, PermissionID: "perm-demo-1",
+			SessionID: "tekton-1", EmployeeID: "tekton-1", EmployeeName: "tekton-1",
+			ToolName: hold.Title, ToolSummary: hold.Summary, ToolState: "pending"})
+		b.fl.emit(state.Event{Kind: state.EvBlocked, EmployeeID: "tekton-1", Text: "permission: Write /tmp/x"})
 	})
 
 	// ...approved; t+6.5s the brief lands in the tray.
@@ -243,6 +288,43 @@ func (b *demoBackend) Send(text string) error {
 	return nil
 }
 
+// ---------------------------------------------------------------- permission replies
+
+// AnswerPermission resolves a pending demo permission: logs the reply on
+// the status line, clears the blocked employee (pulses resume), and emits a
+// "resolved" EvPermission on the same id so the UI drops the modal.
+func (b *demoBackend) AnswerPermission(permissionID, response string) error {
+	switch response {
+	case "once", "always", "reject":
+	default:
+		return fmt.Errorf("invalid permission response %q (want once|always|reject)", response)
+	}
+	if b.fl.isStopped() {
+		return errors.New("backend stopped")
+	}
+	b.mu.Lock()
+	hold, ok := b.pendingPerm[permissionID]
+	delete(b.pendingPerm, permissionID)
+	if !ok {
+		hold = permHold{
+			SessionID: "tekton-1", EmployeeID: "tekton-1", EmployeeName: "tekton-1",
+			Title: "permission", Summary: "demo request",
+		}
+	}
+	empID := hold.EmployeeID
+	if empID != "" && empID != "boss" {
+		delete(b.blockedIDs, empID)
+	}
+	b.mu.Unlock()
+
+	b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
+		"[demo] permission %s answered %q (%s: %s %s)", permissionID, response, hold.EmployeeName, hold.Title, hold.Summary)})
+	b.fl.emit(state.Event{Kind: state.EvPermission, PermissionID: permissionID,
+		SessionID: hold.SessionID, EmployeeID: hold.EmployeeID, EmployeeName: hold.EmployeeName,
+		ToolName: hold.Title, ToolSummary: response, ToolState: "resolved"})
+	return nil
+}
+
 // ---------------------------------------------------------------- stop
 
 func (b *demoBackend) Stop() error {
@@ -306,7 +388,22 @@ func (b *demoBackend) doReturn(employeeID, taskID, subject, body string) {
 	}
 	b.active = next
 	delete(b.blockedIDs, employeeID)
+	// A staged return implies the boss approved: auto-resolve any permission
+	// the employee was still waiting on so no modal dangles past the brief.
+	var resolved []state.Event
+	for id, hold := range b.pendingPerm {
+		if hold.EmployeeID == employeeID {
+			delete(b.pendingPerm, id)
+			resolved = append(resolved, state.Event{Kind: state.EvPermission, PermissionID: id,
+				SessionID: hold.SessionID, EmployeeID: hold.EmployeeID, EmployeeName: hold.EmployeeName,
+				ToolName: hold.Title, ToolSummary: "once", ToolState: "resolved"})
+		}
+	}
 	b.mu.Unlock()
+
+	for _, ev := range resolved {
+		b.fl.emit(ev)
+	}
 
 	mail := state.MailItem{
 		ID:      "mail-" + taskID,

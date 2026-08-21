@@ -429,6 +429,71 @@ func (b *liveBackend) postPrompt(sessionID, text string) error {
 	return b.doJSON(http.MethodPost, "/session/"+sessionID+"/prompt_async", body, nil)
 }
 
+// ---------------------------------------------------------------- permission replies
+
+// AnswerPermission replies to a pending permission prompt. Primary route is
+// the modern global one (POST /permission/{requestID}/reply, opencode >=1.18);
+// if the server rejects it, fall back to the legacy session-scoped route
+// (POST /session/{id}/permissions/{permissionID}) using the session the
+// request was seen on.
+func (b *liveBackend) AnswerPermission(permissionID, response string) error {
+	switch response {
+	case "once", "always", "reject":
+	default:
+		return fmt.Errorf("invalid permission response %q (want once|always|reject)", response)
+	}
+	if b.fl.isStopped() {
+		return errors.New("backend stopped")
+	}
+	body, _ := json.Marshal(map[string]any{"reply": response})
+	if err := b.doJSON(http.MethodPost, "/permission/"+permissionID+"/reply", body, nil); err == nil {
+		return nil
+	}
+	b.mu.Lock()
+	hold, ok := b.ctx.pendingPerms[permissionID]
+	b.mu.Unlock()
+	if !ok || hold.SessionID == "" {
+		return errors.New("permission.reply failed and the request's session is unknown")
+	}
+	legacy, _ := json.Marshal(map[string]any{"response": response})
+	return b.doJSON(http.MethodPost, "/session/"+hold.SessionID+"/permissions/"+permissionID, legacy, nil)
+}
+
+// ---------------------------------------------------------------- diffs
+
+// fetchDiffAndEmit pulls GET /session/{id}/diff on completion paths that may
+// have missed the inline session.diff event; paths already surfaced (by the
+// SSE event) are skipped via ctx.diffSeen. Failures are silent — a session
+// without snapshot support returns an error and there is nothing to show.
+func (b *liveBackend) fetchDiffAndEmit(sessionID string) {
+	b.mu.Lock()
+	started := b.baseURL != "" && !b.fl.isStopped()
+	primaryID := b.primaryID
+	b.mu.Unlock()
+	if !started || sessionID == "" {
+		return
+	}
+	var diffs []ocSnapshotFileDiff
+	if err := b.doJSON(http.MethodGet, "/session/"+sessionID+"/diff", nil, &diffs); err != nil {
+		return
+	}
+	if len(diffs) == 0 {
+		return
+	}
+	b.mu.Lock()
+	empID, empName, _ := actorFor(sessionID, b.ctx, primaryID)
+	var evs []state.Event
+	for _, d := range diffs {
+		if ev, ok := diffEvent(sessionID, empID, empName, d, b.ctx); ok {
+			evs = append(evs, ev)
+		}
+	}
+	b.mu.Unlock()
+	for _, e := range evs {
+		b.fl.emit(e)
+	}
+}
+
 // latestAssistantText returns the newest non-empty assistant text part in
 // a session; "" on any failure (abort, rename, network — not a return).
 func (b *liveBackend) latestAssistantText(sessionID string) string {
@@ -604,6 +669,9 @@ func (b *liveBackend) maybeChildReturned(sessionID string) {
 	if text == "" {
 		return // no assistant output — not a return
 	}
+	// The child's edits surface as diffs next to its return (completion-time
+	// fetch; the session.diff event wins when the server emits one).
+	b.fetchDiffAndEmit(sessionID)
 
 	b.mu.Lock()
 	if b.ctx.returned[sessionID] {
@@ -663,6 +731,8 @@ func (b *liveBackend) maybeBossCompleted(info ocMessage) {
 	if text == "" {
 		text = "(the boss sent an empty reply)"
 	}
+	// Boss edits surface as diff events on message completion.
+	b.fetchDiffAndEmit(primaryID)
 
 	b.mu.Lock()
 	var id string

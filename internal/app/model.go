@@ -35,7 +35,22 @@ const (
 	minRows      = 12
 	tickInterval = 180 * time.Millisecond
 	ambientEvery = 140 // ticks between ambient bubbles
+
+	// Message queue — Enter while a boss reply is pending enqueues; on the
+	// pending flush one message sends every queueFlushDelay until drained.
+	queueCap        = 10
+	queueFlushDelay = 400 * time.Millisecond
 )
+
+// QueueDebugf, when set (uisshot --debug only), receives message-queue
+// trace lines. Nil in production — the hot path checks before formatting.
+var QueueDebugf func(format string, args ...any)
+
+func qdebugf(format string, args ...any) {
+	if QueueDebugf != nil {
+		QueueDebugf(format, args...)
+	}
+}
 
 // ambientLines — pure ASCII; the floor staff typed these, not a program.
 var ambientLines = []string{
@@ -62,6 +77,23 @@ type Model struct {
 	chat          *panels.Chat
 	activity      *panels.Activity
 	keys          KeyMap
+
+	// Message queue (model-level so it survives tab switches): texts typed
+	// while a boss reply is pending, flushed one-per-400ms on completion.
+	queue []string
+
+	// Permission prompts (boss/primary session only): perm is the OPEN
+	// prompt replacing the textarea; permEscd is the latest esc'd-but-
+	// unanswered prompt /perm can re-open.
+	perm     *permPrompt
+	permEscd *permPrompt
+}
+
+// permPrompt is a pending boss permission request.
+type permPrompt struct {
+	ID       string
+	ToolName string
+	Summary  string
 }
 
 // chatSentMsg fires after backend.Send succeeds — the local user bubble and
@@ -74,6 +106,21 @@ type sendErrMsg struct{ err error }
 // slashMsg fires when the chat input starts with "/" — local command, never
 // sent to the backend.
 type slashMsg struct{ text string }
+
+// enqueueMsg fires when Enter lands while a boss reply is pending — the
+// text joins the model-level queue instead of reaching the backend.
+type enqueueMsg struct{ text string }
+
+// queueFlushMsg (400ms tick chain) flushes the next queued message.
+type queueFlushMsg struct{}
+
+// permAnswerMsg fires when the user answers an open permission prompt
+// (y/a/n → "once"/"always"/"reject").
+type permAnswerMsg struct{ response string }
+
+// permLaterMsg fires on esc — the prompt stays pending, re-openable with
+// /perm.
+type permLaterMsg struct{}
 
 // New builds the app around a backend. backend.Start is NOT called here —
 // main owns that (goroutine → tea.Program.Send).
@@ -108,6 +155,20 @@ func New(b state.Backend) Model {
 		),
 		keys: NewKeyMap(),
 	}
+	// Queue + permission seams: the panel owns the keys, the model owns the
+	// queue/prompt state; callbacks ferry over tea.Msgs so the model value
+	// copy in Update stays the single writer.
+	chat.SetEnqueue(func(text string) tea.Cmd {
+		return func() tea.Msg { return enqueueMsg{text: text} }
+	})
+	chat.SetPermissionHandlers(
+		func(response string) tea.Cmd {
+			return func() tea.Msg { return permAnswerMsg{response: response} }
+		},
+		func() tea.Cmd {
+			return func() tea.Msg { return permLaterMsg{} }
+		},
+	)
 	m.tabs.SetState(m.st)
 	return m
 }
@@ -147,6 +208,44 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if cmd := m.applySlash(msg.text); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+	case enqueueMsg:
+		if len(m.queue) >= queueCap {
+			m.noticeErr(fmt.Sprintf("queue full (%d) — wait for the boss to catch up, or /queue clear", queueCap))
+		} else {
+			m.queue = append(m.queue, msg.text)
+			if m.chat != nil {
+				m.chat.SetQueueLen(len(m.queue))
+			}
+			qdebugf("enqueued %q (n=%d)", msg.text, len(m.queue))
+		}
+	case queueFlushMsg:
+		if len(m.queue) > 0 {
+			cmds = append(cmds, m.flushQueued())
+		}
+	case permAnswerMsg:
+		if m.perm != nil {
+			pid, response := m.perm.ID, msg.response
+			if m.permEscd != nil && m.permEscd.ID == pid {
+				m.permEscd = nil
+			}
+			m.perm = nil
+			m.chat.SetPermission(nil)
+			cmds = append(cmds, func() tea.Msg {
+				if m.backend != nil {
+					if err := m.backend.AnswerPermission(pid, response); err != nil {
+						return sendErrMsg{err: err}
+					}
+				}
+				return nil
+			})
+		}
+	case permLaterMsg:
+		if m.perm != nil {
+			m.permEscd = m.perm
+			m.perm = nil
+			m.chat.SetPermission(nil)
+			m.notice("esc'd permission pending (/perm)")
+		}
 	case state.Event:
 		cmds = append(cmds, m.applyEvent(msg))
 	default:
@@ -178,7 +277,7 @@ func (m Model) Frame() string {
 	side := lipgloss.NewStyle().Width(m.sidebar).Height(m.middleH).
 		Render(m.tabs.View())
 	mid := lipgloss.JoinHorizontal(lipgloss.Top, floor, side)
-	bot := chrome.StatusBar(m.st, m.keys.HintLine(), m.width)
+	bot := chrome.StatusBar(m.st, m.keys.HintLine(), len(m.queue), m.width)
 	return lipgloss.JoinVertical(lipgloss.Left, top, mid, bot)
 }
 
@@ -203,6 +302,11 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 			m.chat.ToggleThink()
 			return nil
 		}
+	case "ctrl+d":
+		if chatActive {
+			m.chat.ToggleDiffs()
+			return nil
+		}
 	default:
 		if !chatActive {
 			if idx := m.keys.TabJump(msg.String()); idx >= 0 {
@@ -217,6 +321,12 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 // applyEvent reduces one backend event, feeds panels + activity log, and
 // re-arms the animation tick. Returns the next cmd when needed.
 func (m *Model) applyEvent(ev state.Event) tea.Cmd {
+	// permission prompts are model-owned UI state (not chat history) —
+	// handle before the reducer (the reducer leaves them untouched).
+	if ev.Kind == state.EvPermission {
+		m.handlePermissionEvent(ev)
+	}
+
 	prevPending := hasPendingBoss(m.st)
 	m.st = reducer(m.st, ev)
 	m.tabs.SetState(m.st)
@@ -233,7 +343,68 @@ func (m *Model) applyEvent(ev state.Event) tea.Cmd {
 	if !prevPending && hasPendingBoss(m.st) && m.chat != nil {
 		return m.chat.SpinnerKick()
 	}
+	if prevPending && !hasPendingBoss(m.st) && len(m.queue) > 0 {
+		// the boss reply landed: flush the queue, one message per 400ms
+		return m.flushQueued()
+	}
 	return nil
+}
+
+// flushQueued pops the oldest queued text, sends it down the SAME path as
+// the chat panel (slash-guard + backend.Send + chatSentMsg), and arms the
+// next 400ms flush tick while the queue stays non-empty.
+func (m *Model) flushQueued() tea.Cmd {
+	if len(m.queue) == 0 {
+		return nil
+	}
+	text := m.queue[0]
+	m.queue = m.queue[1:]
+	if m.chat != nil {
+		m.chat.SetQueueLen(len(m.queue))
+	}
+	qdebugf("flush %q (remaining=%d)", text, len(m.queue))
+	b := m.backend
+	send := func() tea.Msg {
+		if strings.HasPrefix(text, "/") {
+			return slashMsg{text: text}
+		}
+		if b != nil {
+			if err := b.Send(text); err != nil {
+				return sendErrMsg{err: err}
+			}
+		}
+		return chatSentMsg{text: text}
+	}
+	return tea.Batch(send, tea.Tick(queueFlushDelay, func(time.Time) tea.Msg {
+		return queueFlushMsg{}
+	}))
+}
+
+// handlePermissionEvent opens/closes the boss permission prompt. Boss/primary
+// requests (pending ToolState) REPLACE the textarea with the answer modal;
+// "resolved" closes the matching open (or esc'd) prompt silently. Child-
+// session requests never open a modal — they surface as an activity line
+// (describeEvent) plus the backend's usual floor blocked sprite.
+func (m *Model) handlePermissionEvent(ev state.Event) {
+	if ev.ToolState == "resolved" {
+		if m.perm != nil && m.perm.ID == ev.PermissionID {
+			m.perm = nil
+			m.chat.SetPermission(nil)
+		}
+		if m.permEscd != nil && m.permEscd.ID == ev.PermissionID {
+			m.permEscd = nil
+		}
+		return
+	}
+	if ev.EmployeeName != "boss" && ev.EmployeeName != "" {
+		return // child permission: activity line only, no modal
+	}
+	m.perm = &permPrompt{ID: ev.PermissionID, ToolName: ev.ToolName, Summary: ev.ToolSummary}
+	m.chat.SetPermission(&panels.PermissionView{
+		ID:       ev.PermissionID,
+		ToolName: ev.ToolName,
+		Summary:  ev.ToolSummary,
+	})
 }
 
 func (m *Model) resize(w, h int) {
@@ -575,6 +746,49 @@ func reducer(st state.OfficeState, ev state.Event) state.OfficeState {
 			return st
 		}
 
+	case state.EvQuestion:
+		{
+			// boss questions: Kind "question" chat entry (yellow "boss asks ›").
+			// Employee questions are activity-line only (describeEvent), like
+			// employee thoughts — the deep-work stream belongs to the boss.
+			if ev.EmployeeName != "" && ev.EmployeeName != "boss" {
+				return st
+			}
+			id := "q-" + ev.QuestionID
+			if ev.QuestionID == "" {
+				id = "q-" + nextMsgID()
+			}
+			st.Chat = capChat(appendChat(st.Chat, state.ChatMsg{
+				ID:   id,
+				From: "boss",
+				Kind: "question",
+				Text: ev.Text,
+				// options ride in Meta for the renderer ("a | b | c")
+				Meta: ev.ToolSummary,
+				At:   time.Now().UnixMilli(),
+			}))
+			return st
+		}
+
+	case state.EvFileDiff:
+		{
+			name := ev.EmployeeName
+			if name == "" {
+				name = "boss"
+			}
+			st.Chat = capChat(appendChat(st.Chat, state.ChatMsg{
+				ID:   "diff-" + nextMsgID(),
+				From: name,
+				Kind: "diff",
+				Text: ev.DiffBody,
+				// Meta carrier for the collapsed header:
+				// path ␟ +adds ␟ -dels (unit separator; panels parses it back)
+				Meta: fmt.Sprintf("%s\x1f+%d\x1f-%d", ev.DiffPath, ev.DiffAdd, ev.DiffDel),
+				At:   time.Now().UnixMilli(),
+			}))
+			return st
+		}
+
 	case state.EvBubble:
 		ttl := ev.TTL
 		if ttl == 0 {
@@ -628,6 +842,10 @@ const slashHelp = `commands:
   /themes            list themes
   /thinking on|off   show/hide thinking blocks
   /tools on|off      show/hide tool one-liners
+  /diffs on|off      expand/collapse file diffs (ctrl+d toggles)
+  /queue             show enqueued messages
+  /queue clear       drop all enqueued messages
+  /perm              re-open an esc'd permission prompt
   /status            office status
   /quit              exit grafeio`
 
@@ -670,6 +888,45 @@ func (m *Model) applySlash(input string) tea.Cmd {
 	case "/tools":
 		m.applyToggle("/tools", fields, func(on bool) {
 			m.chat.SetShowTools(on)
+		})
+	case "/diffs":
+		m.applyToggle("/diffs", fields, func(on bool) {
+			m.chat.SetDiffsExpanded(on)
+		})
+	case "/queue":
+		if len(fields) >= 2 {
+			if fields[1] == "clear" {
+				m.queue = nil
+				if m.chat != nil {
+					m.chat.SetQueueLen(0)
+				}
+				m.notice("queue cleared")
+			} else {
+				m.noticeErr("/queue: usage /queue | /queue clear")
+			}
+			return nil
+		}
+		if len(m.queue) == 0 {
+			m.notice("queue empty — type while the boss is typing to enqueue")
+			return nil
+		}
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "queue (%d/%d):", len(m.queue), queueCap)
+		for i, t := range m.queue {
+			fmt.Fprintf(&sb, "\n  %d. %s", i+1, t)
+		}
+		m.notice(sb.String())
+	case "/perm":
+		if m.permEscd == nil {
+			m.notice("no pending permission (/perm re-opens an esc'd prompt)")
+			return nil
+		}
+		m.perm = m.permEscd
+		m.permEscd = nil
+		m.chat.SetPermission(&panels.PermissionView{
+			ID:       m.perm.ID,
+			ToolName: m.perm.ToolName,
+			Summary:  m.perm.Summary,
 		})
 	case "/status":
 		var pend, doing, done int
@@ -812,6 +1069,32 @@ func (m *Model) describeEvent(ev state.Event) string {
 			text += " · " + ev.ToolSummary
 		}
 		what = fmt.Sprintf("tool — %s: %s (%s)", name, text, toolState)
+	case state.EvPermission:
+		name := ev.EmployeeName
+		if name == "" {
+			name = "boss"
+		}
+		toolState := ev.ToolState
+		if toolState == "" {
+			toolState = "pending"
+		}
+		text := ev.ToolName
+		if ev.ToolSummary != "" {
+			text += " · " + ev.ToolSummary
+		}
+		what = fmt.Sprintf("permission — %s: %s (%s)", name, text, toolState)
+	case state.EvQuestion:
+		name := ev.EmployeeName
+		if name == "" {
+			name = "boss"
+		}
+		what = "question — " + name + ": " + clipRunes(ev.Text, 60)
+	case state.EvFileDiff:
+		name := ev.EmployeeName
+		if name == "" {
+			name = "boss"
+		}
+		what = fmt.Sprintf("diff — %s: %s +%d -%d", name, ev.DiffPath, ev.DiffAdd, ev.DiffDel)
 	case state.EvStatus:
 		what = "status — " + ev.Text
 	default:

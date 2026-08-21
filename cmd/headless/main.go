@@ -7,6 +7,9 @@
 //	                            send the prompt once the primary session is
 //	                            ready, run 14s so thought/tool events + the
 //	                            boss reply stream through, stop, exit 0
+//	grafeio-headless --answer   after the first permission event prints,
+//	                            call backend.AnswerPermission(pid, "once") and
+//	                            print the result (demo: clears tekton-1's block)
 //
 // Every state.Event is printed as one line (kind + key fields) so a smoke
 // run can assert the floor contract without a renderer.
@@ -27,6 +30,7 @@ func main() {
 	demo := flag.Bool("demo", true, "run the scripted demo backend (default)")
 	live := flag.Bool("live", false, "spawn a real opencode serve and run live for 3s")
 	prompt := flag.String("prompt", "", "live mode: send this prompt after the primary session is ready and run 14s")
+	answer := flag.Bool("answer", false, "auto-answer the first permission prompt with \"once\" and print the result")
 	flag.Parse()
 
 	var b state.Backend
@@ -51,17 +55,41 @@ func main() {
 
 	var mu sync.Mutex
 	ticks := 0
+	var answerPID string // first PENDING permission id seen, under mu
 	emit := func(e state.Event) {
+		// --answer: capture the first pending permission id now; the actual
+		// backend call happens OUTSIDE the emit lock (demo emits
+		// synchronously from inside AnswerPermission — calling here would
+		// deadlock on mu).
+		answerNow := false
 		mu.Lock()
-		defer mu.Unlock()
+		if *answer && answerPID == "" && e.Kind == state.EvPermission && e.ToolState != "resolved" {
+			answerPID = e.PermissionID
+			answerNow = true
+		}
 		if e.Kind == state.EvTick {
 			ticks++
 			if ticks%10 == 1 {
 				fmt.Printf("[tick] #%d\n", ticks)
 			}
+			mu.Unlock()
 			return
 		}
 		printEvent(e)
+		mu.Unlock()
+		if answerNow {
+			// One event's worth of separation, then the reply round-trip.
+			time.AfterFunc(50*time.Millisecond, func() {
+				err := b.AnswerPermission(answerPID, "once")
+				mu.Lock()
+				defer mu.Unlock()
+				if err != nil {
+					fmt.Printf("[answer] permission %s -> ERROR: %v\n", answerPID, err)
+				} else {
+					fmt.Printf("[answer] permission %s -> ok (backend.AnswerPermission(\"%s\", \"once\"))\n", answerPID, answerPID)
+				}
+			})
+		}
 	}
 
 	fmt.Printf("[mode] %s\n", b.Mode())
@@ -135,6 +163,12 @@ func printEvent(e state.Event) {
 		fmt.Printf("[thought] %s done=%v %q\n", e.EmployeeName, e.Done, trunc(e.Text, 120))
 	case state.EvTool:
 		fmt.Printf("[tool] %s %s %s %q\n", e.EmployeeName, e.ToolName, e.ToolState, trunc(e.ToolSummary, 80))
+	case state.EvPermission:
+		fmt.Printf("[permission] %s %s %s %q state=%s\n", e.PermissionID, e.EmployeeName, e.ToolName, trunc(e.ToolSummary, 80), e.ToolState)
+	case state.EvQuestion:
+		fmt.Printf("[question] %s %s %q options=%q state=%s\n", e.QuestionID, e.EmployeeName, trunc(e.Text, 120), trunc(e.ToolSummary, 80), e.ToolState)
+	case state.EvFileDiff:
+		fmt.Printf("[diff] %s %s +%d/-%d\n%s\n", e.EmployeeName, e.DiffPath, e.DiffAdd, e.DiffDel, trunc(e.DiffBody, 300))
 	default:
 		fmt.Printf("[%s]\n", e.Kind)
 	}

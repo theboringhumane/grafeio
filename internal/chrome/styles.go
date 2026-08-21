@@ -44,6 +44,10 @@ type Theme struct {
 	Border    color.Color // panel rounded border
 	ToolColor color.Color // chat tool one-liner ink (noir: dim cyan)
 
+	// Deep-work stream accents.
+	Warn     color.Color // permission modal amber, queue badge (statusbar)
+	Question color.Color // question-tool yellow ("boss asks ›")
+
 	// per-role chat/floor identity colors
 	RoleBoss     color.Color
 	RoleHR       color.Color
@@ -67,6 +71,8 @@ var themeList = []Theme{
 		Dim:   lipgloss.Color("8"),
 		BarBg: lipgloss.Color("8"), Border: lipgloss.Color("7"),
 		ToolColor:    lipgloss.Color("6"),
+		Warn:         lipgloss.Color("3"),
+		Question:     lipgloss.Color("11"),
 		RoleBoss:     lipgloss.Color("3"),
 		RoleHR:       lipgloss.Color("1"),
 		RoleDev:      lipgloss.Color("6"),
@@ -84,6 +90,8 @@ var themeList = []Theme{
 		Dim:   lipgloss.Color("#57606a"),
 		BarBg: lipgloss.Color("#d8dce1"), Border: lipgloss.Color("#57606a"),
 		ToolColor:    lipgloss.Color("#0891b2"),
+		Warn:         lipgloss.Color("#b35900"),
+		Question:     lipgloss.Color("#9a6700"),
 		RoleBoss:     lipgloss.Color("#9a6700"),
 		RoleHR:       lipgloss.Color("#d1242f"),
 		RoleDev:      lipgloss.Color("#0891b2"),
@@ -101,6 +109,8 @@ var themeList = []Theme{
 		Dim:   lipgloss.Color("#6f6f6f"),
 		BarBg: lipgloss.Color("#3a3a3a"), Border: lipgloss.Color("#8a8a8a"),
 		ToolColor:    lipgloss.Color("#a8a8a8"),
+		Warn:         lipgloss.Color("#efefef"),
+		Question:     lipgloss.Color("#c6c6c6"),
 		RoleBoss:     lipgloss.Color("#ffffff"),
 		RoleHR:       lipgloss.Color("#d0d0d0"),
 		RoleDev:      lipgloss.Color("#bcbcbc"),
@@ -118,6 +128,8 @@ var themeList = []Theme{
 		Dim:   lipgloss.Color("#6272a4"),
 		BarBg: lipgloss.Color("#44475a"), Border: lipgloss.Color("#6272a4"),
 		ToolColor:    lipgloss.Color("#8be9fd"),
+		Warn:         lipgloss.Color("#ffb86c"),
+		Question:     lipgloss.Color("#f1fa8c"),
 		RoleBoss:     lipgloss.Color("#f1fa8c"),
 		RoleHR:       lipgloss.Color("#ff5555"),
 		RoleDev:      lipgloss.Color("#8be9fd"),
@@ -135,6 +147,8 @@ var themeList = []Theme{
 		Dim:   lipgloss.Color("#586e75"),
 		BarBg: lipgloss.Color("#073642"), Border: lipgloss.Color("#586e75"),
 		ToolColor:    lipgloss.Color("#2aa198"),
+		Warn:         lipgloss.Color("#cb4b16"),
+		Question:     lipgloss.Color("#b58900"),
 		RoleBoss:     lipgloss.Color("#b58900"),
 		RoleHR:       lipgloss.Color("#dc322f"),
 		RoleDev:      lipgloss.Color("#2aa198"),
@@ -241,15 +255,17 @@ func MarkdownStyle() glan.StyleConfig {
 // Theme constants — re-pointed by SetTheme. ink slots of the active theme:
 // Accent/Err/OK/Info stay semantic for consumers; panels read these vars.
 var (
-	Accent  color.Color
-	Err     color.Color
-	OK      color.Color
-	Info    color.Color
-	Magenta color.Color
-	Blue    color.Color
-	White   color.Color
-	Black   color.Color
-	Dim     color.Color
+	Accent   color.Color
+	Err      color.Color
+	OK       color.Color
+	Info     color.Color
+	Magenta  color.Color
+	Blue     color.Color
+	White    color.Color
+	Black    color.Color
+	Dim      color.Color
+	Warn     color.Color
+	Question color.Color
 )
 
 // BarBgColor is the inverted bar background of the active theme.
@@ -281,12 +297,18 @@ var (
 
 	// ToolStyle is the chat tool one-liner style (noir: dim cyan).
 	ToolStyle lipgloss.Style
+
+	// Deep-work stream styles.
+	WarnText     lipgloss.Style // permission amber
+	WarnBold     lipgloss.Style // permission amber, bold (modal header)
+	QuestionText lipgloss.Style // question-tool yellow
 )
 
 // applyTheme re-points every exported style var for the given theme.
 func applyTheme(t Theme) {
 	Accent, Err, OK, Info = t.Accent, t.Err, t.OK, t.Info
 	Magenta, Blue, White, Black, Dim = t.Magenta, t.Blue, t.White, t.Black, t.Dim
+	Warn, Question = t.Warn, t.Question
 	BarBgColor = t.BarBg
 
 	Bar = lipgloss.NewStyle().Background(BarBgColor).Foreground(White)
@@ -301,6 +323,9 @@ func applyTheme(t Theme) {
 	OKText = lipgloss.NewStyle().Foreground(OK)
 	InfoText = lipgloss.NewStyle().Foreground(Info)
 	ToolStyle = lipgloss.NewStyle().Foreground(t.ToolColor).Faint(true)
+	WarnText = lipgloss.NewStyle().Foreground(t.Warn)
+	WarnBold = lipgloss.NewStyle().Foreground(t.Warn).Bold(true)
+	QuestionText = lipgloss.NewStyle().Foreground(t.Question)
 }
 
 // RoleColor — port of node-legacy roster.nameColor: per-theme role ink;
