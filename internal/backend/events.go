@@ -127,6 +127,21 @@ type ocSessionErrorProps struct {
 	} `json:"error"`
 }
 
+// ocPartDelta is the properties blob of a message.part.delta frame: the
+// incremental TEXT GROWTH channel. Verified against opencode serve 1.18.19
+// (see cmd/headless probes): a reasoning part's message.part.updated only
+// ever arrives as start (empty text, time.end=0) and completion (full text,
+// time.end!=0) — all intermediate growth rides these deltas, appended in
+// order to the same partID. Text parts delta too, so deltas are only
+// surfaced for parts a message.part.updated has classified as reasoning.
+type ocPartDelta struct {
+	SessionID string `json:"sessionID"`
+	MessageID string `json:"messageID"`
+	PartID    string `json:"partID"`
+	Field     string `json:"field"` // "text" is the only field that matters here
+	Delta     string `json:"delta"`
+}
+
 // ocSSEEvent is one frame off GET /event (the Event union's `type` plus a
 // raw `properties` blob each case unmarshals for itself).
 type ocSSEEvent struct {
@@ -139,16 +154,24 @@ type ocSSEEvent struct {
 // normCtx is the mutable reducer-side context (TS: NormCtx). Not
 // goroutine-safe on its own — the owning backend holds a mutex.
 type normCtx struct {
-	employees     map[string]state.Employee // child session id -> employee
-	tasks         map[string]state.BoardTask
-	nameCounts    map[state.EmployeeRole]int // role -> last issued number
-	seatSeq       int
-	lastWorkingAt map[string]int64    // child id -> last "working" emit time (ms)
-	returned      map[string]bool     // child sessions that already returned
-	fired         map[string]bool     // dedupe delete-event vs delete-call
-	pendingPerms  map[string]permHold // permission/question request id -> hold
-	diffSeen      map[string]bool     // sessionID|path -> already surfaced
+	employees      map[string]state.Employee // child session id -> employee
+	tasks          map[string]state.BoardTask
+	nameCounts     map[state.EmployeeRole]int // role -> last issued number
+	seatSeq        int
+	lastWorkingAt  map[string]int64    // child id -> last "working" emit time (ms)
+	returned       map[string]bool     // child sessions that already returned
+	fired          map[string]bool     // dedupe delete-event vs delete-call
+	pendingPerms   map[string]permHold // permission/question request id -> hold
+	diffSeen       map[string]bool     // sessionID|path -> already surfaced
+	reasoningParts map[string]bool     // part id -> a message.part.updated said "reasoning"
+	reasoningAccum map[string]string   // part id -> delta-accumulated transcript so far
+	deltaBuffer    map[string]string   // part id -> deltas seen BEFORE the part was classified
 }
+
+// thoughtCapRunes bounds a thought transcript. Raised from the old 400 (a
+// summary) to 3000: EvThought carries the GROWING transcript now, so the UI
+// can render a live expanding block.
+const thoughtCapRunes = 3000
 
 // permHold remembers a pending permission/question request so its reply
 // event can be turned into a "resolved" follow-up on the same id.
@@ -162,14 +185,17 @@ type permHold struct {
 
 func newNormCtx() *normCtx {
 	return &normCtx{
-		employees:     make(map[string]state.Employee),
-		tasks:         make(map[string]state.BoardTask),
-		nameCounts:    make(map[state.EmployeeRole]int),
-		lastWorkingAt: make(map[string]int64),
-		returned:      make(map[string]bool),
-		fired:         make(map[string]bool),
-		pendingPerms:  make(map[string]permHold),
-		diffSeen:      make(map[string]bool),
+		employees:      make(map[string]state.Employee),
+		tasks:          make(map[string]state.BoardTask),
+		nameCounts:     make(map[state.EmployeeRole]int),
+		lastWorkingAt:  make(map[string]int64),
+		returned:       make(map[string]bool),
+		fired:          make(map[string]bool),
+		pendingPerms:   make(map[string]permHold),
+		diffSeen:       make(map[string]bool),
+		reasoningParts: make(map[string]bool),
+		reasoningAccum: make(map[string]string),
+		deltaBuffer:    make(map[string]string),
 	}
 }
 
@@ -271,20 +297,49 @@ func (ctx *normCtx) throttledWorking(employeeID, taskID string, now int64, force
 	return []state.Event{{Kind: state.EvWorking, EmployeeID: employeeID, TaskID: taskID}}
 }
 
+// capThought trims and rune-caps a thought transcript at thoughtCapRunes.
+func capThought(text string) string {
+	text = strings.TrimSpace(text)
+	if len([]rune(text)) > thoughtCapRunes {
+		return sliceMax(text, thoughtCapRunes-3) + "..."
+	}
+	return text
+}
+
 // mapReasoningPart: a ReasoningPart from the PRIMARY session is the boss
 // thinking out loud; from a child session it is that employee thinking.
 // Done is set when the part's time.end lands (the SDK stamps it on the
 // completed update). Empty text with no completion stamp is noise — skip.
-// Text is trimmed and capped at 400 chars. CallID carries the part id so
-// the UI can replace streaming updates of the same thought.
+// Text is the ACCUMULATED transcript capped at 3000 runes (thoughtCapRunes).
+// CallID carries the part id so the UI can replace streaming updates of the
+// same thought.
+//
+// Registration side effects: EVERY reasoning part is remembered in
+// ctx.reasoningParts so message.part.delta frames for it can stream (the
+// serve only sends updated at start+completion — deltas carry the growth).
+// Any deltas that arrived before this classification (deltaBuffer) seed the
+// accumulator. On completion the accumulator is freed.
 func mapReasoningPart(part ocPart, ctx *normCtx, primaryID string) []state.Event {
-	text := strings.TrimSpace(part.Text)
+	text := capThought(part.Text)
 	done := part.Time.End != 0
+	if !ctx.reasoningParts[part.ID] {
+		ctx.reasoningParts[part.ID] = true
+		if buffered := ctx.deltaBuffer[part.ID]; buffered != "" {
+			ctx.reasoningAccum[part.ID] = buffered
+			delete(ctx.deltaBuffer, part.ID)
+		}
+	}
+	if done {
+		// The completed part's own text is authoritative; the accumulator
+		// is only a fallback for a completion that somehow carries none.
+		if text == "" {
+			text = capThought(ctx.reasoningAccum[part.ID])
+		}
+		delete(ctx.reasoningAccum, part.ID)
+		delete(ctx.reasoningParts, part.ID)
+	}
 	if text == "" && !done {
 		return nil
-	}
-	if len([]rune(text)) > 400 {
-		text = sliceMax(text, 397) + "..."
 	}
 	var empID, empName string
 	if part.SessionID == primaryID {
@@ -301,6 +356,44 @@ func mapReasoningPart(part ocPart, ctx *normCtx, primaryID string) []state.Event
 		Text:         text,
 		CallID:       part.ID,
 		Done:         done,
+	}}
+}
+
+// mapReasoningDelta turns one message.part.delta frame into a GROWING
+// EvThought: the accumulated transcript so far for that reasoning part,
+// Done=false. Deltas for parts never classified as reasoning (the final
+// text answer deltas too) are never surfaced as thought — a text delta
+// stream belongs to the chat reply, not the boss's mind.
+//
+// Classification race: a delta can theoretically precede its part's first
+// message.part.updated; those deltas pile into deltaBuffer until the part
+// is classified (mapReasoningPart flushes on "reasoning", drops otherwise).
+// Buffers are rune-capped so an unclassified text-part flood can't grow
+// without bound.
+func mapReasoningDelta(d ocPartDelta, ctx *normCtx, primaryID string) []state.Event {
+	if d.PartID == "" || d.Field != "text" || d.Delta == "" {
+		return nil
+	}
+	if !ctx.reasoningParts[d.PartID] {
+		buffered := ctx.deltaBuffer[d.PartID] + d.Delta
+		if len([]rune(buffered)) <= thoughtCapRunes {
+			ctx.deltaBuffer[d.PartID] = buffered
+		}
+		return nil
+	}
+	accumulated := ctx.reasoningAccum[d.PartID] + d.Delta
+	ctx.reasoningAccum[d.PartID] = accumulated
+	empID, empName, ok := actorFor(d.SessionID, ctx, primaryID)
+	if !ok {
+		return nil
+	}
+	return []state.Event{{
+		Kind:         state.EvThought,
+		EmployeeID:   empID,
+		EmployeeName: empName,
+		Text:         capThought(accumulated),
+		CallID:       d.PartID,
+		Done:         false,
 	}}
 }
 
@@ -607,6 +700,9 @@ func diffEvent(sessionID, empID, empName string, d ocSnapshotFileDiff, ctx *norm
 //	session.updated (known child, title)   -> task upsert (retitle)
 //	message.part.updated (reasoning, primary) -> thought (boss mind)
 //	message.part.updated (reasoning, child)   -> thought (employee mind)
+//	message.part.delta (reasoning part, any)  -> thought, growing transcript
+//		(serve streams growth ONLY via deltas: updated lands at start
+//		empty and completion full — verified 1.18.19)
 //	message.part.updated (tool, any)       -> tool run/done/error (+ child working pulse)
 //	message.part.updated (child, other)    -> working (throttled 500ms/employee)
 //	message.updated (primary, ANY role)    -> [] — the primary's own user
@@ -695,6 +791,13 @@ func mapOCEvent(raw ocSSEEvent, ctx *normCtx, primaryID string, now int64) []sta
 			return nil
 		}
 		return ctx.throttledWorking(emp.ID, ctx.tasks[part.SessionID].ID, now, false)
+
+	case "message.part.delta":
+		var p ocPartDelta
+		if json.Unmarshal(raw.Properties, &p) != nil {
+			return nil
+		}
+		return mapReasoningDelta(p, ctx, primaryID)
 
 	case "message.updated":
 		var p struct {

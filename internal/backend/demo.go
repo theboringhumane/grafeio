@@ -58,7 +58,8 @@ func demoEmployee(id string, role state.EmployeeRole, seat string) state.Employe
 // ---------------------------------------------------------------- start
 
 // Start replays the office day: floor opens at t0, first briefs at 400ms,
-// a third hire at 1s, a boss thought at 1.6s (done 2.2s), a boss question
+// a third hire at 1s, a streaming boss thought at 1.6s-2.4s (four growing
+// updates on CallID th-1, then done), a boss question
 // at 2s, a boss grep at 2.4s, tekton-2's file diff at 4.5s, returns at
 // 2.5s/4s/6.5s, tekton-1's read at 5.2s (done 5.6s) ahead of the permission
 // gate at 6s (Write /tmp/x — stays until AnswerPermission or the scripted
@@ -86,14 +87,29 @@ func (b *demoBackend) Start(emit func(state.Event)) error {
 		b.dispatch("t3", "Draft the demo smoke script", "tekton-2")
 	})
 
-	// t+1.6s -> t+2.2s: the boss thinks out loud before tool work starts.
-	b.fl.at(1600*time.Millisecond, func() {
+	// t+1.6s -> t+2.4s: the boss thinks out loud before tool work starts —
+	// a STREAMING thought: one CallID ("th-1") emits four growing transcript
+	// updates (the way message.part.delta drives live mode), then collapses
+	// Done=true. The UI renders an expanding thinking block that folds shut.
+	thoughtStream := []struct {
+		at   time.Duration
+		text string
+	}{
+		{1600 * time.Millisecond, "planning"},
+		{1867 * time.Millisecond, "planning the"},
+		{2133 * time.Millisecond, "planning the dispatch"},
+		{2400 * time.Millisecond, "planning the dispatch... ok, wiring it to tekton-1"},
+	}
+	for _, beat := range thoughtStream {
+		beat := beat
+		b.fl.at(beat.at, func() {
+			b.fl.emit(state.Event{Kind: state.EvThought, EmployeeID: "boss", EmployeeName: "boss",
+				Text: beat.text, CallID: "th-1", Done: false})
+		})
+	}
+	b.fl.at(2400*time.Millisecond, func() {
 		b.fl.emit(state.Event{Kind: state.EvThought, EmployeeID: "boss", EmployeeName: "boss",
-			Text: "planning the dispatch...", CallID: "demo-thought-1", Done: false})
-	})
-	b.fl.at(2200*time.Millisecond, func() {
-		b.fl.emit(state.Event{Kind: state.EvThought, EmployeeID: "boss", EmployeeName: "boss",
-			Text: "planning the dispatch...", CallID: "demo-thought-1", Done: true})
+			Text: "planning the dispatch... ok, wiring it to tekton-1", CallID: "th-1", Done: true})
 	})
 
 	// t+2s: the boss wants a steer — a real question request (the UI would

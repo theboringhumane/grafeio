@@ -87,6 +87,14 @@ type Model struct {
 	// unanswered prompt /perm can re-open.
 	perm     *permPrompt
 	permEscd *permPrompt
+
+	// activeThink — CallIDs with an OPEN boss EvThought stream (Done not
+	// yet seen). Model-owned (the reducer stays pure): the chat panel
+	// consults this set to render streaming blocks expanded/livecoded
+	// while completed ones collapse to "thinking · N lines". Any
+	// EvChatBoss (pending placeholder OR answer) clears it — a newer boss
+	// turn downgrades older unfinished think entries to collapsed.
+	activeThink map[string]bool
 }
 
 // permPrompt is a pending boss permission request.
@@ -142,10 +150,11 @@ func New(b state.Backend) Model {
 	})
 	activity := panels.NewActivity()
 	m := Model{
-		backend:  b,
-		st:       initialState(b.Mode()),
-		chat:     chat,
-		activity: activity,
+		backend:     b,
+		st:          initialState(b.Mode()),
+		chat:        chat,
+		activity:    activity,
+		activeThink: map[string]bool{},
 		tabs: panels.NewTabs(
 			chat,
 			panels.NewAgents(),
@@ -327,8 +336,30 @@ func (m *Model) applyEvent(ev state.Event) tea.Cmd {
 		m.handlePermissionEvent(ev)
 	}
 
+	// Think-stream bookkeeping (model-owned; the reducer stays pure):
+	// open a CallID's stream on EvThought Done=false, close it on
+	// Done=true. Defensive: ANY EvChatBoss — a fresh pending placeholder
+	// included — downgrades every still-open stream to collapsed.
+	switch ev.Kind {
+	case state.EvThought:
+		if ev.EmployeeID == "boss" && ev.CallID != "" {
+			if ev.Done {
+				delete(m.activeThink, ev.CallID)
+			} else {
+				m.activeThink[ev.CallID] = true
+			}
+		}
+	case state.EvChatBoss:
+		for id := range m.activeThink {
+			delete(m.activeThink, id)
+		}
+	}
+
 	prevPending := hasPendingBoss(m.st)
 	m.st = reducer(m.st, ev)
+	if m.chat != nil {
+		m.chat.SetStreamingThink(m.activeThink)
+	}
 	m.tabs.SetState(m.st)
 
 	if ev.Kind != state.EvTick {
@@ -695,19 +726,41 @@ func reducer(st state.OfficeState, ev state.Event) state.OfficeState {
 
 	case state.EvThought:
 		{
-			// boss thoughts: thinking flag + a chat entry (Kind "think", cap 20).
+			// boss thoughts: thinking flag + a chat entry (Kind "think", cap 20)
+			// keyed by CallID — mid-stream updates REPLACE the entry in place
+			// (accumulated text), Done=true is the final update; the model's
+			// activeThink set decides streaming vs collapsed at render.
 			// employee thoughts: activity line only, no chat.
 			if ev.EmployeeID != "boss" {
 				return st
 			}
 			st.BossThinking = !ev.Done
-			st.Chat = capChat(appendChat(st.Chat, state.ChatMsg{
-				ID:   "think-" + nextMsgID(),
+			id := "think-" + ev.CallID
+			if ev.CallID == "" {
+				// no id to key on — legacy emitters stay append-only
+				id = "think-" + nextMsgID()
+			}
+			entry := state.ChatMsg{
+				ID:   id,
 				From: "boss",
 				Kind: "think",
 				Text: ev.Text,
+				Meta: ev.CallID, // renderer reads the CallID back from Meta
 				At:   time.Now().UnixMilli(),
-			}))
+			}
+			next := append([]state.ChatMsg(nil), st.Chat...)
+			merged := false
+			for i, msg := range next {
+				if msg.Kind == "think" && msg.ID == entry.ID {
+					next[i] = entry
+					merged = true
+					break
+				}
+			}
+			if !merged {
+				next = append(next, entry)
+			}
+			st.Chat = capChat(next)
 			return st
 		}
 
@@ -874,7 +927,7 @@ func (m *Model) applySlash(input string) tea.Cmd {
 			return nil
 		}
 		_ = chrome.PersistTheme() // best effort
-		office.SetTheme(name) // floor palette follows chrome
+		office.SetTheme(name)     // floor palette follows chrome
 		m.chat.RefreshTheme()
 		m.tabs.SetState(m.st)
 		m.notice("theme → " + chrome.CurrentTheme().Name)

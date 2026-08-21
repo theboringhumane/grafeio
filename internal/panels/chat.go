@@ -7,8 +7,10 @@
 //	            boss turns are rendered THROUGH GLAMOUR as markdown
 //	            (**bold**, lists, fences format + wrap) with a yellow
 //	            "boss › " hanging indent.
-//	            Kind "think" entries render as dim-italic thinking blocks,
-//	            COLLAPSED to "thinking · N lines" until ctrl+t expands all;
+//	            Kind "think" entries render as dim-italic thinking blocks —
+//	            LIVE while their CallID streams (spinner header, growing
+//	            tail, always expanded), then COLLAPSED to
+//	            "thinking · N lines" until ctrl+t expands all;
 //	            Kind "tool" entries render as dim one-liners merged by CallID;
 //	            From "office" entries render as dim local notices (red when
 //	            Meta == "error").
@@ -109,6 +111,14 @@ type Chat struct {
 	showTools     bool // /tools on|off    — tool one-liners visible (default true)
 	thinkExpanded bool // ctrl+t — thinking expanded; DEFAULT false (collapsed)
 	diffExpanded  bool // ctrl+d or /diffs on|off — diffs expanded; DEFAULT false
+
+	// streamingThink — CallIDs with an OPEN boss EvThought stream (set by
+	// the app from its model-owned active set). Streaming blocks always
+	// render expanded (live transcript) regardless of ctrl+t; when the
+	// stream closes (Done / new boss turn) they collapse to "thinking ·
+	// N lines". tick drives the header spinner — no extra timer.
+	streamingThink map[string]bool
+	tick           int
 
 	w, h      int
 	md        *glamour.TermRenderer
@@ -248,6 +258,22 @@ func (c *Chat) SetShowThinking(on bool) {
 // ShowThinking reports whether thinking blocks render.
 func (c *Chat) ShowThinking() bool { return c.showThinking }
 
+// SetStreamingThink hands the panel the live think-stream set — CallIDs
+// whose boss EvThought hasn't seen Done yet. Called by the app right
+// before SetState (render consults the set there). Defensive copy: the
+// caller keeps mutating its own map.
+func (c *Chat) SetStreamingThink(ids map[string]bool) {
+	if len(ids) == 0 {
+		c.streamingThink = nil
+		return
+	}
+	next := make(map[string]bool, len(ids))
+	for id := range ids {
+		next[id] = true
+	}
+	c.streamingThink = next
+}
+
 // SetShowTools shows/hides tool one-liners (/tools on|off).
 func (c *Chat) SetShowTools(on bool) {
 	if c.showTools == on {
@@ -307,8 +333,23 @@ func (c *Chat) SetSize(w, h int) {
 // SetState implements Tab: keeps the latest chat slice, re-renders the
 // conversation when it changed, and keeps scroll pinned to the bottom.
 func (c *Chat) SetState(st state.OfficeState) {
+	c.tick = st.Tick
 	rev := revision(st.Chat)
-	if rev == c.renderRev && len(st.Chat) == len(c.chat) {
+	// fold the stream set into the revision (order-independent) so closing a
+	// stream re-renders even when Done's final text equals the last update.
+	srev := uint64(14695981039346656037)
+	for id := range c.streamingThink {
+		h := uint64(14695981039346656037)
+		for i := 0; i < len(id); i++ {
+			h ^= uint64(id[i])
+			h *= 1099511628211
+		}
+		srev ^= h
+	}
+	rev ^= srev
+	// while any think block streams, re-render on EVERY tick (the header
+	// spinner advances with the office clock even when text is unchanged)
+	if rev == c.renderRev && len(st.Chat) == len(c.chat) && len(c.streamingThink) == 0 {
 		return
 	}
 	c.renderRev = rev
@@ -517,13 +558,45 @@ func (c *Chat) renderConversation() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// renderThink renders one Kind="think" entry: dim-italic "thinking" header +
-// greyed body when expanded; a single "thinking · N lines" line when
-// collapsed (the default).
+// thinkStreamLines caps the visible body of a STREAMING think block —
+// the tail of the accumulated text (the freshest lines) stays visible.
+const thinkStreamLines = 10
+
+// thinkFrames cycles the streaming header's spinner char, one step per
+// office tick (no extra timer — render consults c.tick).
+var thinkFrames = []string{"|", "/", "-", "\\"}
+
+// renderThink renders one Kind="think" entry in one of three shapes:
+//
+//	STREAMING  — dim-italic "⠿ thinking…" spinner header + the accumulated
+//	             text dim-italic, LAST thinkStreamLines lines max with a
+//	             "… N more above" first line; always expanded (ctrl+t
+//	             cannot collapse a live transcript).
+//	collapsed  — one dim "thinking · N lines" line (the default once the
+//	             stream's Done update lands / a new boss turn starts).
+//	expanded   — dim-italic "thinking" header + greyed body (ctrl+t).
 func (c *Chat) renderThink(b *strings.Builder, m state.ChatMsg) {
 	think := chrome.DimText.Italic(true)
 	body := chrome.DimText
 	lines := strings.Split(strings.TrimRight(wrapPlain(m.Text, c.mdWidth+1), "\n"), "\n")
+	if m.Meta != "" && c.streamingThink[m.Meta] {
+		frame := thinkFrames[c.tick%len(thinkFrames)]
+		if frame < "" {
+			frame = "|"
+		}
+		b.WriteString(think.Render(frame + " thinking…"))
+		shown := lines
+		if more := len(lines) - thinkStreamLines; more > 0 {
+			b.WriteString("\n  ")
+			b.WriteString(think.Render("… " + itoa(more) + " more above"))
+			shown = lines[more:]
+		}
+		for _, ln := range shown {
+			b.WriteString("\n  ")
+			b.WriteString(think.Render(ln))
+		}
+		return
+	}
 	if !c.thinkExpanded {
 		b.WriteString(think.Render("thinking · ") + body.Render(countLines(lines)+" lines"))
 		return

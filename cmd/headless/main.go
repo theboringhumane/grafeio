@@ -56,6 +56,9 @@ func main() {
 	var mu sync.Mutex
 	ticks := 0
 	var answerPID string // first PENDING permission id seen, under mu
+	// Per-CallID thought counters make a STREAMING thought obvious: the same
+	// CallID reappears with a growing (accum N chars) figure until done=true.
+	thoughtCounts := make(map[string]int)
 	emit := func(e state.Event) {
 		// --answer: capture the first pending permission id now; the actual
 		// backend call happens OUTSIDE the emit lock (demo emits
@@ -72,6 +75,14 @@ func main() {
 			if ticks%10 == 1 {
 				fmt.Printf("[tick] #%d\n", ticks)
 			}
+			mu.Unlock()
+			return
+		}
+		if e.Kind == state.EvThought {
+			thoughtCounts[e.CallID]++
+			n := thoughtCounts[e.CallID]
+			fmt.Printf("[thought#%d (accum %d chars) %s done=%v %q] call=%s\n",
+				n, len([]rune(e.Text)), e.EmployeeName, e.Done, tail(e.Text, 60), e.CallID)
 			mu.Unlock()
 			return
 		}
@@ -131,6 +142,16 @@ func trunc(s string, max int) string {
 	return s
 }
 
+// tail returns the LAST max runes of s — for streaming thoughts the tail is
+// where the growth shows.
+func tail(s string, max int) string {
+	r := []rune(s)
+	if len(r) > max {
+		return "..." + string(r[len(r)-max:])
+	}
+	return s
+}
+
 func printEvent(e state.Event) {
 	switch e.Kind {
 	case state.EvStatus:
@@ -159,8 +180,6 @@ func printEvent(e state.Event) {
 		fmt.Printf("[chat-boss] %s pending=%v %q\n", e.Msg.ID, e.Msg.Pending, trunc(e.Msg.Text, 120))
 	case state.EvBubble:
 		fmt.Printf("[bubble] %s %q\n", e.EmployeeID, e.Text)
-	case state.EvThought:
-		fmt.Printf("[thought] %s done=%v %q\n", e.EmployeeName, e.Done, trunc(e.Text, 120))
 	case state.EvTool:
 		fmt.Printf("[tool] %s %s %s %q\n", e.EmployeeName, e.ToolName, e.ToolState, trunc(e.ToolSummary, 80))
 	case state.EvPermission:

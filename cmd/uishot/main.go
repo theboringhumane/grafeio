@@ -15,6 +15,13 @@
 //	                    [--diffs]   (expands all diff entries via ctrl+d)
 //	                    [--debug]   (queue flush proof: resolves the pending boss,
 //	                                prints [queue] trace lines, longer window)
+//	                    [--think]   (think-stream proof: one CallID streamed in
+//	                                accumulated updates, then collapsed after
+//	                                Done — prints BOTH frames: mid-stream at
+//	                                t=2.0s and collapsed at t=3.2s)
+//	                    [--think-stop mid|done] (with --think: print just ONE
+//	                                frame — mid = streaming, done = collapsed —
+//	                                for the gallery freeze shot)
 package main
 
 import (
@@ -123,6 +130,7 @@ type stubBackend struct {
 	done       chan struct{}
 	start      time.Time
 	flushQueue bool   // --debug: script resolves the round-2 pending boss
+	thinkMode  bool   // --think: script streams one think CallID instead
 	permAnswer string // recorded by AnswerPermission for the final print
 }
 
@@ -146,6 +154,10 @@ func (b *stubBackend) script() {
 			time.Sleep(d)
 		}
 		b.emit(ev)
+	}
+	if b.thinkMode {
+		b.scriptThink(at)
+		return
 	}
 
 	at(50, state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — stub backend online"})
@@ -228,6 +240,55 @@ func (b *stubBackend) script() {
 		at(3900, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("b3", "boss",
 			"Ship it — and keep typing, I'll keep up.", false)})
 	}
+}
+
+// scriptThink (--think) — the live think-transcript proof, everything in
+// the window's earlier half: one old block ALREADY Done (renders collapsed
+// in both frames), then one CallID streamed in 4 ACCUMULATED updates 600ms
+// apart, then the final Done update. Frame 1 (t=2.0s) catches update 3 of
+// 4 mid-stream (12 lines → "… 2 more above"); frame 2 (t=3.2s) shows both
+// blocks collapsed. Lines are kept ≤34 cells so chat-width wrapping stays
+// 1:1 with the source lines and the counts are deterministic.
+func (b *stubBackend) scriptThink(at func(ms int, ev state.Event)) {
+	thought := func(callID, text string, done bool) state.Event {
+		return state.Event{Kind: state.EvThought, EmployeeID: "boss",
+			EmployeeName: "boss", CallID: callID, Text: text, Done: done}
+	}
+	part1 := "goals first: weekly leaderboard.\n" +
+		"top 20, tie-break on streak."
+	part2 := part1 + "\n" +
+		"store stays local — sqlite only.\n" +
+		"boss peeks but never edits rows.\n" +
+		"window rolls monday at midnight.\n" +
+		"empty week shows last week's ghost."
+	part3 := part2 + "\n" +
+		"render: dim row tint, gold crown.\n" +
+		"rank one gets the mug sprite.\n" +
+		"long names clip at 18 cells.\n" +
+		"stale rows fade after 3 weeks.\n" +
+		"footer keeps the total count.\n" +
+		"no pagination — one screen."
+	part4 := part3 + "\n" +
+		"panic path: retry once, then hold.\n" +
+		"the boss asks before writes.\n" +
+		"tests pin the window rollover.\n" +
+		"ship friday with the mug.\n" +
+		"backlog: per-team leaderboards.\n" +
+		"keep the ghost rule — nice touch."
+
+	at(50, state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — think-stream stub online"})
+	at(150, state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
+		"sketch the leaderboard flow", false)})
+	at(200, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("b0", "boss", "", true)})
+	// an older, already-complete thought — collapsed in BOTH frames
+	at(350, thought("th-old",
+		"weekly beats daily — less noise.\nboss only sees the rollout row.", true))
+	// the live stream: 4 accumulated updates, ~600ms apart, one CallID
+	at(500, thought("th-1", part1, false))
+	at(1100, thought("th-1", part2, false))
+	at(1700, thought("th-1", part3, false))
+	at(2300, thought("th-1", part4, false))
+	at(2900, thought("th-1", part4, true)) // Done: final accumulated text
 }
 
 func (b *stubBackend) Mode() state.Mode { return state.ModeDemo }
@@ -317,6 +378,40 @@ func diffsWorkload(p *tea.Program) {
 	p.Send(tea.KeyPressMsg(tea.Key{Code: 'd', Mod: tea.ModCtrl}))
 }
 
+// runThinkShot runs one fresh app+program against a think-mode stub for
+// `dur`, then returns the final frame. Two calls with different durations
+// = the deterministic before/after pair (--think's frames).
+func runThinkShot(tab string, dur time.Duration) (string, error) {
+	backend := &stubBackend{done: make(chan struct{}), thinkMode: true}
+	m := app.New(backend)
+	if !m.SelectTab(tab) {
+		return "", fmt.Errorf("unknown tab %q", tab)
+	}
+	p := tea.NewProgram(m,
+		tea.WithWindowSize(shotCols, shotRows),
+		tea.WithoutRenderer(),
+		tea.WithInput(nil),
+		tea.WithOutput(io.Discard),
+	)
+	emit := func(ev state.Event) { p.Send(ev) }
+	if err := backend.Start(emit); err != nil {
+		return "", err
+	}
+	go func() {
+		time.Sleep(dur)
+		p.Quit()
+	}()
+	final, err := p.Run()
+	if err != nil {
+		return "", err
+	}
+	fm, ok := final.(app.Model)
+	if !ok {
+		return "", fmt.Errorf("unexpected final model type %T", final)
+	}
+	return fm.Frame(), nil
+}
+
 func main() {
 	tab := flag.String("tab", defaultTab, "active tab: chat|agents|board|mail|activity")
 	theme := flag.String("theme", "", "force a ui theme: "+strings.Join(chrome.ThemeNames(), "|"))
@@ -324,10 +419,12 @@ func main() {
 	perm := flag.Bool("perm", false, "auto-answer the boss permission prompt with 'once' at 3s (open → answered)")
 	diffs := flag.Bool("diffs", false, "press ctrl+d to expand all diff entries")
 	debug := flag.Bool("debug", false, "queue flush proof: resolves the pending boss so the queue drains; prints [queue] trace lines")
+	think := flag.Bool("think", false, "think-stream proof: one CallID streamed in accumulated updates, prints BOTH frames (t=2.0s mid-stream expanded, t=3.2s collapsed after Done)")
+	thinkStop := flag.String("think-stop", "", "with --think: print ONE frame only (mid = t=2.0s streaming, done = t=3.2s collapsed) for the gallery shot")
 	flag.Parse()
 
 	// keystroke workloads only reach the textarea / prompt on the chat tab
-	if (*slash || *perm || *diffs || *debug) && *tab == defaultTab {
+	if (*slash || *perm || *diffs || *debug || *think) && *tab == defaultTab {
 		*tab = "chat"
 	}
 
@@ -337,6 +434,42 @@ func main() {
 				strings.Join(chrome.ThemeNames(), ", "))
 			os.Exit(2)
 		}
+	}
+
+	if *think {
+		type stop struct {
+			at    time.Duration
+			label string
+		}
+		stops := []stop{
+			{2000 * time.Millisecond, "frame 1 — t=2.0s (mid-stream, EXPANDED)"},
+			{3200 * time.Millisecond, "frame 2 — t=3.2s (collapsed after Done)"},
+		}
+		switch *thinkStop {
+		case "mid":
+			stops = stops[:1]
+		case "done":
+			stops = stops[1:]
+		case "":
+		default:
+			fmt.Fprintf(os.Stderr, "uishot: --think-stop must be mid|done, got %q\n", *thinkStop)
+			os.Exit(2)
+		}
+		for _, s := range stops {
+			frame, err := runThinkShot(*tab, s.at)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "uishot: %v\n", err)
+				os.Exit(1)
+			}
+			if *thinkStop == "" {
+				fmt.Printf("===== UI SHOT · %s =====\n", s.label)
+			} else {
+				fmt.Println("===== UI SHOT =====")
+			}
+			fmt.Println(frame)
+			fmt.Println("===== UI SHOT =====")
+		}
+		return
 	}
 
 	if *debug {

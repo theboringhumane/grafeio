@@ -24,6 +24,12 @@
 //
 // Note: unlike the demo backend, this backend never emits EvTick — the app
 // owns the animation timer for live mode.
+//
+// Thought streaming: message.part.delta frames make EvThought events arrive
+// at token rate (tens per second). emitThought coalesces per CallID: at
+// most one emit every thoughtMinGapMs, keeping the LAST update in flight
+// and dropping intermediates (coalesce, never reorder). A Done=true always
+// flushes immediately so the block collapses on completion, not 150ms late.
 package backend
 
 import (
@@ -63,6 +69,7 @@ type liveBackend struct {
 	chatSeq       int
 	pendingBoss   []string
 	bossCompleted map[string]bool
+	thoughtSlots  map[string]*thoughtSlot // CallID -> coalescing slot (thought stream gate)
 	am            *amHandle
 	amTasks       map[string]string // id -> dedupe key
 	amMails       map[string]bool
@@ -77,6 +84,7 @@ func newLiveBackend(baseURL, directory string) *liveBackend {
 		fl:            newFlow(),
 		ctx:           newNormCtx(),
 		bossCompleted: make(map[string]bool),
+		thoughtSlots:  make(map[string]*thoughtSlot),
 		amTasks:       make(map[string]string),
 		amMails:       make(map[string]bool),
 		client:        &http.Client{Timeout: 15 * time.Second},
@@ -246,6 +254,9 @@ func (b *liveBackend) Stop() error {
 
 var urlRe = regexp.MustCompile(`https?://\S+`)
 var urlTrimRe = regexp.MustCompile(`[.,;)\]]+$`)
+
+// debugSSE toggles the raw SSE trace in streamOnce (GRAFEIO_DEBUG_SSE=1).
+var debugSSE = os.Getenv("GRAFEIO_DEBUG_SSE") != ""
 
 // spawnServe runs `opencode serve --port 0 --hostname 127.0.0.1` and
 // resolves with the listening URL scanned from stdout, or dies after 10s.
@@ -611,11 +622,113 @@ func (b *liveBackend) streamOnce() error {
 		if err := json.Unmarshal([]byte(payload), &raw); err != nil {
 			continue
 		}
+		if debugSSE {
+			// GRAFEIO_DEBUG_SSE=1: raw stream trace — event type plus, for
+			// part traffic, the part id/type/text length so reasoning
+			// streaming behaviour can be verified without a proxy.
+			note := raw.Type
+			var pp struct {
+				Part    ocPart `json:"part"`
+				PartID  string `json:"partID"`
+				Field   string `json:"field"`
+				Delta   string `json:"delta"`
+				Session string `json:"sessionID"`
+			}
+			if json.Unmarshal(raw.Properties, &pp) == nil {
+				switch {
+				case pp.Part.ID != "":
+					note += " part.id=" + pp.Part.ID + " part.type=" + pp.Part.Type +
+						" part.text.len=" + itoa(len([]rune(pp.Part.Text))) +
+						" part.time.end=" + itoa64(pp.Part.Time.End)
+				case pp.PartID != "":
+					note += " partID=" + pp.PartID + " field=" + pp.Field +
+						" delta.len=" + itoa(len([]rune(pp.Delta)))
+				}
+			}
+			fmt.Fprintf(os.Stderr, "[sse-raw] %s | %s\n", note, trimTo(payload, 400))
+		}
 		if err := b.onEvent(raw); err != nil {
 			b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] event handling failed (" + raw.Type + "): " + shortTitle(err.Error(), 100)})
 		}
 	}
 	return sc.Err()
+}
+
+// ---------------------------------------------------------------- thought gate
+
+// thoughtMinGapMs is the per-CallID EvThought emission floor: the UI gets
+// ~7 fps of transcript growth instead of every token.
+const thoughtMinGapMs = 150
+
+// thoughtSlot is the coalescing state for one thought's stream.
+type thoughtSlot struct {
+	pending *state.Event // latest coalesced update waiting for the gap
+	lastAt  int64        // ms of the last emitted update for this CallID
+	ticking bool         // a flush timer is already in flight
+}
+
+// emitThought gates EvThought bursts per CallID: emit now if the gap has
+// passed, otherwise stash the event as the slot's pending update (any older
+// pending is dropped — the LAST update always wins) and arm one trailing
+// flush. Done=true flushes immediately and retires the slot; order is never
+// violated because SSE frames for a part are strictly ordered and a pending
+// update is cleared when its successor ships.
+func (b *liveBackend) emitThought(e state.Event) {
+	if e.CallID == "" {
+		b.fl.emit(e)
+		return
+	}
+	now := nowMs()
+	b.mu.Lock()
+	slot := b.thoughtSlots[e.CallID]
+	if slot == nil {
+		slot = &thoughtSlot{}
+		b.thoughtSlots[e.CallID] = slot
+	}
+	if e.Done {
+		slot.pending = nil
+		slot.lastAt = now
+		delete(b.thoughtSlots, e.CallID)
+		b.mu.Unlock()
+		b.fl.emit(e)
+		return
+	}
+	if now-slot.lastAt >= thoughtMinGapMs {
+		slot.lastAt = now
+		b.mu.Unlock()
+		b.fl.emit(e)
+		return
+	}
+	pending := e
+	slot.pending = &pending
+	if slot.ticking {
+		b.mu.Unlock()
+		return
+	}
+	slot.ticking = true
+	wait := time.Duration(thoughtMinGapMs-(now-slot.lastAt)) * time.Millisecond
+	b.mu.Unlock()
+	b.fl.at(wait, func() { b.flushThought(e.CallID) })
+}
+
+// flushThought ships the coalesced trailing update for a CallID, if any.
+func (b *liveBackend) flushThought(callID string) {
+	b.mu.Lock()
+	slot := b.thoughtSlots[callID]
+	if slot == nil {
+		b.mu.Unlock()
+		return
+	}
+	slot.ticking = false
+	pending := slot.pending
+	slot.pending = nil
+	if pending != nil {
+		slot.lastAt = nowMs()
+	}
+	b.mu.Unlock()
+	if pending != nil {
+		b.fl.emit(*pending)
+	}
 }
 
 // onEvent normalizes via events.go, then runs the I/O-needing branches.
@@ -625,6 +738,10 @@ func (b *liveBackend) onEvent(raw ocSSEEvent) error {
 	events := mapOCEvent(raw, b.ctx, primaryID, nowMs())
 	b.mu.Unlock()
 	for _, e := range events {
+		if e.Kind == state.EvThought {
+			b.emitThought(e)
+			continue
+		}
 		b.fl.emit(e)
 	}
 
