@@ -36,11 +36,47 @@ const (
 	tickInterval = 180 * time.Millisecond
 	ambientEvery = 140 // ticks between ambient bubbles
 
-	// Message queue — Enter while a boss reply is pending enqueues; on the
-	// pending flush one message sends every queueFlushDelay until drained.
-	queueCap        = 10
-	queueFlushDelay = 400 * time.Millisecond
+	// Message queue — the INTELLIGENT BACKLOG: Enter while a boss reply is
+	// pending enqueues a numbered item; the turn-complete flush sends the
+	// whole backlog as ONE composed [BATCH DISPATCH] prompt (the boss runs
+	// manager dispatch discipline over it — trivial inline, parallel
+	// sub-agents for the rest). Exactly 1 item keeps the plain FIFO send.
+	queueCap = 10
+
+	// batchTitleClip — the QueueItemStart board title is the first 60 chars
+	// of the typed text (machine clip, not NL).
+	batchTitleClip = 60
+	// batchSummaryClip — per-item clip inside the composite user bubble
+	// ("you › 3 items: fix the badge; ship v2; …").
+	batchSummaryClip = 32
+	// batchRespawnWindow — a session.error on the primary inside this window
+	// of the batch send counts as "the boss died on the batch": ONE respawn.
+	batchRespawnWindow = 5 * time.Second
 )
+
+// batchMarker prefixes the ONE composed batch prompt. Machine format (the
+// app writes it, the backend echoes it verbatim) — the chat render rewrites
+// ANY chat-user echo carrying it into the compact composite bubble.
+const batchMarker = "[BATCH DISPATCH — "
+
+// teamBackend — the backlog/board seam live and demo backends expose beyond
+// state.Backend (the backend dev's contract; the app type-asserts it).
+// QueueItemStart mirrors one backlog item to the board and returns its id
+// ("" when the backend has no board seam — QueueItemDone("") is a no-op);
+// QueueItemDone closes the row when the batch's turn completes;
+// ResetPrimary(true) respawns a fresh boss session for the one-shot retry.
+type teamBackend interface {
+	QueueItemStart(index int, title string) string
+	QueueItemDone(boardID string)
+	ResetPrimary(forceNew bool) error
+}
+
+// queueEntry — one backlog item: the typed text plus the board row id
+// QueueItemStart handed back ("" when the backend has no team seam).
+type queueEntry struct {
+	text    string
+	boardID string
+}
 
 // QueueDebugf, when set (uisshot --debug only), receives message-queue
 // trace lines. Nil in production — the hot path checks before formatting.
@@ -78,9 +114,26 @@ type Model struct {
 	activity      *panels.Activity
 	keys          KeyMap
 
-	// Message queue (model-level so it survives tab switches): texts typed
-	// while a boss reply is pending, flushed one-per-400ms on completion.
-	queue []string
+	// Message backlog (model-level so it survives tab switches): texts typed
+	// while a boss reply is pending, each with its board row id.
+	queue []queueEntry
+
+	// Batch dispatch bookkeeping (set by dispatchQueued, consumed by the
+	// pending→non-pending completion transition):
+	//   batchInFlight  — a composed batch is awaiting its turn
+	//   batchRespawned — the ONE respawn for the in-flight batch is spent
+	//   batchItems     — retained for the ≤5s session.error respawn
+	//   batchDoneIDs   — board rows closed by QueueItemDone on completion
+	//   batchSummaries — item texts for the composite user-bubble rewrite
+	//   batchSentAt    — send time, bounds the session.error window
+	//   respawns       — global respawn count for this session run
+	batchInFlight  bool
+	batchRespawned bool
+	batchItems     []queueEntry
+	batchDoneIDs   map[string]bool
+	batchSummaries []string
+	batchSentAt    time.Time
+	respawns       int
 
 	// Permission prompts (boss/primary session only): perm is the OPEN
 	// prompt replacing the textarea; permEscd is the latest esc'd-but-
@@ -131,6 +184,16 @@ type chatSentMsg struct{ text string }
 
 // sendErrMsg fires when the backend rejects a prompt.
 type sendErrMsg struct{ err error }
+
+// queueSendErrMsg fires when a backlog flush send (batch or single) is
+// rejected. batch + !retry gets ONE respawn (ResetPrimary + resend the same
+// composed batch); retry=true (or single) just surfaces the error.
+type queueSendErrMsg struct {
+	err   error
+	items []queueEntry
+	batch bool
+	retry bool
+}
 
 // slashMsg fires when the chat input starts with "/" — local command, never
 // sent to the backend.
@@ -251,19 +314,46 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			Kind: state.EvStatus,
 			Text: fmt.Sprintf("[grafeio] send failed: %v", msg.err),
 		}))
+	case queueSendErrMsg:
+		// FAILURE RESPAWN — one per flush call: the boss session died at
+		// Send; reset the primary and resend the SAME composed batch on the
+		// fresh session. A retry failure just surfaces the error.
+		if msg.batch && !msg.retry && !m.batchRespawned {
+			if _, ok := m.team(); ok {
+				m.batchRespawned = true
+				m.batchSentAt = time.Now()
+				m.respawns++
+				m.notice("boss went down — respawned a fresh session, resending batch")
+				qdebugf("batch send failed (%v) — respawning (respawn #%d)", msg.err, m.respawns)
+				cmds = append(cmds, m.resendBatchCmd(msg.items))
+				break
+			}
+		}
+		cmds = append(cmds, m.applyEvent(state.Event{
+			Kind: state.EvStatus,
+			Text: fmt.Sprintf("[grafeio] send failed: %v", msg.err),
+		}))
 	case slashMsg:
 		if cmd := m.applySlash(msg.text); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
 	case enqueueMsg:
 		if len(m.queue) >= queueCap {
-			m.noticeErr(fmt.Sprintf("queue full (%d) — wait for the boss to catch up, or /queue clear", queueCap))
+			m.noticeErr(fmt.Sprintf("backlog full (%d) — wait for the boss to catch up, or /queue clear", queueCap))
 		} else {
-			m.queue = append(m.queue, msg.text)
+			n := len(m.queue) + 1
+			ent := queueEntry{text: msg.text}
+			if tb, ok := m.team(); ok {
+				// board row for the backlog item: title is the machine
+				// first-N-chars clip of the typed text.
+				ent.boardID = tb.QueueItemStart(n, clipRunes(msg.text, batchTitleClip))
+			}
+			m.queue = append(m.queue, ent)
 			if m.chat != nil {
 				m.chat.SetQueueLen(len(m.queue))
 			}
-			qdebugf("enqueued %q (n=%d)", msg.text, len(m.queue))
+			qdebugf("enqueued %q as item #%d (board=%q, n=%d)", msg.text, n, ent.boardID, len(m.queue))
+			m.notice(fmt.Sprintf("queued as item #%d — flushes as a batch when the boss frees up", n))
 		}
 	case queueFlushMsg:
 		if len(m.queue) > 0 {
@@ -425,6 +515,26 @@ func (m *Model) applyEvent(ev state.Event) tea.Cmd {
 		}
 	}
 
+	// The backend echoes the composed batch prompt verbatim as chat-user;
+	// the member sees ONE compact composite bubble instead of the raw
+	// dispatch text ("you › 3 items: fix the badge; ship v2; …").
+	if ev.Kind == state.EvChatUser && strings.HasPrefix(ev.Msg.Text, batchMarker) &&
+		len(m.batchSummaries) > 0 {
+		titles := make([]string, len(m.batchSummaries))
+		for i, t := range m.batchSummaries {
+			titles[i] = clipRunes(t, batchSummaryClip)
+		}
+		ev.Msg.Text = fmt.Sprintf("%d items: %s", len(titles), strings.Join(titles, "; "))
+	}
+
+	// session.error on the primary within the window of a batch send = the
+	// boss died mid-batch: arm the ONE respawn (consumed at the completion
+	// transition below, where a naive close would otherwise fire).
+	respawn := ev.Kind == state.EvChatBoss &&
+		strings.HasPrefix(ev.Msg.ID, "boss-error-") &&
+		m.batchInFlight && !m.batchRespawned &&
+		!m.batchSentAt.IsZero() && time.Since(m.batchSentAt) <= batchRespawnWindow
+
 	prevPending := hasPendingBoss(m.st)
 	m.st = reducer(m.st, ev)
 	if m.chat != nil {
@@ -466,41 +576,157 @@ func (m *Model) applyEvent(ev state.Event) tea.Cmd {
 	}
 	// While a question hold is outstanding the turn is PARKED at the
 	// question reply API — not completed — so the queue must NOT flush.
-	if prevPending && !hasPendingBoss(m.st) && len(m.queue) > 0 && !m.questionParked {
-		// the boss reply landed: flush the queue, one message per 400ms
-		return m.flushQueued()
+	if prevPending && !hasPendingBoss(m.st) && !m.questionParked {
+		// the boss reply landed (or errored out) — turn completed
+		if respawn {
+			// session.error inside the window: fresh session + the SAME
+			// batch, once. The rows stay open for the retry's turn.
+			m.batchRespawned = true
+			m.batchSentAt = time.Now()
+			m.respawns++
+			items := append([]queueEntry(nil), m.batchItems...)
+			m.notice("boss went down — respawned a fresh session, resending batch")
+			qdebugf("session.error inside batch window — respawning (respawn #%d, items=%d)", m.respawns, len(items))
+			return m.resendBatchCmd(items)
+		}
+		// v1: the FIRST completed turn after a batch send closes every
+		// board row of the batch — per-item close-outs over multi-turn
+		// batches (the boss answering items one turn at a time) are a
+		// later wave; good enough now.
+		if len(m.batchDoneIDs) > 0 {
+			if tb, ok := m.team(); ok {
+				for id := range m.batchDoneIDs {
+					tb.QueueItemDone(id)
+				}
+				qdebugf("batch turn completed: %d board row(s) done", len(m.batchDoneIDs))
+			}
+			m.batchDoneIDs = nil
+			m.batchInFlight = false
+		}
+		if len(m.queue) > 0 {
+			// the boss is free: flush the backlog (ONE batch when >1)
+			return m.flushQueued()
+		}
 	}
 	return nil
 }
 
-// flushQueued pops the oldest queued text, sends it down the SAME path as
-// the chat panel (slash-guard + backend.Send + chatSentMsg), and arms the
-// next 400ms flush tick while the queue stays non-empty.
+// team type-asserts the optional teamBackend seam (live/demo backends).
+func (m *Model) team() (teamBackend, bool) {
+	if m.backend == nil {
+		return nil, false
+	}
+	tb, ok := m.backend.(teamBackend)
+	return tb, ok
+}
+
+// composeBatch builds the ONE batch-dispatch prompt the boss session
+// decomposes per its manager discipline: numbered independent work items,
+// parallel sub-agents for the non-trivial ones, a closing status table.
+func composeBatch(items []queueEntry) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "[BATCH DISPATCH — %d requests arrived while you were busy. "+
+		"Treat each as an independent numbered work item: do trivial ones inline; "+
+		"for non-trivial independent items DISPATCH PARALLEL SUB-AGENTS per your "+
+		"manager discipline; then finalize with a one-line-per-item status table.]\n",
+		len(items))
+	for i, it := range items {
+		fmt.Fprintf(&sb, "%d. %s\n", i+1, it.text)
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+// flushQueued drains the backlog: the intelligent flush after a turn
+// completes (or a parked question unblocks).
 func (m *Model) flushQueued() tea.Cmd {
+	return m.dispatchQueued(false)
+}
+
+// dispatchQueued sends the backlog as ONE composed [BATCH DISPATCH] prompt
+// when >1 items are queued; exactly 1 item keeps the plain FIFO send path.
+// manual=true is /route — force the send NOW, bypassing the busy gate.
+// Slash inputs never reach the queue (the chat panel dispatches them
+// immediately) — the single-item slash guard stays defensive.
+func (m *Model) dispatchQueued(manual bool) tea.Cmd {
 	if len(m.queue) == 0 {
 		return nil
 	}
-	text := m.queue[0]
-	m.queue = m.queue[1:]
+	items := m.queue
+	m.queue = nil
 	if m.chat != nil {
-		m.chat.SetQueueLen(len(m.queue))
+		m.chat.SetQueueLen(0)
 	}
-	qdebugf("flush %q (remaining=%d)", text, len(m.queue))
+	if manual {
+		if len(items) > 1 {
+			m.notice(fmt.Sprintf("routed manually — batch dispatching %d queued items now", len(items)))
+		} else {
+			m.notice("routed manually — sending now")
+		}
+	}
+	texts := make([]string, len(items))
+	var boardIDs []string
+	for i, it := range items {
+		texts[i] = it.text
+		if it.boardID != "" {
+			boardIDs = append(boardIDs, it.boardID)
+		}
+	}
+	sendText := texts[0]
+	batch := len(texts) > 1
+	if batch {
+		sendText = composeBatch(items)
+		qdebugf("flush: batch dispatching %d items as ONE send", len(texts))
+	} else {
+		qdebugf("flush %q (plain send, single item)", texts[0])
+	}
+	m.batchItems = items
+	m.batchSummaries = texts
+	if batch {
+		m.batchInFlight = true
+		m.batchRespawned = false
+		m.batchSentAt = time.Now()
+		if len(boardIDs) > 0 {
+			m.batchDoneIDs = map[string]bool{}
+			for _, id := range boardIDs {
+				m.batchDoneIDs[id] = true
+			}
+		}
+	}
 	b := m.backend
 	send := func() tea.Msg {
-		if strings.HasPrefix(text, "/") {
-			return slashMsg{text: text}
+		if !batch && strings.HasPrefix(texts[0], "/") {
+			return slashMsg{text: texts[0]}
+		}
+		if b != nil {
+			if err := b.Send(sendText); err != nil {
+				return queueSendErrMsg{err: err, items: items, batch: batch, retry: false}
+			}
+		}
+		return chatSentMsg{text: sendText}
+	}
+	return send
+}
+
+// resendBatchCmd — the ONE failure respawn: ResetPrimary(true) then resend
+// the SAME composed batch on the fresh session. Errors come back with
+// retry=true so the loop can never respawn twice for one flush call.
+func (m *Model) resendBatchCmd(items []queueEntry) tea.Cmd {
+	text := composeBatch(items)
+	b := m.backend
+	tb, _ := m.team()
+	return func() tea.Msg {
+		if tb != nil {
+			if err := tb.ResetPrimary(true); err != nil {
+				return queueSendErrMsg{err: fmt.Errorf("respawn: %w", err), batch: true, retry: true}
+			}
 		}
 		if b != nil {
 			if err := b.Send(text); err != nil {
-				return sendErrMsg{err: err}
+				return queueSendErrMsg{err: err, items: items, batch: true, retry: true}
 			}
 		}
 		return chatSentMsg{text: text}
 	}
-	return tea.Batch(send, tea.Tick(queueFlushDelay, func(time.Time) tea.Msg {
-		return queueFlushMsg{}
-	}))
 }
 
 // handlePermissionEvent opens/closes the boss permission prompt. Boss/primary
@@ -1112,8 +1338,9 @@ const slashHelp = `commands:
   /thinking on|off   show/hide thinking blocks
   /tools on|off      show/hide tool one-liners
   /diffs on|off      expand/collapse file diffs (ctrl+d toggles)
-  /queue             show enqueued messages
-  /queue clear       drop all enqueued messages
+  /queue             show the backlog (numbered items batched on flush)
+  /queue clear       drop all queued backlog items
+  /route             force-dispatch the backlog now (bypasses the busy gate)
   /perm              re-open an esc'd permission prompt
   /question          re-open a deferred boss question
   /status            office status
@@ -1170,22 +1397,39 @@ func (m *Model) applySlash(input string) tea.Cmd {
 				if m.chat != nil {
 					m.chat.SetQueueLen(0)
 				}
-				m.notice("queue cleared")
+				m.notice("backlog cleared")
 			} else {
 				m.noticeErr("/queue: usage /queue | /queue clear")
 			}
 			return nil
 		}
 		if len(m.queue) == 0 {
-			m.notice("queue empty — type while the boss is typing to enqueue")
+			m.notice("backlog empty — type while the boss is typing to queue an item")
 			return nil
 		}
 		var sb strings.Builder
-		fmt.Fprintf(&sb, "queue (%d/%d):", len(m.queue), queueCap)
-		for i, t := range m.queue {
-			fmt.Fprintf(&sb, "\n  %d. %s", i+1, t)
+		if len(m.queue) > 1 {
+			fmt.Fprintf(&sb, "%d queued (will batch-dispatch on flush):", len(m.queue))
+		} else {
+			fmt.Fprintf(&sb, "1 queued (sends on flush):")
+		}
+		for i, e := range m.queue {
+			fmt.Fprintf(&sb, "\n  %d. %s", i+1, e.text)
 		}
 		m.notice(sb.String())
+	case "/route":
+		// force the backlog out NOW, bypassing the busy gate. A parked
+		// question hold stays blocking — a chat Send is what deadlocks the
+		// parked loop (the answer must go through AnswerQuestion first).
+		if m.questionParked || m.question != nil || m.questionEscd != nil {
+			m.notice("/route: boss is waiting on your answer — answer the question first (/question)")
+			return nil
+		}
+		if len(m.queue) == 0 {
+			m.notice("nothing queued — type while the boss is typing to enqueue")
+			return nil
+		}
+		return m.dispatchQueued(true)
 	case "/perm":
 		if m.permEscd == nil {
 			m.notice("no pending permission (/perm re-opens an esc'd prompt)")

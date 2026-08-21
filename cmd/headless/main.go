@@ -14,6 +14,16 @@
 //	                            distinct and operation-appropriate. Prints
 //	                            "STALE-REPRO: FIXED" (exit 0) when all checks
 //	                            pass, "STALE-REPRO: BUG" (exit 1) otherwise.
+//	grafeio-headless --batch-probe
+//	                            queue-flush contract probe (forces live):
+//	                            mirrors TWO queue items onto the agentmemory
+//	                            board via the QueueItemStart seam, sends ONE
+//	                            composed batch prompt like the app would,
+//	                            waits up to 60s for the completed boss reply,
+//	                            asserts the reply covers BOTH queued items,
+//	                            then marks the board actions done. Prints
+//	                            BATCH-PHASE lines + "BATCH-PROBE: OK" (exit 0)
+//	                            or "BATCH-PROBE: FAIL" (exit 1).
 //	grafeio-headless --answer   after the first permission event prints,
 //	                            call backend.AnswerPermission(pid, "once") and
 //	                            print the result (demo: clears tekton-1's block)
@@ -55,6 +65,7 @@ func main() {
 	prompt2 := flag.String("prompt2", "", "live mode: after prompt completes, send this second prompt and run the stale-reply assertions (prints STALE-REPRO: FIXED|BUG)")
 	answer := flag.Bool("answer", false, "auto-answer the first permission prompt with \"once\" and print the result")
 	ask := flag.Bool("ask", false, "live mode: question-loop probe — send the question-tool prompt, AnswerQuestion the first pending question after 2s, assert resolution (15s budget, QUESTION-LOOP: FIXED|STUCK)")
+	batchProbe := flag.Bool("batch-probe", false, "live mode: queue-flush batch probe — board-mirror 2 queue items, send one composed batch, assert the boss covers both (BATCH-PROBE: OK|FAIL)")
 	flag.Parse()
 
 	if *prompt2 != "" && *prompt == "" {
@@ -65,7 +76,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "--ask is a standalone probe: do not combine with --prompt/--prompt2")
 		os.Exit(2)
 	}
-	if *ask {
+	if *batchProbe && (*prompt != "" || *prompt2 != "" || *ask) {
+		fmt.Fprintln(os.Stderr, "--batch-probe is a standalone probe: do not combine with --prompt/--prompt2/--ask")
+		os.Exit(2)
+	}
+	if *ask || *batchProbe {
 		*live = true
 		*demo = false
 	}
@@ -212,6 +227,73 @@ func main() {
 	fmt.Printf("[mode] %s\n", b.Mode())
 	if err := b.Start(emit); err != nil {
 		fail("start", err)
+	}
+
+	// --batch-probe: queue-flush contract probe. Mirror the (hardcoded)
+	// queue onto the agentmemory board via the QueueItemStart/Done seam the
+	// app type-asserts, send ONE composed batch exactly like the app's
+	// flush does, wait up to 60s for the completed boss reply, and assert
+	// the reply covers BOTH queued items.
+	if *batchProbe {
+		qb, _ := b.(queueBoard)
+		items := []string{
+			"Answer this quiz line: which planet is known as the Red Planet? (answer: Mars)",
+			"Answer this quiz line: which metal element has the symbol W? (answer: Tungsten)",
+		}
+		boardIDs := make([]string, len(items))
+		for i, title := range items {
+			if qb != nil {
+				boardIDs[i] = qb.QueueItemStart(i+1, title)
+			}
+			fmt.Printf("BATCH-PHASE queue  QUE-%d %q board=%q\n", i+1, title, boardIDs[i])
+		}
+		// The composed batch literal, in the shape the app's queue-flush
+		// composes: one header naming the count, one line per QUE item.
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "[grafeio office] QUEUE FLUSH: %d queued items arrived together. Work ALL %d items in this one turn, then reply confirming EACH item by its QUE id and short answer.\n", len(items), len(items))
+		for i, title := range items {
+			fmt.Fprintf(&sb, "QUE-%d: %s\n", i+1, title)
+		}
+		fmt.Printf("BATCH-PHASE compose\n%s", sb.String())
+		fmt.Println("BATCH-PHASE send")
+		if err := b.Send(sb.String()); err != nil {
+			fail("send", err)
+		}
+		fmt.Println("BATCH-PHASE awaiting-boss (60s budget)")
+		turn := collectTurn(bossCh, 60*time.Second)
+		fmt.Printf("BATCH-PHASE boss-replies %d completed bubble(s)\n", len(turn))
+		for i, t := range turn {
+			fmt.Printf("[assert]   #%d %q\n", i+1, trunc(t, 200))
+		}
+		joined := strings.ToLower(strings.Join(turn, "\n"))
+		failures := 0
+		check := func(ok bool, label string) {
+			if ok {
+				fmt.Printf("[assert] PASS %s\n", label)
+			} else {
+				failures++
+				fmt.Printf("[assert] FAIL %s\n", label)
+			}
+		}
+		check(len(turn) > 0, "boss produced a completed reply inside the budget")
+		check(strings.Contains(joined, "mars"), "boss reply covers QUE-1 (Mars)")
+		check(strings.Contains(joined, "tungsten"), "boss reply covers QUE-2 (Tungsten)")
+		for i, id := range boardIDs {
+			if qb != nil && id != "" {
+				qb.QueueItemDone(id)
+				fmt.Printf("BATCH-PHASE board-done QUE-%d %s\n", i+1, id)
+			}
+		}
+		if err := b.Stop(); err != nil {
+			fail("stop", err)
+		}
+		fmt.Println("[done] backend stopped")
+		if failures == 0 {
+			fmt.Println("BATCH-PROBE: OK")
+			return
+		}
+		fmt.Printf("BATCH-PROBE: FAIL (%d check(s) failed)\n", failures)
+		os.Exit(1)
 	}
 
 	// --ask: question-loop regression probe. Send the question-tool prompt,
@@ -407,6 +489,14 @@ func staleReproChecks(turn1, turn2 []string) int {
 	}
 	check(!dups, "(4) no chat-boss body is byte-identical to an earlier one")
 	return failures
+}
+
+// queueBoard is the board-mirror seam backends expose OUTSIDE
+// state.Backend (the app headlessly type-asserts it): one pending
+// agentmemory action per queued office item, marked done on completion.
+type queueBoard interface {
+	QueueItemStart(index int, title string) string
+	QueueItemDone(boardID string)
 }
 
 func fail(stage string, err error) {

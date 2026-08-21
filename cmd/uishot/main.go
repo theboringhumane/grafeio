@@ -46,6 +46,17 @@
 //	                                hold is outstanding ENQUEUES; flush fires
 //	                                only after resolved + completed boss reply —
 //	                                ordering trace prints it)
+//	                    [--batch]    (intelligent-backlog proof: boss busy ~3s
+//	                                while three messages enqueue as backlog
+//	                                #1 #2 #3; the turn-complete flush must be
+//	                                ONE composed [BATCH DISPATCH] send. Prints
+//	                                the frame, the composed batch text, the
+//	                                stub Send/QueueItemStart/Done logs and the
+//	                                ordering trace)
+//	                    [--batch-respawn] (failure-respawn proof: the stub
+//	                                rejects the first batch Send — the app
+//	                                must ResetPrimary(true) and resend the
+//	                                SAME batch once; second send succeeds)
 package main
 
 import (
@@ -162,6 +173,12 @@ type stubBackend struct {
 	sendSeq    int               // unique reply IDs per Send (replace-by-ID safety)
 	answerLog  []string          // recorded by AnswerQuestion/RejectQuestion (the capture proof)
 	trace      func(line string) // --stream/--ask-*: ordering-trace sink
+
+	batchMode       bool     // --batch/--batch-respawn: backlog-batch proof script
+	respawnMode     bool     // --batch-respawn: reject the first batch Send once
+	batchFailedOnce bool     // the one-shot rejection sentinel
+	sendLog         []string // every Send call, verbatim (the proof)
+	teamLog         []string // QueueItemStart/Done + ResetPrimary calls (the proof)
 }
 
 func mail(id, from, to, subject, body string, kind state.MailKind) state.MailItem {
@@ -195,6 +212,10 @@ func (b *stubBackend) script() {
 	}
 	if b.askMode != "" {
 		b.scriptAsk(at)
+		return
+	}
+	if b.batchMode {
+		b.scriptBatch(at)
 		return
 	}
 
@@ -414,11 +435,60 @@ func (b *stubBackend) scriptStream(at func(ms int, ev state.Event)) {
 	trace("[stream] done: bossmsg-m1 → pending=false")
 }
 
+// scriptBatch (--batch / --batch-respawn) — the intelligent-backlog proof:
+// the boss is busy from 200ms to 3000ms; the workload types three messages
+// into the backlog in that window (#1 #2 #3); the turn-complete flush at
+// ~3s must go out as ONE composed [BATCH DISPATCH] send.
+func (b *stubBackend) scriptBatch(at func(ms int, ev state.Event)) {
+	at(50, state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — backlog-batch stub online"})
+	at(150, state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
+		"start the standup notes", false)})
+	at(200, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-1", "boss", "", true)})
+	// busy until ~3s — everything the workload types ENQUEUES in this window
+	at(3000, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("b1", "boss",
+		"standup notes are in drafts — checking the backlog.", false)})
+}
+
 // Send answers any interactive prompt deterministically (600ms ack). Reply
 // IDs are UNIQUE per call ("bx-N") — with replace-by-ID in the reducer, a
 // recycled ID would collapse consecutive flushed replies into one bubble.
+// batchMode adds the backlog seam: the composed batch echoes as chat-user
+// (proving the composite bubble) and stages the typing placeholder like the
+// real backends — the pending→non-pending transition closes the board
+// rows. respawnMode rejects the FIRST [BATCH DISPATCH] send once (a dead
+// boss session), so the app must ResetPrimary + resend the same batch.
 func (b *stubBackend) Send(text string) error {
+	clip := text
+	if r := []rune(clip); len(r) > 60 {
+		clip = string(r[:59]) + "…"
+	}
+	b.sendLog = append(b.sendLog, text)
+	if b.trace != nil {
+		b.trace("[stub] Send(" + clip + ")")
+	}
+	if b.respawnMode && !b.batchFailedOnce && strings.HasPrefix(text, "[BATCH DISPATCH") {
+		b.batchFailedOnce = true
+		if b.trace != nil {
+			b.trace("[stub] Send REJECTED — stubbed dead boss session (one-shot)")
+		}
+		return fmt.Errorf("stub: boss session dead")
+	}
 	if b.emit != nil {
+		if b.batchMode {
+			b.sendSeq++
+			seq := b.sendSeq
+			emit := b.emit
+			emit(state.Event{Kind: state.EvChatUser, Msg: chatMsg(
+				fmt.Sprintf("ue-%d", seq), "user", text, false)})
+			emit(state.Event{Kind: state.EvChatBoss, Msg: chatMsg(
+				fmt.Sprintf("boss-batch-%d", seq), "boss", "", true)})
+			time.AfterFunc(600*time.Millisecond, func() {
+				emit(state.Event{Kind: state.EvChatBoss, Msg: chatMsg(
+					fmt.Sprintf("bx-%d", seq), "boss",
+					"backlog dispatched: 3 items split across the floor — status table on their return.", false)})
+			})
+			return nil
+		}
 		b.sendSeq++
 		id := fmt.Sprintf("bx-%d", b.sendSeq)
 		reply := "Roger that."
@@ -429,6 +499,39 @@ func (b *stubBackend) Send(text string) error {
 			b.emit(state.Event{Kind: state.EvChatBoss,
 				Msg: chatMsg(id, "boss", reply, false)})
 		})
+	}
+	return nil
+}
+
+// --- teamBackend seam (the backlog board) ----------------------------------
+// Log-only twins of the live/demo contract: the frame's proof is the
+// printed call log, not an emitted board (board tabs are staged separately).
+
+// QueueItemStart mirrors one backlog item: logs the call, returns the
+// deterministic "demo-N" board row id.
+func (b *stubBackend) QueueItemStart(index int, title string) string {
+	id := fmt.Sprintf("demo-%d", index)
+	b.teamLog = append(b.teamLog, fmt.Sprintf("QueueItemStart(%d, %q) -> %s", index, title, id))
+	if b.trace != nil {
+		b.trace(fmt.Sprintf("[team] QueueItemStart(%d, %q) -> %s", index, title, id))
+	}
+	return id
+}
+
+// QueueItemDone closes the board row when the batch's turn completes.
+func (b *stubBackend) QueueItemDone(boardID string) {
+	b.teamLog = append(b.teamLog, fmt.Sprintf("QueueItemDone(%s)", boardID))
+	if b.trace != nil {
+		b.trace("[team] QueueItemDone(" + boardID + ")")
+	}
+}
+
+// ResetPrimary is the failure-respawn hook: logs the respawn of the boss
+// session (the retry resends the SAME batch right after).
+func (b *stubBackend) ResetPrimary(forceNew bool) error {
+	b.teamLog = append(b.teamLog, fmt.Sprintf("ResetPrimary(%v)", forceNew))
+	if b.trace != nil {
+		b.trace(fmt.Sprintf("[team] ResetPrimary(%v)", forceNew))
 	}
 	return nil
 }
@@ -651,6 +754,25 @@ func streamWorkload(p *tea.Program) {
 	typeLine("how do bees make it")
 }
 
+// batchWorkload (--batch / --batch-respawn): three messages typed while
+// the boss turn is pending (200–3000ms) — each ENQUEUES as a numbered
+// backlog item; the flush at the turn-complete sends them as ONE batch.
+func batchWorkload(p *tea.Program) {
+	typeLine := func(s string) {
+		for _, r := range s {
+			p.Send(tea.KeyPressMsg(tea.Key{Code: r, Text: string(r)}))
+			time.Sleep(8 * time.Millisecond)
+		}
+		p.Send(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	}
+	time.Sleep(700 * time.Millisecond)
+	typeLine("fix the badge")
+	time.Sleep(400 * time.Millisecond)
+	typeLine("ship v2")
+	time.Sleep(400 * time.Millisecond)
+	typeLine("write the release notes")
+}
+
 // traceLog collects timestamped ordering lines for the --stream proof
 // (enqueue / done / flush), written from the script goroutine, the tea
 // update loop (via app.QueueDebugf) and the shot runner.
@@ -759,6 +881,50 @@ func runAskShot(mode string, dur time.Duration) (string, []string, []string, err
 	return fm.Frame(), lines, backend.answerLog, nil
 }
 
+// runBatchShot runs one fresh app+program against the backlog stub and
+// returns the frame, ordering trace, verbatim Send calls and team-seam
+// calls. respawn=true stubs the first batch Send dead (the respawn proof).
+func runBatchShot(respawn bool, dur time.Duration) (string, []string, []string, []string, error) {
+	tl := &traceLog{start: time.Now()}
+	backend := &stubBackend{done: make(chan struct{}),
+		batchMode: true, respawnMode: respawn, trace: tl.add}
+	m := app.New(backend)
+	if !m.SelectTab("chat") {
+		return "", nil, nil, nil, fmt.Errorf("unknown tab %q", "chat")
+	}
+	p := tea.NewProgram(m,
+		tea.WithWindowSize(shotCols, shotRows),
+		tea.WithoutRenderer(),
+		tea.WithInput(nil),
+		tea.WithOutput(io.Discard),
+	)
+	app.QueueDebugf = func(format string, args ...any) {
+		tl.add("[queue] " + fmt.Sprintf(format, args...))
+	}
+	emit := func(ev state.Event) { p.Send(ev) }
+	if err := backend.Start(emit); err != nil {
+		return "", nil, nil, nil, err
+	}
+	go batchWorkload(p)
+	go func() {
+		time.Sleep(dur)
+		p.Quit()
+	}()
+	final, err := p.Run()
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+	fm, ok := final.(app.Model)
+	if !ok {
+		return "", nil, nil, nil, fmt.Errorf("unexpected final model type %T", final)
+	}
+	app.QueueDebugf = nil
+	tl.mu.Lock()
+	lines := append([]string(nil), tl.lines...)
+	tl.mu.Unlock()
+	return fm.Frame(), lines, backend.sendLog, backend.teamLog, nil
+}
+
 // printAskCapture prints the stub's captured AnswerQuestion/RejectQuestion
 // calls and FAILS the run when the expected capture is missing (the
 // deadlock regression: the answer must never fall through to Send).
@@ -793,6 +959,8 @@ func main() {
 	askAnswer := flag.Bool("ask-answer", false, "question-hold proof: boss EvQuestion opens the answer modal (typing placeholder removed, park status line); typing + enter routes through AnswerQuestion — prints BOTH frames (modal open / after answered) + the stub capture log")
 	askEsc := flag.Bool("ask-esc", false, "question-hold proof: esc defers the modal (notice), /question re-opens it, the answer still routes through AnswerQuestion")
 	askQueue := flag.Bool("ask-queue", false, "queue-hold proof: a message typed while the question hold is outstanding must ENQUEUE; AnswerQuestion → resolved → completed boss reply → flush, ordering trace printed")
+	batch := flag.Bool("batch", false, "intelligent-backlog proof: three messages enqueue while the boss is busy; the flush is ONE composed [BATCH DISPATCH] send (frame + batch text + stub logs + trace)")
+	batchRespawn := flag.Bool("batch-respawn", false, "failure-respawn proof: the first batch Send is rejected once — the app must ResetPrimary(true) and resend the SAME batch exactly once")
 	flag.Parse()
 
 	// keystroke workloads only reach the textarea / modal on the chat tab
@@ -806,6 +974,74 @@ func main() {
 				strings.Join(chrome.ThemeNames(), ", "))
 			os.Exit(2)
 		}
+	}
+
+	if *batch || *batchRespawn {
+		frame, trace, sends, team, err := runBatchShot(*batchRespawn, 5600*time.Millisecond)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "uishot: %v\n", err)
+			os.Exit(1)
+		}
+		label := "--batch (flush = ONE composed batch send)"
+		if *batchRespawn {
+			label = "--batch-respawn (first Send rejected → ResetPrimary + resend once)"
+		}
+		fmt.Printf("===== UI SHOT · %s =====\n", label)
+		fmt.Println(frame)
+		fmt.Println("===== UI SHOT =====")
+		fmt.Println("--- ordering trace ---")
+		for _, ln := range trace {
+			fmt.Println(ln)
+		}
+		fmt.Println("--- stub Send calls ---")
+		for i, s := range sends {
+			fmt.Printf("Send call %d:\n%s\n", i+1, s)
+		}
+		fmt.Println("--- team seam log ---")
+		for _, ln := range team {
+			fmt.Println(ln)
+		}
+		// asserts — the intelligent-backlog contract
+		fail := func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, "uishot: "+format+"\n", args...)
+			os.Exit(1)
+		}
+		wantSends := 1
+		if *batchRespawn {
+			wantSends = 2
+		}
+		if len(sends) != wantSends {
+			fail("expected exactly %d Send call(s), got %d", wantSends, len(sends))
+		}
+		if !strings.HasPrefix(sends[0], "[BATCH DISPATCH — 3 requests arrived") {
+			fail("expected ONE batch-composed send of 3 items, got: %q", sends[0])
+		}
+		for _, item := range []string{"1. fix the badge", "2. ship v2", "3. write the release notes"} {
+			if !strings.Contains(sends[0], item) {
+				fail("composed batch missing numbered item %q", item)
+			}
+		}
+		if *batchRespawn {
+			if sends[1] != sends[0] {
+				fail("respawned batch differs from the original")
+			}
+			hasReset := false
+			for _, ln := range team {
+				if ln == "ResetPrimary(true)" {
+					hasReset = true
+				}
+			}
+			if !hasReset {
+				fail("expected ResetPrimary(true) after the rejected batch send")
+			}
+		}
+		for _, id := range []string{"demo-1", "demo-2", "demo-3"} {
+			if !strings.Contains(" "+strings.Join(team, " ")+" ", "QueueItemDone("+id+")") {
+				fail("expected QueueItemDone(%s) after the batch turn completed", id)
+			}
+		}
+		fmt.Println("asserts: OK — ONE composed batch send, board rows started/done, no second send until flush")
+		return
 	}
 
 	if *askAnswer || *askEsc || *askQueue {

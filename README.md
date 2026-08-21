@@ -35,6 +35,11 @@ one bubble, and thinking transcripts unfold in real time before auto-collapsing.
 
 ![streaming](docs/shots-go/chat-stream.png)
 
+And the queue is not a tunnel — it's a **backlog the office manages**: items get
+board rows, flush goes out as one `[BATCH DISPATCH]` the boss decomposes into
+parallel sub-agents (`/route` forces it early), and a dead boss respawns a fresh
+session and resends the batch.
+
 ## Keys
 
 | key | does |

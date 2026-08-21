@@ -420,6 +420,20 @@ func (b *demoBackend) RejectQuestion(requestID string) error {
 	return nil
 }
 
+// ---------------------------------------------------------------- queue board + respawn
+
+// QueueItemStart is the demo twin of the live board seam: no agentmemory,
+// so it returns a deterministic "demo-<index>" id proving interface-compat.
+func (b *demoBackend) QueueItemStart(index int, title string) string {
+	return "demo-" + itoa(index)
+}
+
+// QueueItemDone is a demo no-op (no board to mark).
+func (b *demoBackend) QueueItemDone(boardID string) {}
+
+// ResetPrimary is a demo no-op (a scripted boss has no session to drop).
+func (b *demoBackend) ResetPrimary(forceNew bool) error { return nil }
+
 // ---------------------------------------------------------------- stop
 
 func (b *demoBackend) Stop() error {

@@ -8,6 +8,7 @@ package backend
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -90,6 +91,81 @@ func (h *amHandle) getJSON(path string) (any, bool) {
 		return nil, false
 	}
 	return v, true
+}
+
+// postJSON sends a JSON POST against the bounded 2s client; ok=false on
+// any network error or non-2xx. Returns the decoded body on success.
+func (h *amHandle) postJSON(path string, body any) (any, bool) {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return nil, false
+	}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, h.baseURL+path, strings.NewReader(string(data)))
+	if err != nil {
+		return nil, false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	res, err := h.client.Do(req)
+	if err != nil {
+		return nil, false
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return nil, false
+	}
+	var v any
+	if err := json.NewDecoder(res.Body).Decode(&v); err != nil {
+		return nil, true // 2xx with non-JSON body still counts as success
+	}
+	return v, true
+}
+
+// CreateAction mirrors a queued office item onto the agentmemory board as
+// a PENDING action (POST /agentmemory/actions — live probe 2026-08-21:
+// {"title","status":"pending","priority","tags":[...]} -> 201; provenance
+// rides tags, e.g. "source:grafeio","queueItem:<id>"). Best-effort: in
+// "none" mode this is a no-op success returning ""; on error the caller
+// drops it (status line only). NEVER throws; all I/O bounded at 2s.
+func (h *amHandle) CreateAction(title string, itemID string) (string, error) {
+	if h.kind != "actions" {
+		return "", nil
+	}
+	v, ok := h.postJSON("/agentmemory/actions", map[string]any{
+		"title":    title,
+		"status":   "pending",
+		"priority": 5,
+		"tags":     []string{"source:grafeio", "queueItem:" + itemID},
+	})
+	if !ok {
+		return "", errors.New("agentmemory create action: POST /agentmemory/actions failed")
+	}
+	if obj, ok := v.(map[string]any); ok {
+		if act, ok := obj["action"].(map[string]any); ok {
+			if id := str(act["id"]); id != "" {
+				return id, nil
+			}
+		}
+	}
+	return "", errors.New("agentmemory create action: response had no action.id")
+}
+
+// MarkAction updates a board action's status
+// (POST /agentmemory/actions/update — live probe 2026-08-21:
+// {"actionId","status"} -> 200 with the updated action; /actions/<id> is
+// 404 on this server). Best-effort: no-op success in "none" mode or for an
+// empty id (offline create returned ""). NEVER throws; bounded at 2s.
+func (h *amHandle) MarkAction(id string, status string) error {
+	if h.kind != "actions" || id == "" {
+		return nil
+	}
+	_, ok := h.postJSON("/agentmemory/actions/update", map[string]any{
+		"actionId": id,
+		"status":   status,
+	})
+	if !ok {
+		return errors.New("agentmemory mark action: POST /agentmemory/actions/update failed")
+	}
+	return nil
 }
 
 // listActions returns board rows; [] in "none" mode.

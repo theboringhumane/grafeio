@@ -87,6 +87,8 @@ type liveBackend struct {
 	amMails       map[string]bool
 	lastUserText  string // belt-and-braces echo dedupe (see Send)
 	lastUserAt    int64
+	respawnFresh  bool   // ResetPrimary(true) latched: next Send respawns a fresh session once
+	respawnOldID  string // primary id ResetPrimary dropped, so Send can un-seat it
 }
 
 func newLiveBackend(baseURL, directory string) *liveBackend {
@@ -198,8 +200,49 @@ func (b *liveBackend) Send(text string) error {
 	}
 
 	b.mu.Lock()
-	ready := b.baseURL != "" && b.primaryID != "" && !b.fl.isStopped()
+	ready := b.baseURL != "" && !b.fl.isStopped()
+	primaryID := b.primaryID
+	forceFresh := b.respawnFresh
+	b.mu.Unlock()
+
+	// Respawn path (ResetPrimary cleared the hold): establish a primary
+	// session on demand — forced-fresh ("grafeio office · respawn") when
+	// ResetPrimary(true) latched it, otherwise the normal reuse pass.
+	oldID := b.respawnOldID
+	if ready && primaryID == "" {
+		var (
+			primary ocSession
+			perr    error
+		)
+		if forceFresh {
+			primary, perr = b.createPrimary("grafeio office · respawn")
+			if perr == nil {
+				b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] primary session respawned fresh (" + primary.ID + ")"})
+			}
+		} else {
+			primary, perr = b.ensurePrimary()
+		}
+		if perr != nil {
+			b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] primary respawn failed: " + shortTitle(perr.Error(), 100)})
+		} else {
+			b.mu.Lock()
+			b.primaryID = primary.ID
+			b.respawnFresh = false // consume the one-shot
+			b.respawnOldID = ""
+			b.mu.Unlock()
+			primaryID = primary.ID
+			// Re-seat the boss so the floor follows the new session.
+			if oldID != "" && oldID != primary.ID {
+				b.fl.emit(state.Event{Kind: state.EvFire, EmployeeID: oldID})
+			}
+			b.fl.emit(state.Event{Kind: state.EvHire, Employee: state.Employee{
+				ID: primary.ID, Name: "manager", Role: state.RoleManager, Seat: "manager", Sprite: state.SpriteAtDesk,
+			}})
+		}
+	}
+	ready = ready && primaryID != ""
 	if !ready {
+		b.mu.Lock()
 		b.chatSeq++
 		deadID := "boss-" + itoa(b.chatSeq)
 		b.mu.Unlock()
@@ -208,10 +251,10 @@ func (b *liveBackend) Send(text string) error {
 		}})
 		return nil
 	}
+	b.mu.Lock()
 	b.chatSeq++
 	pendingID := "boss-" + itoa(b.chatSeq)
 	b.pendingBoss = append(b.pendingBoss, pendingID)
-	primaryID := b.primaryID
 	b.mu.Unlock()
 
 	b.fl.emit(state.Event{Kind: state.EvChatBoss, Msg: state.ChatMsg{
@@ -433,8 +476,15 @@ func httpErrorText(status int, body []byte) string {
 	return fmt.Sprintf("status %d: %s", status, trimTo(string(body), 200))
 }
 
+// STALE_SESSION_MSG_LIMIT: a reused root session carrying more history
+// than this is treated as a stale giant context (the class that timed out
+// turns earlier) and a fresh "grafeio office" session is created anyway.
+const STALE_SESSION_MSG_LIMIT = 50
+
 // ensurePrimary reuses the newest root session for this directory, else
-// creates one titled "grafeio office".
+// creates one titled "grafeio office". Reuse passes the stale check first:
+// > STALE_SESSION_MSG_LIMIT messages -> create fresh anyway. The choice is
+// logged on the status line.
 func (b *liveBackend) ensurePrimary() (ocSession, error) {
 	var sessions []ocSession
 	if err := b.doJSON(http.MethodGet, "/session", nil, &sessions); err == nil {
@@ -449,15 +499,89 @@ func (b *liveBackend) ensurePrimary() (ocSession, error) {
 			}
 		}
 		if newest != nil {
+			count := b.sessionMessageCount(newest.ID)
+			if count > STALE_SESSION_MSG_LIMIT {
+				b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
+					"[grafeio] primary session %s has %d msgs (> %d, stale) — creating fresh", newest.ID, count, STALE_SESSION_MSG_LIMIT)})
+				return b.createPrimary("grafeio office")
+			}
+			b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
+				"[grafeio] primary session: reuse %s (%d msgs)", newest.ID, count)})
 			return *newest, nil
 		}
 	}
+	return b.createPrimary("grafeio office")
+}
+
+// createPrimary makes a brand-new root session with the given title.
+func (b *liveBackend) createPrimary(title string) (ocSession, error) {
 	var created ocSession
-	body, _ := json.Marshal(map[string]any{"title": "grafeio office"})
+	body, _ := json.Marshal(map[string]any{"title": title})
 	if err := b.doJSON(http.MethodPost, "/session", body, &created); err != nil {
 		return ocSession{}, fmt.Errorf("session.create failed: %w", err)
 	}
 	return created, nil
+}
+
+// sessionMessageCount counts rows in GET /session/{id}/message; -1 on
+// error (reuse proceeds — a counting failure must not churn sessions).
+func (b *liveBackend) sessionMessageCount(sessionID string) int {
+	var rows []json.RawMessage
+	if err := b.doJSON(http.MethodGet, "/session/"+sessionID+"/message", nil, &rows); err != nil {
+		return -1
+	}
+	return len(rows)
+}
+
+// ---------------------------------------------------------------- queue board + respawn
+
+// QueueItemStart mirrors a queued office item onto the agentmemory board
+// as a pending action the office can watch. Best-effort: "" when the
+// agentmemory probe was "none" (offline) — QueueItemDone("") is a no-op.
+// Errors are dropped to the status line only when the server was
+// reachable and still failed. NOT part of state.Backend: the app side
+// type-asserts this seam.
+func (b *liveBackend) QueueItemStart(index int, title string) string {
+	if b.am == nil || b.am.kind != "actions" {
+		return ""
+	}
+	boardID, err := b.am.CreateAction(fmt.Sprintf("QUE-%d: %s", index, title), fmt.Sprintf("que-%d", index))
+	if err != nil {
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] board action create failed: " + shortTitle(err.Error(), 100)})
+		return ""
+	}
+	return boardID
+}
+
+// QueueItemDone marks a queue item's board action done. Empty id / offline
+// probe -> silent no-op; a failed round-trip is status-line only.
+func (b *liveBackend) QueueItemDone(boardID string) {
+	if boardID == "" || b.am == nil || b.am.kind != "actions" {
+		return
+	}
+	if err := b.am.MarkAction(boardID, "done"); err != nil {
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] board action mark done failed: " + shortTitle(err.Error(), 100)})
+	}
+}
+
+// ResetPrimary clears the hold on the primary session so the NEXT Send
+// lazily establishes a replacement (nothing is archived/deleted — the old
+// session simply stops being the boss). With forceNew=true the
+// replacement is a BRAND-NEW session titled "grafeio office · respawn",
+// consumed one-shot; false runs the normal reuse pass (which still creates
+// fresh when the newest root session is stale). Live backend only; the
+// demo twin is a no-op. Used by the queue-flush resilience path: a failed
+// flush respawns a fresh primary and retries once.
+func (b *liveBackend) ResetPrimary(forceNew bool) error {
+	b.mu.Lock()
+	old := b.primaryID
+	b.primaryID = ""
+	b.respawnFresh = forceNew
+	b.respawnOldID = old
+	b.mu.Unlock()
+	b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
+		"[grafeio] primary session reset (forceNew=%v) — next send respawns", forceNew)})
+	return nil
 }
 
 // postPrompt is promptAsync: POST /session/{id}/prompt_async (204 on ok).
