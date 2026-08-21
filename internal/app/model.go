@@ -33,11 +33,16 @@ import (
 )
 
 const (
-	mailCap   = 30
-	chatCap   = 30
-	thinkCap  = 20 // thinking blocks kept in chat
-	toolCap   = 20 // tool one-liners kept in chat
-	bubbleCap = 3  // never more than 3 concurrent balloons (drop oldest)
+	mailCap = 30
+	// chatCap / thinkCap / toolCap are FUSES, not windows: the transcript is
+	// WhatsApp-grade — the FULL history stays (oldest top, newest bottom,
+	// everything scrollable, nothing eaten as new messages arrive). The
+	// 10k bound only trips on pathological unbounded growth inside one
+	// process; it must never clip a human conversation.
+	chatCap   = 10000
+	thinkCap  = 10000 // thinking blocks kept in chat
+	toolCap   = 10000 // tool one-liners kept in chat
+	bubbleCap = 3     // never more than 3 concurrent balloons (drop oldest)
 
 	// Sidebar sizing: the default is 80 cols; brain.json ui.sidebarWidth is
 	// clamped to 26..100 (explicit config wins over /compact); the compact
@@ -403,6 +408,11 @@ type questionAnswerMsg struct{ text string }
 // stays pending, re-openable with /question.
 type questionLaterMsg struct{}
 
+// stopWorkMsg fires on a DOUBLE-esc in the main chat input — the chat
+// panel's stop seam; handled exactly like /stop (abort + clean unwind).
+// The ferry keeps the model value copy in Update the single writer.
+type stopWorkMsg struct{}
+
 // New builds the app around a backend + the brain.json config. cfg is
 // nil-tolerant (config.Default() substituted — headless stubs and harnesses).
 // backend.Start is NOT called here — main owns that (goroutine →
@@ -503,6 +513,12 @@ func New(b state.Backend, cfg *config.Config) Model {
 			return func() tea.Msg { return questionLaterMsg{} }
 		},
 	)
+	// Double-esc seam: esc-esc in the main chat input aborts the running
+	// turn. The panel owns the key timing (500ms window, modal/picker esc's
+	// never count); the model owns stopWork — the same /stop path.
+	chat.SetStopHandler(func() tea.Cmd {
+		return func() tea.Msg { return stopWorkMsg{} }
+	})
 	m.tabs.SetCompact(m.compact())
 	m.chat.SetCompact(m.compact())
 	m.tabs.SetState(m.st)
@@ -758,6 +774,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.chat.SetQuestion(nil)
 			m.notice("(question deferred — /question to reopen)")
 		}
+	case stopWorkMsg:
+		// double-esc in the main chat input == /stop (abort + unwind);
+		// idle-safe: nothing runs → the abort seam no-ops, the unwind is
+		// empty and only the status line reports like /stop would.
+		m.stopWork()
 	case state.Event:
 		cmds = append(cmds, m.applyEvent(msg))
 	default:
@@ -1732,9 +1753,10 @@ func appendChat(chat []state.ChatMsg, msg state.ChatMsg) []state.ChatMsg {
 	return append(append([]state.ChatMsg(nil), chat...), msg)
 }
 
-// capChat enforces the global chat cap AND the per-kind caps, so a stream of
-// thinking/tool entries can't drown out the conversation (each survives at
-// thinkCap/toolCap, oldest of the kind drops first).
+// capChat enforces the global chat fuse AND the per-kind fuses (all 10k —
+// see the const block: history is retained in full in practice; a stream of
+// thinking/tool entries drowns nothing). Only past the fuse does the oldest
+// of a kind drop first.
 func capChat(chat []state.ChatMsg) []state.ChatMsg {
 	chat = capList(chat, chatCap)
 	chat = capKind(chat, "think", thinkCap)
@@ -1972,8 +1994,8 @@ func reducer(st state.OfficeState, ev state.Event) state.OfficeState {
 		// stream. The pending placeholder ("office-<msgID>") appends once,
 		// streaming growth re-emits the same ID, and the completion pin
 		// swaps Pending→false in place; a duplicated completion is
-		// idempotent. Rides capChat (cap 30) like every chat entry, and
-		// never touches boss typing/delegation state.
+		// idempotent. Rides capChat (the 10k fuse) like every chat entry,
+		// and never touches boss typing/delegation state.
 		msg := ev.Msg
 		if msg.ID != "" {
 			for i, c := range st.Chat {
@@ -1990,8 +2012,8 @@ func reducer(st state.OfficeState, ev state.Event) state.OfficeState {
 
 	case state.EvThought:
 		{
-			// boss thoughts: thinking flag + a chat entry (Kind "think", cap 20)
-			// keyed by CallID — mid-stream updates REPLACE the entry in place
+			// boss thoughts: thinking flag + a chat entry (Kind "think", 10k
+			// fuse) keyed by CallID — mid-stream updates REPLACE the entry in place
 			// (accumulated text), Done=true is the final update; the model's
 			// activeThink set decides streaming vs collapsed at render.
 			// employee thoughts: the activity line still records them, and
@@ -2199,6 +2221,16 @@ func reducer(st state.OfficeState, ev state.Event) state.OfficeState {
 
 	case state.EvStatus:
 		st.StatusLine = ev.Text
+		return st
+
+	case state.EvUsage:
+		// Real opencode assistant-message counters (EvUsage carries
+		// per-message DELTAS — see state.go); plain accumulation into the
+		// conversation totals the status bar renders. Repeated frames can
+		// never double-count: the backend ships growth only.
+		st.TokensIn += ev.TokensIn
+		st.TokensOut += ev.TokensOut
+		st.CostUSD += ev.CostUSD
 		return st
 	}
 	return st
@@ -2664,6 +2696,8 @@ func (m *Model) describeEvent(ev state.Event) string {
 		what = fmt.Sprintf("diff — %s: %s +%d -%d", name, ev.DiffPath, ev.DiffAdd, ev.DiffDel)
 	case state.EvStatus:
 		what = "status — " + ev.Text
+	case state.EvUsage:
+		what = fmt.Sprintf("usage — +%d in / +%d out tok · +$%.4f", ev.TokensIn, ev.TokensOut, ev.CostUSD)
 	default:
 		what = string(ev.Kind)
 	}

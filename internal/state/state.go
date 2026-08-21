@@ -194,6 +194,20 @@ type OfficeState struct {
 	// floor nameplate "[delegat]". Clears the moment any boss-side
 	// activity lands.
 	BossDelegating bool `json:"bossDelegating,omitempty"`
+	// TokensIn/TokensOut/CostUSD — the conversation's REAL usage totals,
+	// accumulated reducer-side from EvUsage deltas the backend lifts
+	// verbatim out of opencode assistant messages (AssistantMessage
+	// .tokens/.cost — required on the wire since serve 1.18.19, verified
+	// against GET /doc). Zero while nothing real has been reported; the
+	// status bar hides its usage segment in that case rather than
+	// estimate. TokensIn counts wire `input`; TokensOut counts wire
+	// `output`+`reasoning` (cache read/write stay out of the headline —
+	// opencode's own CostUSD is the authoritative bill). Additive state:
+	// a new office starts at 0 and the session snapshot never threads
+	// them (Snapshot keeps chat only).
+	TokensIn  int64   `json:"tokensIn,omitempty"`
+	TokensOut int64   `json:"tokensOut,omitempty"`
+	CostUSD   float64 `json:"costUsd,omitempty"`
 }
 
 // EventKind — Go has no tagged unions; one Event struct with a Kind + optional fields.
@@ -227,6 +241,14 @@ const (
 	EvPermission EventKind = "permission"
 	EvQuestion   EventKind = "question"
 	EvFileDiff   EventKind = "diff"
+	// EvUsage — a usage/cost delta lifted from one opencode assistant
+	// message.updated (AssistantMessage.tokens/.cost). CallID carries the
+	// messageID; TokensIn/TokensOut/CostUSD are the GROWTH since the last
+	// frame for that same message (never an absolute re-report), so the
+	// reducer simply accumulates. Emitted only for sessions the office
+	// owns (primary, concierge pseudo-desk, hired children) and only when
+	// the delta is non-zero.
+	EvUsage EventKind = "usage"
 )
 
 // Event — the wire between backend and the tea.Model. Only fields relevant
@@ -262,6 +284,13 @@ type Event struct {
 	DiffBody     string `json:"diffBody,omitempty"` // compact unified diff, capped by the backend
 	DiffAdd      int    `json:"diffAdd,omitempty"`
 	DiffDel      int    `json:"diffDel,omitempty"`
+	// Usage fields (EvUsage): per-message DELTAS, not absolutes — the
+	// backend remembers what each messageID already reported and sends
+	// only the growth, so the app accumulates with += and repeated
+	// message.updated frames can never double-count.
+	TokensIn  int64   `json:"tokensIn,omitempty"`  // wire tokens.input growth
+	TokensOut int64   `json:"tokensOut,omitempty"` // wire tokens.output+reasoning growth
+	CostUSD   float64 `json:"costUsd,omitempty"`   // wire cost growth (USD, opencode-computed)
 }
 
 // Backend — one per run. Demo scripted, live via opencode serve + agentmemory.

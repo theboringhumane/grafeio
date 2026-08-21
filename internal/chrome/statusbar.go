@@ -87,8 +87,16 @@ func StatusBar(st state.OfficeState, hint string, queueN, width int) string {
 		OnBar(White, "/") +
 		OnBar(Info, fmt.Sprintf("%d", doing)) +
 		OnBar(White, "/") +
-		OnBar(OK, fmt.Sprintf("%d", done)) +
-		OnBar(White, " | ") +
+		OnBar(OK, fmt.Sprintf("%d", done))
+	// The usage tag rides inside `counts`, immediately before the mode
+	// segment, so every existing truncation rule keeps working untouched
+	// (hint drops first, then the left status line shrinks; counts always
+	// survives). Empty while no REAL usage has been reported — the bar is
+	// byte-identical to before in that case.
+	if tag := usageTag(st); tag != "" {
+		counts += OnBar(White, " | ") + OnBar(Dim, tag)
+	}
+	counts += OnBar(White, " | ") +
 		OnBar(ModeColor(st.Mode), string(st.Mode)) +
 		OnBar(White, " ")
 
@@ -131,4 +139,45 @@ func StatusBar(st state.OfficeState, hint string, queueN, width int) string {
 		line = ansi.Truncate(line, width, "")
 	}
 	return Bar.Width(width).Render(line)
+}
+
+// usageTag renders the cost/token segment ("$0.0042 · 12.4k tok") from the
+// conversation's REAL, opencode-reported totals (state.OfficeState
+// TokensIn/TokensOut/CostUSD, accumulated from EvUsage deltas). "" while
+// both counters are zero — the segment hides itself entirely rather than
+// show an estimated or fabricated number. The $ figure leads and is
+// dropped on its own when only tokens are known (real cost data absent);
+// grafeio NEVER prices tokens itself.
+func usageTag(st state.OfficeState) string {
+	toks := st.TokensIn + st.TokensOut
+	var parts []string
+	if st.CostUSD > 0 {
+		parts = append(parts, costUSD(st.CostUSD))
+	}
+	if toks > 0 {
+		parts = append(parts, humanTokens(toks)+" tok")
+	}
+	return strings.Join(parts, " · ")
+}
+
+// humanTokens compacts a token count: whole numbers under 1000, one-decimal
+// k/M above (999 → "999", 1234 → "1.2k", 2_500_000 → "2.5M").
+func humanTokens(n int64) string {
+	switch {
+	case n < 1000:
+		return fmt.Sprintf("%d", n)
+	case n < 1_000_000:
+		return fmt.Sprintf("%.1fk", float64(n)/1000)
+	default:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	}
+}
+
+// costUSD formats the opencode-reported bill: 4 decimals under $1 (the
+// interesting per-turn range), 2 above ("$0.0042", "$1.23").
+func costUSD(usd float64) string {
+	if usd < 1 {
+		return fmt.Sprintf("$%.4f", usd)
+	}
+	return fmt.Sprintf("$%.2f", usd)
 }

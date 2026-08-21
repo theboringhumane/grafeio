@@ -41,6 +41,28 @@ type ocMessage struct {
 		Created   int64 `json:"created"`
 		Completed int64 `json:"completed"`
 	} `json:"time"`
+	// Cost/Tokens — the AssistantMessage usage counters. REQUIRED fields on
+	// the wire (opencode serve 1.18.19 GET /doc, AssistantMessage schema:
+	// required [..., "cost", "tokens"]): cost is the message's USD total as
+	// computed by opencode ITSELF — grafeio never prices anything. Numbers
+	// decode as float64 (the wire type is "number"); token counters are
+	// integral in practice and convert at emit time.
+	Cost   float64  `json:"cost"`
+	Tokens ocTokens `json:"tokens"`
+}
+
+// ocTokens is the AssistantMessage .tokens blob (serve 1.18.19 /doc:
+// {total?, input, output, reasoning, cache:{read, write}} — total is
+// optional, the rest required).
+type ocTokens struct {
+	Total     float64 `json:"total"`
+	Input     float64 `json:"input"`
+	Output    float64 `json:"output"`
+	Reasoning float64 `json:"reasoning"`
+	Cache     struct {
+		Read  float64 `json:"read"`
+		Write float64 `json:"write"`
+	} `json:"cache"`
 }
 
 // ocPart covers the Part union fields the mapping reads (ReasoningPart /
@@ -187,6 +209,11 @@ type normCtx struct {
 	textAccum        map[string]string   // messageID -> delta-accumulated answer text so far
 	textStart        map[string]int64    // messageID -> stream start (ms; Msg.At for every update of the bubble)
 	textSess         map[string]string   // messageID -> owning sessionID (primary vs concierge routing)
+	// usageSeen — per-assistant-message usage counters already emitted
+	// (messageID -> last totals). Lets mapUsage ship DELTAS: repeated
+	// message.updated frames for the same id re-report absolute counters,
+	// and only the growth becomes an EvUsage.
+	usageSeen map[string]ocUsageLast
 	// conciergeID — the office concierge's session id, set by the live
 	// backend's registerConcierge ("" until the first SendConcierge creates
 	// the session lazily). The concierge is a PSEUDO-DESK: it sits in
@@ -241,6 +268,7 @@ func newNormCtx(cfg *config.Config) *normCtx {
 		textAccum:        make(map[string]string),
 		textStart:        make(map[string]int64),
 		textSess:         make(map[string]string),
+		usageSeen:        make(map[string]ocUsageLast),
 	}
 }
 
@@ -959,6 +987,58 @@ func diffEvent(sessionID, empID, empName string, d ocSnapshotFileDiff, ctx *norm
 	}, true
 }
 
+// ocUsageLast remembers the counters already emitted for one assistant
+// message so repeated message.updated frames ship only the growth.
+type ocUsageLast struct {
+	in, out int64
+	cost    float64
+}
+
+// mapUsage lifts the REAL usage counters off one assistant message.updated
+// (AssistantMessage.tokens/.cost — required on the wire since opencode
+// serve 1.18.19, verified against GET /doc) and emits their GROWTH since
+// the same message's last frame as state.EvUsage (CallID = messageID; the
+// reducer accumulates with +=). Rules:
+//
+//   - role "assistant" only (user messages carry no counters);
+//   - office-owned sessions only: the primary ("boss"), the concierge
+//     pseudo-desk and hired children (both in ctx.employees) — a shared
+//     serve's foreign sessions never leak into the member's tally;
+//   - TokensIn = wire input; TokensOut = wire output + reasoning. Cache
+//     read/write stay OUT of the headline counts (provider-billing
+//     overlap); the $ figure is authoritative anyway — opencode computed
+//     it, grafeio never prices anything;
+//   - an all-zero delta (the typical first frame, counters still 0)
+//     emits nothing.
+func mapUsage(info ocMessage, ctx *normCtx, primaryID string) []state.Event {
+	if info.Role != "assistant" || info.ID == "" {
+		return nil
+	}
+	if info.SessionID != primaryID {
+		if _, ok := ctx.employees[info.SessionID]; !ok {
+			return nil
+		}
+	}
+	cur := ocUsageLast{
+		in:   int64(info.Tokens.Input),
+		out:  int64(info.Tokens.Output) + int64(info.Tokens.Reasoning),
+		cost: info.Cost,
+	}
+	prev := ctx.usageSeen[info.ID]
+	d := ocUsageLast{in: cur.in - prev.in, out: cur.out - prev.out, cost: cur.cost - prev.cost}
+	if d.in == 0 && d.out == 0 && d.cost == 0 {
+		return nil
+	}
+	ctx.usageSeen[info.ID] = cur
+	return []state.Event{{
+		Kind:      state.EvUsage,
+		CallID:    info.ID,
+		TokensIn:  d.in,
+		TokensOut: d.out,
+		CostUSD:   d.cost,
+	}}
+}
+
 // mapOCEvent is the ONE pure mapping entry point. primaryID identifies the
 // boss session; everything with parentID == primaryID is an employee.
 //
@@ -977,6 +1057,8 @@ func diffEvent(sessionID, empID, empName string, d ocSnapshotFileDiff, ctx *norm
 //	same ID with Pending:false so one bubble spans stream + final)
 //	message.part.updated (tool, any)       -> tool run/done/error (+ child working pulse)
 //	message.part.updated (child, other)    -> working (throttled 500ms/employee)
+//	message.updated (assistant, office-owned) -> usage (cost/token DELTA
+//		per message id, real counters off the wire — see mapUsage)
 //	message.updated (primary, ANY role)    -> [] — the primary's own user
 //		message must NEVER echo as chat-user (Send() owns the only
 //		chat-user echo; kids' briefs are not chat)
@@ -1111,6 +1193,10 @@ func mapOCEvent(raw ocSSEEvent, ctx *normCtx, primaryID string, now int64) []sta
 			return nil
 		}
 		info := p.Info
+		// Every assistant message.updated also re-reports its usage
+		// counters — the delta rides along whatever this frame already
+		// emitted (children's working pulse included).
+		usage := mapUsage(info, ctx, primaryID)
 		if info.SessionID == primaryID {
 			// Boss completion needs a fetch — the backend handles it.
 			// User-role messages on the primary are the member's own chat,
@@ -1121,13 +1207,13 @@ func mapOCEvent(raw ocSSEEvent, ctx *normCtx, primaryID string, now int64) []sta
 				// parts never open a boss bubble.
 				unregisterTextStream(ctx, info.ID)
 			}
-			return nil
+			return usage
 		}
 		emp, ok := ctx.employees[info.SessionID]
 		if !ok || info.Role != "assistant" || ctx.returned[info.SessionID] {
-			return nil
+			return usage
 		}
-		return ctx.throttledWorking(emp.ID, ctx.tasks[info.SessionID].ID, now, false)
+		return append(usage, ctx.throttledWorking(emp.ID, ctx.tasks[info.SessionID].ID, now, false)...)
 
 	case "permission.asked", "permission.updated":
 		var p ocPermissionReq

@@ -20,13 +20,17 @@
 //		            the SAME timeline as every other entry —
 //		            mergeChatTimeline places it at its birth timestamp
 //		            (creation time), so threads scroll with the
-//		            conversation instead of docking after it: header
-//		            "┌ <agent> · <task>" over indented "│ [tool] …" rows
-//		            while the agent is active (long rows WRAP with "│ "
-//		            continuations, never truncate), auto-collapsing to
-//		            "<agent> · <task> (· N tool calls ✓ done)" on
-//		            EvReturned or 120 ticks of quiet, with ctrl+g
-//		            expanding/collapsing all completed threads;
+//		            conversation instead of docking after it. EVERY
+//		            thread renders as a rounded bordered CARD (dim
+//		            lipgloss.RoundedBorder, full panel width), COLLAPSED
+//		            BY DEFAULT — live threads included — as
+//		            "▾ <agent> · <task> (· N tool calls ✓ done)";
+//		            a per-agent click or the ctrl+g baseline expands the
+//		            card to its "▴ ┌ <agent> · <task>" header over
+//		            indented "│ [tool] …" rows (long rows WRAP with
+//		            "│ " continuations, never truncate), with ctrl+g
+//		            expanding/collapsing all threads at once;
+//		            /stop force-collapses to a "✗ stopped" summary card;
 //		            Kind "office" entries (the concierge's EvChatOffice seam)
 //		            render as INFO-cyan "office ›" markdown bubbles — a real
 //		            turn, streamed replace-by-ID like the boss, with a dim
@@ -67,13 +71,19 @@
 // Scroll: mouse wheel + PgUp/PgDn always scroll the conversation; ↑/↓ move
 // inside a multi-line draft and scroll the conversation otherwise. ctrl+t
 // expands/collapses ALL thinking blocks, ctrl+d expands/collapses ALL diff
-// entries (both handled by the app keymap).
+// entries (both handled by the app keymap). While any worker thread renders
+// expanded, esc and ↑ are "back one" FIRST: each press folds the MOST
+// RECENTLY expanded thread back to its collapsed summary row (one thread
+// per press); with nothing expanded, ↑ walks its old scroll path untouched
+// and esc-esc in the main input (two UNCONSUMED presses inside 500ms)
+// aborts the running turn — the same path as /stop.
 package panels
 
 import (
 	"image/color"
 	"runtime"
 	"strings"
+	"time"
 
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/spinner"
@@ -110,13 +120,13 @@ const (
 // errMeta — chat entry markers the app reducer tags onto state.ChatMsg so
 // this panel can style them without touching the user/boss turn paths.
 // wtoolKind is the EMPLOYEE tool line: grouped into a per-agent thread that
-// renders INLINE in the conversation timeline (see mergeChatTimeline).
+// renders INLINE in the conversation timeline (see mergeChatTimeline), as a
+// rounded bordered card, collapsed by default.
 // wthinkKind is
 // the EMPLOYEE EvThought line (the app reducer merges one per agent+CallID,
 // same stream mechanics as the boss's thinkKind): it joins the SAME worker
-// thread — a dim-italic "thinking · N lines" row while the thread is
-// live, a "· N think" count in the collapsed summary, a full body under
-// ctrl+g.
+// thread — a dim-italic "thinking · N lines" row inside the expanded card,
+// a "· N think" count in the collapsed summary, a full body under ctrl+g.
 const (
 	thinkKind    = "think"
 	toolKind     = "tool"
@@ -134,10 +144,19 @@ const (
 	officeKind = "office"
 )
 
-// wtoolStaleTicks — a workers thread auto-collapses after this many ticks
-// with no tool activity from its agent (EvReturned collapses instantly via
-// the sprite). ctrl+g re-expands completed threads.
+// wtoolStaleTicks — the staleness horizon that decides whether a workers
+// thread counts as LIVE (busy sprite + tool activity inside the window).
+// It drives the "team is working" loading row (chat_loading.go) and the
+// per-tick re-render gate in SetState — thread CARDS no longer expand on
+// it: every card is collapsed by default, live ones included, on the
+// ctrl+g / per-agent baseline alone.
 const wtoolStaleTicks = 120
+
+// dblEscWindow — two esc presses in the MAIN chat input inside this window
+// count as a double-esc and fire the stop seam (the app's /stop abort
+// path). A lone press is only recorded; window-close pairs re-arm so a
+// third esc starts a fresh pair instead of stacking interrupts.
+const dblEscWindow = 500 * time.Millisecond
 
 // diffMetaSep splits the diff ChatMsg.Meta carrier: path ␟ +adds ␟ -dels
 // (unit separator — paths may contain spaces). Written by the app reducer,
@@ -196,6 +215,14 @@ type Chat struct {
 	onQuestionLater  func() tea.Cmd
 	qInput           string // the modal's own free-text input buffer
 	questionWaiting  bool   // question hold outstanding (open or deferred)
+
+	// Double-esc interrupt (the panic-key): in the MAIN chat input — no
+	// modal or picker consumed the key — two esc presses inside
+	// dblEscWindow fire onStopEsc, the app's /stop abort path. A lone esc
+	// is just recorded (single-esc behavior in the input stays a no-op);
+	// a completed double-esc re-arms so a third press opens a fresh pair.
+	lastEscAt time.Time
+	onStopEsc func() tea.Cmd
 
 	chat    []state.ChatMsg // rendered snapshot
 	pending bool
@@ -278,15 +305,19 @@ type Chat struct {
 
 	// click/expansion bookkeeping for the workers-thread region:
 	// threadExpand holds PER-AGENT explicit expansion (double-click an
-	// agent on the floor / click a thread header — a set entry wins over
-	// the live+ctrl+g default); threadRows maps rendered content line →
-	// agent name for the expanded-thread "┌" headers (mouse hit lookup).
+	// agent on the floor / click a thread card — a set entry wins the
+	// ctrl+g default outright: every thread is COLLAPSED BY DEFAULT,
+	// live ones included); threadRows maps rendered content line →
+	// agent name for the thread-card header/hit rows (mouse hit lookup).
 	// threadStop holds the /stop markers: a stopped thread force-collapses
 	// and its summary reads "✗ stopped" until an explicit expand re-opens
-	// the rows.
-	threadExpand map[string]bool
-	threadRows   map[int]string
-	threadStop   map[string]bool
+	// the rows. threadExpandOrder is the expansion-ORDER ledger (oldest
+	// first) the esc/↑ "back one" collapse walks: ExpandThread appends,
+	// collapseLastThread pops.
+	threadExpand      map[string]bool
+	threadRows        map[int]string
+	threadStop        map[string]bool
+	threadExpandOrder []string
 
 	diffCache map[string]diffCacheEntry // parsed+hilighted diff rows by msg ID
 }
@@ -364,23 +395,33 @@ func (c *Chat) ToggleDiffs() {
 	c.forceRender()
 }
 
-// ToggleThreads expands/collapses ALL completed worker threads in the
-// conversation (ctrl+g, routed by the app keymap). Independent of the
-// thinking toggles — live threads always render expanded regardless.
+// ToggleThreads expands/collapses ALL worker threads in the conversation
+// (ctrl+g, routed by the app keymap) — the only GLOBAL expand baseline:
+// threads are collapsed by default, live ones included, so the opens are
+// this baseline and the per-agent click override (a /stop stopped thread
+// stays folded to its "✗ stopped" card under both until an explicit
+// per-agent expand). Independent of the thinking toggles.
 func (c *Chat) ToggleThreads() {
 	c.threadsExpanded = !c.threadsExpanded
 	c.forceRender()
 }
 
 // ExpandThread sets ONE agent's work-thread expansion explicitly (mouse:
-// double-click the agent's floor sprite / click the thread's "┌" header).
-// A set per-agent override wins over the live/ctrl+g default until the
-// next call — ctrl+g still moves the global baseline underneath it.
+// double-click the agent's floor sprite / click the thread card's header
+// rows). A set per-agent override wins the ctrl+g default outright until
+// the next call (a mouse-collapsed live thread stays collapsed until
+// re-clicked) — ctrl+g still moves the global baseline underneath it.
+// Every call also moves the agent inside threadExpandOrder (expand →
+// newest tail, collapse → out) — the ledger esc/↑ "back one" pops from.
 func (c *Chat) ExpandThread(agent string, expanded bool) {
 	if c.threadExpand == nil {
 		c.threadExpand = map[string]bool{}
 	}
 	c.threadExpand[agent] = expanded
+	c.threadExpandOrder = removeString(c.threadExpandOrder, agent)
+	if expanded {
+		c.threadExpandOrder = append(c.threadExpandOrder, agent)
+	}
 	c.forceRender()
 }
 
@@ -391,33 +432,135 @@ func (c *Chat) ToggleThread(agent string) {
 }
 
 // threadExpandedNow — the thread's effective expansion under the same
-// rule renderWorkerGroup applies: per-agent override wins, else live (busy
-// sprite + activity inside the staleness horizon), else ctrl+g.
+// rule renderWorkerGroup applies: COLLAPSED BY DEFAULT (a live, busy
+// thread folds to its summary card like any other — the live half is
+// gone); a set per-agent override wins outright, a /stop stopped thread
+// force-collapses until an explicit expand re-opens it, else the ctrl+g
+// baseline decides.
 func (c *Chat) threadExpandedNow(name string) bool {
 	if v, ok := c.threadExpand[name]; ok {
 		return v
 	}
-	if av, ok := c.agents[name]; ok && av.active {
-		lastTick := 0
-		for _, m := range c.chat {
-			if (m.Kind == wtoolKind || m.Kind == wthinkKind) && m.From == name {
-				if _, tk := parseWtoolMeta(m.Meta); tk > lastTick {
-					lastTick = tk
-				}
-			}
-		}
-		if c.tick-lastTick <= wtoolStaleTicks {
-			return true
-		}
+	if c.threadStop[name] {
+		return false
 	}
 	return c.threadsExpanded
 }
 
+// threadEffectivelyExpanded — the SAME expanded/collapsed rule
+// renderWorkerGroup renders by, evaluated for one thread: a set per-agent
+// override wins outright, a /stop stopped thread force-collapses until an
+// explicit expand re-opens it, else the ctrl+g baseline decides. The
+// active/lastTick liveness pair is UNREAD here now (collapsed by default,
+// live threads too) — it still feeds the loading row via the caller.
+func (c *Chat) threadEffectivelyExpanded(name string, active bool, lastTick int) bool {
+	if v, ok := c.threadExpand[name]; ok {
+		return v
+	}
+	if c.threadStop[name] {
+		return false
+	}
+	return c.threadsExpanded
+}
+
+// expandedThreadNames — the agent names whose worker threads render
+// EXPANDED right now, in first-appearance chat order. The /tools +
+// /thinking visibility switches mirror renderConversation's: a thread
+// whose lines are all hidden has no row on screen to fold.
+func (c *Chat) expandedThreadNames() []string {
+	var names []string
+	seen := map[string]bool{}
+	lastTick := map[string]int{}
+	for _, m := range c.chat {
+		switch m.Kind {
+		case wtoolKind:
+			if !c.showTools {
+				continue
+			}
+		case wthinkKind:
+			if !c.showThinking {
+				continue
+			}
+		default:
+			continue
+		}
+		if !seen[m.From] {
+			seen[m.From] = true
+			names = append(names, m.From)
+		}
+		if _, tk := parseWtoolMeta(m.Meta); tk > lastTick[m.From] {
+			lastTick[m.From] = tk
+		}
+	}
+	var expanded []string
+	for _, name := range names {
+		active := false
+		if av, ok := c.agents[name]; ok {
+			active = av.active
+		}
+		if c.threadEffectivelyExpanded(name, active, lastTick[name]) {
+			expanded = append(expanded, name)
+		}
+	}
+	return expanded
+}
+
+// removeString filters every occurrence of s out of slice, order kept.
+func removeString(slice []string, s string) []string {
+	out := slice[:0]
+	for _, v := range slice {
+		if v != s {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// collapseLastThread is the esc/↑ "back one" gesture: fold the MOST
+// RECENTLY expanded worker thread back to its collapsed summary card and
+// report true (the key is spent). The fold is the same mutation as
+// clicking the thread's card header — a per-agent ExpandThread(false)
+// override — so a ctrl+g-expanded thread folds exactly like an explicitly
+// opened one, every other thread keeps its rendering, and a later click
+// re-opens it as always. The ledger knows the explicit expands; a thread
+// expanded by the ctrl+g baseline has no entry, so it joins oldest-first
+// (chat order) and its freshest expansion ends up on top of the stack.
+// With NO thread expanded nothing is mutated and false is returned — the
+// key falls through to exactly its old path (no sticky state).
+func (c *Chat) collapseLastThread() bool {
+	expanded := c.expandedThreadNames()
+	if len(expanded) == 0 {
+		return false
+	}
+	open := make(map[string]bool, len(expanded))
+	for _, name := range expanded {
+		open[name] = true
+	}
+	// prune the ledger to threads still expanded (one may have folded on
+	// its own — the live agent went quiet, a ctrl+g blanket collapse…)
+	tracked := make(map[string]bool, len(c.threadExpandOrder))
+	order := c.threadExpandOrder[:0]
+	for _, name := range c.threadExpandOrder {
+		if open[name] {
+			order = append(order, name)
+			tracked[name] = true
+		}
+	}
+	for _, name := range expanded {
+		if !tracked[name] {
+			order = append(order, name)
+		}
+	}
+	c.threadExpandOrder = order
+	c.ExpandThread(order[len(order)-1], false)
+	return true
+}
+
 // ClickRow handles a mouse click at (x, y) IN CHAT CONTENT COORDS
 // (viewport row 0 at the top of the chat panel; the app translated the
-// screen coords over the tab/border chrome). A hit on an expanded worker
-// thread's "┌" header row toggles that agent's thread. Returns true when
-// the click was claimed.
+// screen coords over the tab/border chrome). A hit on a worker thread
+// card's TOP rows (its border cap or the "▴ ┌"/"▾" header line) toggles
+// that agent's thread. Returns true when the click was claimed.
 func (c *Chat) ClickRow(x, y int) bool {
 	if y < 0 || y >= c.vp.Height() {
 		return false
@@ -504,6 +647,12 @@ func (c *Chat) SetPermission(p *PermissionView) {
 func (c *Chat) SetQuestionHandlers(answer func(text string) tea.Cmd, later func() tea.Cmd) {
 	c.onQuestionAnswer, c.onQuestionLater = answer, later
 }
+
+// SetStopHandler wires the app's double-esc interrupt seam: two esc
+// presses inside dblEscWindow in the main chat input fire it (the app's
+// /stop abort path). Unset (or with nothing running), esc-esc is a
+// harmless no-op.
+func (c *Chat) SetStopHandler(fn func() tea.Cmd) { c.onStopEsc = fn }
 
 // SetQuestion opens (non-nil) or closes (nil) the boss question modal that
 // replaces the textarea region. Opening clears the modal's input buffer;
@@ -703,7 +852,13 @@ func (c *Chat) SetSize(w, h int) {
 		regionH = c.questionModalH()
 	}
 	regionH += c.chipsH() + c.popoverH() + c.slashH()
-	vpH := h - regionH - 1 /* divider */ - spH
+	// the "team is working" row takes one line while any worker thread is
+	// live — zero otherwise (the row self-hides, so vpH must follow suit)
+	ldH := 0
+	if c.anyThreadActive() {
+		ldH = 1
+	}
+	vpH := h - regionH - 1 /* divider */ - spH - ldH
 	if vpH < 1 {
 		vpH = 1
 	}
@@ -794,8 +949,10 @@ func (c *Chat) SetState(st state.OfficeState) {
 	// straight from its text, and text changes always land in rev (when a
 	// partial survives into a later tick its own diff re-triggers). Think
 	// streams DO still animate per tick — see len(c.streamingThink) below.
-	// a worker thread within its staleness horizon must re-render every
-	// tick — the auto-collapse boundary is tick-relative, invisible to rev.
+	// a worker thread within its staleness horizon re-renders every tick —
+	// the liveness horizon the loading row reads is tick-relative and
+	// invisible to rev (the cards themselves are stable per rev now:
+	// collapsed-by-default killed the tick-relative expand boundary).
 	wtoolRecent := false
 	for _, m := range st.Chat {
 		if m.Kind != wtoolKind && m.Kind != wthinkKind {
@@ -977,6 +1134,15 @@ func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 				return nil
 			}
 		}
+		// esc with an open worker thread is "back one": fold the most
+		// recently expanded thread to its summary row. The precedence
+		// above is untouched — modals/pickers already claimed their own
+		// esc — and with NO thread expanded the key falls through into the
+		// switch below, whose "esc" case runs the double-esc interrupt
+		// tracker (only an UNCONSUMED esc ever counts toward the pair).
+		if msg.String() == "esc" && c.collapseLastThread() {
+			return nil
+		}
 		switch msg.String() {
 		case "ctrl+v", "super+v":
 			// Image paste probe (async tea.Cmd): a clipboard holding an
@@ -989,6 +1155,20 @@ func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 			// making ctrl+v the only trigger that still reaches us).
 			c.closeSlashPicker(true) // pasting is not fragment typing
 			return c.startImagePaste()
+		case "esc":
+			// Double-esc = interrupt. The modal/picker arms above already
+			// consumed their esc (close/defer), so only a MAIN-input esc
+			// reaches here: a lone press is merely recorded — single-esc
+			// in the input was (and stays) a no-op — and the second one
+			// inside dblEscWindow fires the app's /stop abort path. The
+			// key never reaches the textarea (it ignores esc anyway).
+			now := time.Now()
+			if c.onStopEsc != nil && !c.lastEscAt.IsZero() && now.Sub(c.lastEscAt) <= dblEscWindow {
+				c.lastEscAt = time.Time{} // re-arm: a third esc opens a fresh pair
+				return c.onStopEsc()
+			}
+			c.lastEscAt = now
+			return nil
 		case "backspace":
 			if c.atOpen {
 				// fragment editing: the picker lives/dies by the tail
@@ -1051,6 +1231,13 @@ func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 			}
 			return nil
 		case "up", "down":
+			// ↑ shares esc's "back one" gesture: an expanded worker
+			// thread folds (most recent first) INSTEAD of scrolling;
+			// with none expanded the key walks its untouched path —
+			// multi-line draft move here, conversation scroll below.
+			if msg.String() == "up" && c.collapseLastThread() {
+				return nil
+			}
 			if c.ta.LineCount() > 1 {
 				var cmd tea.Cmd
 				c.ta, cmd = c.ta.Update(msg)
@@ -1163,6 +1350,13 @@ func (c *Chat) View() string {
 	var b strings.Builder
 	b.WriteString(c.vp.View())
 	b.WriteString("\n")
+	// live worker threads → the colorful "team is working" row, glued to
+	// the input right above the divider; "" (self-hidden) when idle and
+	// SetSize has already released its row
+	if row := c.loadingRow(c.w); row != "" {
+		b.WriteString(row)
+		b.WriteString("\n")
+	}
 	b.WriteString(chrome.DimText.Render(fitPlain(strings.Repeat("─", c.w), c.w)))
 	if c.pendingSpin {
 		// the typing row — glued to the input, not the transcript: the
@@ -1386,7 +1580,8 @@ func (c *Chat) renderConversation() string {
 }
 
 // agentView — a roster rollup entry for the workers-thread decoration:
-// the agent's dispatch task (header) and sprite-liveness (collapse rule).
+// the agent's dispatch task (header) and sprite-liveness (the loading
+// row's live/hide rule — thread cards no longer expand on it).
 type agentView struct {
 	task   string
 	active bool
@@ -1439,35 +1634,37 @@ func workerToolLine(m state.ChatMsg) string {
 
 // renderWorkerGroup draws ONE agent's thread INLINE at its timeline slot
 // (mergeChatTimeline interleaves threads with the conversation — there is
-// no docked region any more). An ACTIVE agent (busy sprite + activity
-// within wtoolStaleTicks) renders its header and merged tool lines —
-// employee thoughts join the SAME thread as dim-italic "thinking · N
-// lines" rows (one per merged CallID), in natural chat order among the
-// tool rows. On EvReturned/the quiet horizon the thread auto-collapses to
-// one dim summary line that KEEPS the think count ("· 9 tools · 3 think
-// ✓ done") — a completed thread is one concise chat row. ctrl+g
-// re-expands every completed thread at once — and a full expand (ctrl+g
-// or a per-agent mouse override) covers both tools AND thoughts, the
-// thoughts with their body text. Expanded "┌" header rows are recorded
-// in threadRows for the mouse hit-map (click toggles that agent's
-// thread).
+// no docked region any more). EVERY thread renders as a rounded bordered
+// CARD — chrome.PanelBox-shaped (lipgloss.RoundedBorder) with a dim
+// border, full panel width — so a subagent thread is visually distinct
+// from the flat conversation rows around it. Threads are COLLAPSED BY
+// DEFAULT, live ones included: one dim summary line that carries the "▾"
+// caret and KEEPS the think count ("▾ <agent> · <task> (· 9 tools · 3
+// think ✓ done)") while tools/thinks accumulate quietly underneath. A
+// per-agent click or the ctrl+g baseline expands the card: an "▴ ┌"
+// header over the merged tool lines, with employee thoughts riding the
+// SAME card as dim-italic "│ thinking · N lines" rows (one per merged
+// CallID) in natural chat order — and a full expand (ctrl+g or a
+// per-agent mouse override) shows the think bodies too. A /stop stopped
+// thread force-collapses to a "✗ stopped" card until an explicit expand
+// re-opens it. The card's top rows (border cap + header) are recorded in
+// threadRows for the mouse hit-map (click toggles that agent's thread).
 func (c *Chat) renderWorkerGroup(b *strings.Builder, g workerGroup) {
 	task := c.workerTasks[g.name] // sticky: a returned agent keeps its task
-	active := false
 	if av, ok := c.agents[g.name]; ok {
-		active = av.active
 		if av.task != "" {
 			task = av.task
 		}
 	}
 	// expanded = whether the thread renders its rows at all; full =
 	// whether think entries show their BODIES (ctrl+g / a full mouse
-	// expand). A set per-agent override wins OUTRIGHT over the
-	// live/ctrl+g default (a mouse-collapsed live thread stays
-	// collapsed until re-clicked). A /stop stopped thread
-	// force-collapses — only an explicit per-agent gesture re-opens it.
+	// expand). A set per-agent override wins the ctrl+g baseline OUTRIGHT
+	// (a mouse-collapsed live thread stays collapsed until re-clicked).
+	// A /stop stopped thread force-collapses — only an explicit per-agent
+	// gesture re-opens it. NO auto-expand: the live rule no longer opens
+	// anything — every thread is collapsed by default.
 	stopped := c.threadStop[g.name]
-	expanded := (active && c.tick-g.lastTick <= wtoolStaleTicks) || c.threadsExpanded
+	expanded := c.threadsExpanded
 	full := c.threadsExpanded
 	if v, ok := c.threadExpand[g.name]; ok {
 		expanded = v
@@ -1482,99 +1679,106 @@ func (c *Chat) renderWorkerGroup(b *strings.Builder, g workerGroup) {
 	if task != "" {
 		head += " · " + task
 	}
+	// Card content width: lipgloss v2's Width is BORDER-BOX (the border
+	// columns count inside it), so the frame draws at exactly c.w cells
+	// and the content budget folds at c.w-2 — the same foldStyledRows
+	// hanging-indent math the flat rows used, minus the border pair.
+	innerW := c.w - 2
+	if innerW < 1 {
+		innerW = 1
+	}
+	var rows []string
 	if expanded {
-		if c.threadRows != nil {
-			// the header row under construction is the NEXT line of b
-			c.threadRows[strings.Count(b.String(), "\n")+1] = g.name
-		}
 		// long threads WRAP with aligned continuations — never
 		// truncate a path the user might need to read
-		for j, ln := range foldStyledRows("┌ "+head, c.w, c.w-2) {
-			if j == 0 {
-				b.WriteString("\n" + chrome.DimText.Render(ln))
-			} else {
-				b.WriteString("\n" + chrome.DimText.Render("  "+ln))
+		for j, ln := range foldStyledRows("▴ ┌ "+head, innerW, innerW-2) {
+			if j > 0 {
+				ln = "  " + ln
 			}
+			rows = append(rows, chrome.DimText.Render(ln))
 		}
 		for _, m := range g.lines {
 			if m.Kind == wthinkKind {
-				c.renderWThink(b, m, full)
+				rows = append(rows, c.wthinkRows(m, full, innerW)...)
 				continue
 			}
-			for j, ln := range foldStyledRows("│ "+workerToolLine(m), c.w, c.w-2) {
-				if j == 0 {
-					b.WriteString("\n" + chrome.ToolStyle.Render(ln))
-				} else {
-					b.WriteString("\n" + chrome.ToolStyle.Render("│ "+ln))
+			for j, ln := range foldStyledRows("│ "+workerToolLine(m), innerW, innerW-2) {
+				if j > 0 {
+					ln = "│ " + ln
 				}
+				rows = append(rows, chrome.ToolStyle.Render(ln))
 			}
 		}
-		return
-	}
-	tools, thinks := 0, 0
-	for _, m := range g.lines {
-		if m.Kind == wthinkKind {
-			thinks++
-		} else {
-			tools++
-		}
-	}
-	unit := "tool calls"
-	if tools == 1 {
-		unit = "tool call"
-	}
-	summary := head + " (· " + itoa(tools) + " " + unit
-	if thinks > 0 {
-		// the collapsed summary KEEPS the think count ("· 3 think");
-		// a summary without thoughts renders byte-identical to before
-		summary += " · " + itoa(thinks) + " think"
-	}
-	summaryStyle := chrome.DimText
-	if stopped {
-		// /stop unwind: the thread collapsed because the sessions were
-		// aborted, not because the work returned
-		summary += " ✗ stopped)"
-		summaryStyle = chrome.ErrText.Faint(true)
 	} else {
-		summary += " ✓ done)"
+		tools, thinks := 0, 0
+		for _, m := range g.lines {
+			if m.Kind == wthinkKind {
+				thinks++
+			} else {
+				tools++
+			}
+		}
+		unit := "tool calls"
+		if tools == 1 {
+			unit = "tool call"
+		}
+		summary := "▾ " + head + " (· " + itoa(tools) + " " + unit
+		if thinks > 0 {
+			// the collapsed summary KEEPS the think count ("· 3 think")
+			summary += " · " + itoa(thinks) + " think"
+		}
+		summaryStyle := chrome.DimText
+		if stopped {
+			// /stop unwind: the thread collapsed because the sessions
+			// were aborted, not because the work returned
+			summary += " ✗ stopped)"
+			summaryStyle = chrome.ErrText.Faint(true)
+		} else {
+			summary += " ✓ done)"
+		}
+		for j, ln := range foldStyledRows(summary, innerW, innerW-2) {
+			if j > 0 {
+				ln = "  " + ln
+			}
+			rows = append(rows, summaryStyle.Render(ln))
+		}
 	}
 	if c.threadRows != nil {
-		// the collapsed summary IS the thread's header — clickable too
-		// (click a collapsed thread to re-expand it)
-		c.threadRows[strings.Count(b.String(), "\n")+1] = g.name
+		// the card's top border cap AND its header/summary row (the NEXT
+		// lines of b, in that order) are the toggle click target
+		base := strings.Count(b.String(), "\n")
+		c.threadRows[base+1] = g.name
+		c.threadRows[base+2] = g.name
 	}
-	for j, ln := range foldStyledRows(summary, c.w, c.w-2) {
-		if j == 0 {
-			b.WriteString("\n" + summaryStyle.Render(ln))
-		} else {
-			b.WriteString("\n" + summaryStyle.Render("  "+ln))
-		}
-	}
+	// PanelBox carries the house rounded border; the border ink is Dim so
+	// the card frames read as quiet chrome, not conversation text.
+	b.WriteString("\n" + chrome.PanelBox.BorderForeground(chrome.Dim).Width(c.w).Render(strings.Join(rows, "\n")))
 }
 
-// renderWThink renders one merged employee thinking entry inside a work
-// thread. In the LIVE view (thread expanded because the agent is working)
-// it is a single dim-italic "│ thinking · N lines" row; on a FULL expand
-// (ctrl+g / per-agent mouse override) the body renders too — the same
-// collapsed-vs-expanded shape as the boss's thinking blocks, capped to
-// the stream tail (the freshest thinkStreamLines lines).
-func (c *Chat) renderWThink(b *strings.Builder, m state.ChatMsg, full bool) {
+// wthinkRows renders one merged employee thinking entry as CARD CONTENT
+// rows (innerW cells each — the card's border columns are the caller's).
+// While the card shows tool rows it is a single dim-italic "│ thinking ·
+// N lines" row; on a FULL expand (ctrl+g / per-agent mouse override) the
+// body renders too — the same collapsed-vs-expanded shape as the boss's
+// thinking blocks, capped to the stream tail (the freshest
+// thinkStreamLines lines).
+func (c *Chat) wthinkRows(m state.ChatMsg, full bool, innerW int) []string {
 	think := chrome.DimText.Italic(true)
 	// fold at the FULL body budget ("│   " is 4 cells) so no row clips
-	lines := foldStyledRows(m.Text, c.w-4, c.w-4)
+	lines := foldStyledRows(m.Text, innerW-4, innerW-4)
 	if !full {
-		b.WriteString("\n" + think.Render(clipPlain("│ thinking · "+countLines(lines)+" lines", c.w)))
-		return
+		return []string{think.Render(clipPlain("│ thinking · "+countLines(lines)+" lines", innerW))}
 	}
-	b.WriteString("\n" + think.Render(clipPlain("│ thinking", c.w)))
+	rows := []string{think.Render(clipPlain("│ thinking", innerW))}
 	shown := lines
 	if more := len(lines) - thinkStreamLines; more > 0 {
-		b.WriteString("\n" + think.Render(clipPlain("│   … "+itoa(more)+" more above", c.w)))
+		rows = append(rows, think.Render(clipPlain("│   … "+itoa(more)+" more above", innerW)))
 		shown = lines[more:]
 	}
 	for _, ln := range shown {
-		b.WriteString("\n" + chrome.DimText.Render("│   "+ln))
+		rows = append(rows, chrome.DimText.Render("│   "+ln))
 	}
+	return rows
 }
 
 // thinkStreamLines caps the visible body of a STREAMING think block —
