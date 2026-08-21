@@ -28,24 +28,26 @@ const (
 type demoBackend struct {
 	fl *flow
 
-	mu          sync.Mutex // guards the demo board state below
-	roster      []state.Employee
-	taskByID    map[string]state.BoardTask
-	active      []string            // employees on a brief (receives pulses)
-	blockedIDs  map[string]bool     // waving at the mailbox, not typing
-	pendingPerm map[string]permHold // permission request id -> hold
-	pulseIdx    int
-	ambientBeat int
-	adHocSeq    int
-	chatSeq     int
+	mu              sync.Mutex // guards the demo board state below
+	roster          []state.Employee
+	taskByID        map[string]state.BoardTask
+	active          []string            // employees on a brief (receives pulses)
+	blockedIDs      map[string]bool     // waving at the mailbox, not typing
+	pendingPerm     map[string]permHold // permission request id -> hold
+	pendingQuestion map[string]permHold // question request id -> hold
+	pulseIdx        int
+	ambientBeat     int
+	adHocSeq        int
+	chatSeq         int
 }
 
 func newDemoBackend() *demoBackend {
 	return &demoBackend{
-		fl:          newFlow(),
-		taskByID:    make(map[string]state.BoardTask),
-		blockedIDs:  make(map[string]bool),
-		pendingPerm: make(map[string]permHold),
+		fl:              newFlow(),
+		taskByID:        make(map[string]state.BoardTask),
+		blockedIDs:      make(map[string]bool),
+		pendingPerm:     make(map[string]permHold),
+		pendingQuestion: make(map[string]permHold),
 	}
 }
 
@@ -113,8 +115,15 @@ func (b *demoBackend) Start(emit func(state.Event)) error {
 	})
 
 	// t+2s: the boss wants a steer — a real question request (the UI would
-	// answer it in a question modal).
+	// answer it in a question modal). The hold is registered so
+	// AnswerQuestion/RejectQuestion can resolve the same id.
 	b.fl.at(2*time.Second, func() {
+		b.mu.Lock()
+		b.pendingQuestion["que-demo-1"] = permHold{
+			SessionID: "boss", EmployeeID: "boss", EmployeeName: "boss",
+			Title: "question", Summary: "internal/app/model.go | internal/state/state.go",
+		}
+		b.mu.Unlock()
 		b.fl.emit(state.Event{Kind: state.EvQuestion, QuestionID: "que-demo-1", SessionID: "boss",
 			EmployeeID: "boss", EmployeeName: "boss",
 			Text:        "Which file should I touch first?",
@@ -355,6 +364,59 @@ func (b *demoBackend) AnswerPermission(permissionID, response string) error {
 	b.fl.emit(state.Event{Kind: state.EvPermission, PermissionID: permissionID,
 		SessionID: hold.SessionID, EmployeeID: hold.EmployeeID, EmployeeName: hold.EmployeeName,
 		ToolName: hold.Title, ToolSummary: response, ToolState: "resolved"})
+	return nil
+}
+
+// ---------------------------------------------------------------- question replies
+
+// AnswerQuestion resolves a pending demo question: logs the answers on the
+// status line and emits a "resolved" EvQuestion on the same id so the UI
+// drops the question modal.
+func (b *demoBackend) AnswerQuestion(requestID string, answers []string) error {
+	if b.fl.isStopped() {
+		return errors.New("backend stopped")
+	}
+	b.mu.Lock()
+	hold, ok := b.pendingQuestion[requestID]
+	delete(b.pendingQuestion, requestID)
+	if !ok {
+		hold = permHold{
+			SessionID: "boss", EmployeeID: "boss", EmployeeName: "boss",
+			Title: "question", Summary: "demo question",
+		}
+	}
+	b.mu.Unlock()
+
+	b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
+		"[demo] answered question %s: %s", requestID, strings.Join(answers, ", "))})
+	b.fl.emit(state.Event{Kind: state.EvQuestion, QuestionID: requestID,
+		SessionID: hold.SessionID, EmployeeID: hold.EmployeeID, EmployeeName: hold.EmployeeName,
+		ToolSummary: "answered", ToolState: "resolved"})
+	return nil
+}
+
+// RejectQuestion rejects a pending demo question: analogous status line
+// plus a "resolved" EvQuestion on the same id.
+func (b *demoBackend) RejectQuestion(requestID string) error {
+	if b.fl.isStopped() {
+		return errors.New("backend stopped")
+	}
+	b.mu.Lock()
+	hold, ok := b.pendingQuestion[requestID]
+	delete(b.pendingQuestion, requestID)
+	if !ok {
+		hold = permHold{
+			SessionID: "boss", EmployeeID: "boss", EmployeeName: "boss",
+			Title: "question", Summary: "demo question",
+		}
+	}
+	b.mu.Unlock()
+
+	b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
+		"[demo] rejected question %s", requestID)})
+	b.fl.emit(state.Event{Kind: state.EvQuestion, QuestionID: requestID,
+		SessionID: hold.SessionID, EmployeeID: hold.EmployeeID, EmployeeName: hold.EmployeeName,
+		ToolSummary: "rejected", ToolState: "resolved"})
 	return nil
 }
 

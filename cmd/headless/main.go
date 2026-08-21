@@ -17,6 +17,20 @@
 //	grafeio-headless --answer   after the first permission event prints,
 //	                            call backend.AnswerPermission(pid, "once") and
 //	                            print the result (demo: clears tekton-1's block)
+//	grafeio-headless --ask      question-loop regression probe (forces live):
+//	                            auto-sends the question-tool prompt, answers the
+//	                            FIRST pending EvQuestion via
+//	                            backend.AnswerQuestion 2s after it surfaces, then
+//	                            asserts inside a 15s TOTAL budget (measured from
+//	                            process start; the serve spawn eats into it):
+//	                            the question resolved event AND a final
+//	                            completed chat-boss whose text references the
+//	                            answer. Prints "QUESTION-LOOP: FIXED" (exit 0) or
+//	                            "QUESTION-LOOP: STUCK" (exit 1).
+//
+// The plain demo run also auto-answers its scripted boss question
+// (que-demo-1, 800ms after it surfaces) so the registration + resolved
+// lines always show.
 //
 // Every state.Event is printed as one line (kind + key fields) so a smoke
 // run can assert the floor contract without a renderer.
@@ -40,12 +54,23 @@ func main() {
 	prompt := flag.String("prompt", "", "live mode: send this prompt after the primary session is ready and wait up to 60s for the completion")
 	prompt2 := flag.String("prompt2", "", "live mode: after prompt completes, send this second prompt and run the stale-reply assertions (prints STALE-REPRO: FIXED|BUG)")
 	answer := flag.Bool("answer", false, "auto-answer the first permission prompt with \"once\" and print the result")
+	ask := flag.Bool("ask", false, "live mode: question-loop probe — send the question-tool prompt, AnswerQuestion the first pending question after 2s, assert resolution (15s budget, QUESTION-LOOP: FIXED|STUCK)")
 	flag.Parse()
 
 	if *prompt2 != "" && *prompt == "" {
 		fmt.Fprintln(os.Stderr, "--prompt2 requires --prompt")
 		os.Exit(2)
 	}
+	if *ask && (*prompt != "" || *prompt2 != "") {
+		fmt.Fprintln(os.Stderr, "--ask is a standalone probe: do not combine with --prompt/--prompt2")
+		os.Exit(2)
+	}
+	if *ask {
+		*live = true
+		*demo = false
+	}
+	// 15s TOTAL budget for --ask, measured from before the serve spawn.
+	askDeadline := time.Now().Add(15 * time.Second)
 
 	var b state.Backend
 	var runFor time.Duration
@@ -67,6 +92,19 @@ func main() {
 	var mu sync.Mutex
 	ticks := 0
 	var answerPID string // first PENDING permission id seen, under mu
+	// Question auto-answer: the plain demo run always answers its scripted
+	// boss question; live mode answers ONLY under --ask. askDelay/askAnswers
+	// differ per mode (--ask spec: 2s and the one-line wire answer).
+	autoAsk := !*live || *ask
+	askDelay := 800 * time.Millisecond
+	askAnswers := []string{"internal/state/state.go"}
+	if *live {
+		askDelay = 2 * time.Second
+		askAnswers = []string{"the recommended per-block toggle"}
+	}
+	var askQID string         // first PENDING question id seen, under mu
+	var questionResolved bool // under mu: a resolved EvQuestion arrived
+	var askErr string         // under mu: AnswerQuestion failure text
 	// Every completed (non-pending) chat-boss body, in arrival order — the
 	// stale-repro assertions read this; emit feeds bossCh non-blocking.
 	bossCh := make(chan string, 256)
@@ -84,10 +122,20 @@ func main() {
 		// synchronously from inside AnswerPermission — calling here would
 		// deadlock on mu).
 		answerNow := false
+		askNow := false
 		mu.Lock()
 		if *answer && answerPID == "" && e.Kind == state.EvPermission && e.ToolState != "resolved" {
 			answerPID = e.PermissionID
 			answerNow = true
+		}
+		// Question auto-answer capture: the backend call happens OUTSIDE the
+		// emit lock (same deadlock reasoning as --answer above).
+		if autoAsk && askQID == "" && e.Kind == state.EvQuestion && e.ToolState == "pending" {
+			askQID = e.QuestionID
+			askNow = true
+		}
+		if e.Kind == state.EvQuestion && e.ToolState == "resolved" {
+			questionResolved = true
 		}
 		if e.Kind == state.EvTick {
 			ticks++
@@ -144,11 +192,81 @@ func main() {
 				}
 			})
 		}
+		if askNow {
+			qid := askQID
+			fmt.Printf("[ask] question %s captured; auto-answering in %s with %q\n", qid, askDelay, askAnswers)
+			time.AfterFunc(askDelay, func() {
+				err := b.AnswerQuestion(qid, askAnswers)
+				mu.Lock()
+				defer mu.Unlock()
+				if err != nil {
+					askErr = err.Error()
+					fmt.Printf("[ask] question %s -> ERROR: %v\n", qid, err)
+				} else {
+					fmt.Printf("[ask] question %s -> ok (backend.AnswerQuestion(%q, %q))\n", qid, qid, askAnswers)
+				}
+			})
+		}
 	}
 
 	fmt.Printf("[mode] %s\n", b.Mode())
 	if err := b.Start(emit); err != nil {
 		fail("start", err)
+	}
+
+	// --ask: question-loop regression probe. Send the question-tool prompt,
+	// the emit callback auto-answers the first pending question (2s delay,
+	// per spec), then assert against the 15s total budget measured from
+	// process start (the serve spawn already consumed part of it).
+	if *ask {
+		askPrompt := "use the question tool to ask me exactly ONE question and then, after my answer, confirm back what I answered."
+		fmt.Printf("[ask] prompt %q\n", askPrompt)
+		if err := b.Send(askPrompt); err != nil {
+			fail("send", err)
+		}
+		remaining := time.Until(askDeadline)
+		if remaining < 0 {
+			remaining = 0
+		}
+		turn := collectTurn(bossCh, remaining)
+		mu.Lock()
+		qid := askQID
+		resolved := questionResolved
+		aerr := askErr
+		mu.Unlock()
+		final := ""
+		if len(turn) > 0 {
+			final = turn[len(turn)-1]
+		}
+		failures := 0
+		check := func(ok bool, label string) {
+			if ok {
+				fmt.Printf("[assert] PASS %s\n", label)
+			} else {
+				failures++
+				fmt.Printf("[assert] FAIL %s\n", label)
+			}
+		}
+		check(qid != "", "a question request surfaced (EvQuestion pending)")
+		check(aerr == "", "backend.AnswerQuestion round-trip succeeded")
+		check(resolved, "question resolved event arrived (EvQuestion resolved)")
+		check(len(turn) > 0 && strings.Contains(strings.ToLower(final), "toggle"),
+			"final completed chat-boss references the answer (\"toggle\")")
+		if len(turn) > 0 {
+			for i, t := range turn {
+				fmt.Printf("[assert] completed bubble #%d %q\n", i+1, trunc(t, 200))
+			}
+		}
+		if err := b.Stop(); err != nil {
+			fail("stop", err)
+		}
+		fmt.Println("[done] backend stopped")
+		if failures == 0 {
+			fmt.Println("QUESTION-LOOP: FIXED")
+			return
+		}
+		fmt.Printf("QUESTION-LOOP: STUCK (%d check(s) failed)\n", failures)
+		os.Exit(1)
 	}
 
 	// --prompt: Start only returns after the primary session exists, so the

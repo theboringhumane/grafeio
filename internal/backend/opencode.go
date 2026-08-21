@@ -498,6 +498,62 @@ func (b *liveBackend) AnswerPermission(permissionID, response string) error {
 	return b.doJSON(http.MethodPost, "/session/"+hold.SessionID+"/permissions/"+permissionID, legacy, nil)
 }
 
+// ---------------------------------------------------------------- question replies
+
+// AnswerQuestion replies to a pending question request. This is THE fix for
+// the question-loop deadlock: the opencode agent loop PARKS at
+// question.asked and resumes only when the question API gets a reply — a
+// normal chat prompt does NOT answer it, so chat used to sit queued forever.
+//
+// Primary route is the modern global one (POST /question/{requestID}/reply,
+// opencode 1.18.19 /doc: body {"answers": [["label"], ...]} — one
+// string-array per asked question; -> 200 boolean). Fallback is the
+// session-scoped v2 route
+// (POST /api/session/{sessionID}/question/{requestID}/reply, same body
+// shape) keyed by the session the request was seen on via the normCtx hold.
+// NOTE: /doc 1.18.19 exposes NO /session/{id}/questions/... legacy shim for
+// questions the way permissions had — the v2 route is the only fallback.
+func (b *liveBackend) AnswerQuestion(requestID string, answers []string) error {
+	if b.fl.isStopped() {
+		return errors.New("backend stopped")
+	}
+	wrapped := make([][]string, len(answers))
+	for i, a := range answers {
+		wrapped[i] = []string{a}
+	}
+	body, _ := json.Marshal(map[string]any{"answers": wrapped})
+	if err := b.doJSON(http.MethodPost, "/question/"+requestID+"/reply", body, nil); err == nil {
+		return nil
+	}
+	b.mu.Lock()
+	hold, ok := b.ctx.pendingQuestions[requestID]
+	b.mu.Unlock()
+	if !ok || hold.SessionID == "" {
+		return errors.New("question.reply failed and the request's session is unknown")
+	}
+	return b.doJSON(http.MethodPost, "/api/session/"+hold.SessionID+"/question/"+requestID+"/reply", body, nil)
+}
+
+// RejectQuestion declines a pending question request outright (opencode
+// serve DOES expose a true reject — /doc 1.18.19: POST
+// /question/{requestID}/reject, no request body, -> 200 boolean). Fallback
+// is the session-scoped v2 reject on the request's captured session.
+func (b *liveBackend) RejectQuestion(requestID string) error {
+	if b.fl.isStopped() {
+		return errors.New("backend stopped")
+	}
+	if err := b.doJSON(http.MethodPost, "/question/"+requestID+"/reject", nil, nil); err == nil {
+		return nil
+	}
+	b.mu.Lock()
+	hold, ok := b.ctx.pendingQuestions[requestID]
+	b.mu.Unlock()
+	if !ok || hold.SessionID == "" {
+		return errors.New("question.reject failed and the request's session is unknown")
+	}
+	return b.doJSON(http.MethodPost, "/api/session/"+hold.SessionID+"/question/"+requestID+"/reject", nil, nil)
+}
+
 // ---------------------------------------------------------------- diffs
 
 // fetchDiffAndEmit pulls GET /session/{id}/diff on completion paths that may

@@ -88,6 +88,18 @@ type Model struct {
 	perm     *permPrompt
 	permEscd *permPrompt
 
+	// Question holds (boss/primary session only): question is the OPEN
+	// hold whose modal replaces the textarea (a free-text input, unlike
+	// the y/a/n permission modal); questionEscd is the latest esc'd-but-
+	// unanswered hold /question can re-open. questionParked survives
+	// defer: the opencode turn is parked at the question reply API (not
+	// "typing") until a completed chat-boss arrives after resolution, so
+	// the message queue must NOT flush and typed text keeps enqueuing.
+	question       *questionHold
+	questionEscd   *questionHold
+	questionParked bool
+	parkedStatus   string // StatusLine saved at park, restored at unpark
+
 	// activeThink — CallIDs with an OPEN boss EvThought stream (Done not
 	// yet seen). Model-owned (the reducer stays pure): the chat panel
 	// consults this set to render streaming blocks expanded/livecoded
@@ -102,6 +114,15 @@ type permPrompt struct {
 	ID       string
 	ToolName string
 	Summary  string
+}
+
+// questionHold is a pending boss question hold. IDs batches every pending
+// wire request id of one question call (v1: ONE typed answer answers each
+// batched id); Text/Options render the modal header + dim options list.
+type questionHold struct {
+	IDs     []string
+	Text    string
+	Options string
 }
 
 // chatSentMsg fires after backend.Send succeeds — the local user bubble and
@@ -129,6 +150,15 @@ type permAnswerMsg struct{ response string }
 // permLaterMsg fires on esc — the prompt stays pending, re-openable with
 // /perm.
 type permLaterMsg struct{}
+
+// questionAnswerMsg fires when the user hits Enter in an open question
+// modal — the typed text goes through AnswerQuestion (this is the fix: a
+// plain Send parks the opencode loop at the question reply API forever).
+type questionAnswerMsg struct{ text string }
+
+// questionLaterMsg fires on esc in an open question modal — the hold
+// stays pending, re-openable with /question.
+type questionLaterMsg struct{}
 
 // New builds the app around a backend. backend.Start is NOT called here —
 // main owns that (goroutine → tea.Program.Send).
@@ -176,6 +206,14 @@ func New(b state.Backend) Model {
 		},
 		func() tea.Cmd {
 			return func() tea.Msg { return permLaterMsg{} }
+		},
+	)
+	chat.SetQuestionHandlers(
+		func(text string) tea.Cmd {
+			return func() tea.Msg { return questionAnswerMsg{text: text} }
+		},
+		func() tea.Cmd {
+			return func() tea.Msg { return questionLaterMsg{} }
 		},
 	)
 	m.tabs.SetState(m.st)
@@ -255,6 +293,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.chat.SetPermission(nil)
 			m.notice("esc'd permission pending (/perm)")
 		}
+	case questionAnswerMsg:
+		if m.question != nil {
+			hold := m.question
+			m.question = nil
+			m.chat.SetQuestion(nil)
+			b := m.backend
+			text := msg.text
+			cmds = append(cmds, func() tea.Msg {
+				// v1: ONE typed string answers every pending QuestionID of
+				// the hold — a question call batching several ids still
+				// unblocks them all with the same answer.
+				if b != nil {
+					for _, qid := range hold.IDs {
+						if err := b.AnswerQuestion(qid, []string{text}); err != nil {
+							return sendErrMsg{err: err}
+						}
+					}
+				}
+				return nil
+			})
+		}
+	case questionLaterMsg:
+		if m.question != nil {
+			m.questionEscd = m.question
+			m.question = nil
+			m.chat.SetQuestion(nil)
+			m.notice("(question deferred — /question to reopen)")
+		}
 	case state.Event:
 		cmds = append(cmds, m.applyEvent(msg))
 	default:
@@ -330,10 +396,14 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 // applyEvent reduces one backend event, feeds panels + activity log, and
 // re-arms the animation tick. Returns the next cmd when needed.
 func (m *Model) applyEvent(ev state.Event) tea.Cmd {
-	// permission prompts are model-owned UI state (not chat history) —
-	// handle before the reducer (the reducer leaves them untouched).
+	// permission prompts + question holds are model-owned UI state (not
+	// chat history) — handle before the reducer (the reducer also uses
+	// the parked state: a question modal drops the typing placeholder).
 	if ev.Kind == state.EvPermission {
 		m.handlePermissionEvent(ev)
+	}
+	if ev.Kind == state.EvQuestion {
+		m.handleQuestionEvent(ev)
 	}
 
 	// Think-stream bookkeeping (model-owned; the reducer stays pure):
@@ -375,10 +445,28 @@ func (m *Model) applyEvent(ev state.Event) tea.Cmd {
 			return state.Event{Kind: state.EvTick}
 		})
 	}
+	// A completed boss bubble unblocks a parked question turn: the hold
+	// resolved, the server resumed — the chat goes back to "typing" and
+	// queued messages flush again.
+	if m.questionParked && ev.Kind == state.EvChatBoss && !ev.Msg.Pending {
+		m.questionParked = false
+		if m.st.StatusLine == "[question] boss is waiting for your answer…" {
+			m.st.StatusLine = m.parkedStatus
+		}
+		if m.chat != nil {
+			m.chat.SetQuestionWaiting(false)
+		}
+		qdebugf("question resolved: completed boss reply unblocks queue")
+		if len(m.queue) > 0 {
+			return m.flushQueued()
+		}
+	}
 	if !prevPending && hasPendingBoss(m.st) && m.chat != nil {
 		return m.chat.SpinnerKick()
 	}
-	if prevPending && !hasPendingBoss(m.st) && len(m.queue) > 0 {
+	// While a question hold is outstanding the turn is PARKED at the
+	// question reply API — not completed — so the queue must NOT flush.
+	if prevPending && !hasPendingBoss(m.st) && len(m.queue) > 0 && !m.questionParked {
 		// the boss reply landed: flush the queue, one message per 400ms
 		return m.flushQueued()
 	}
@@ -440,6 +528,81 @@ func (m *Model) handlePermissionEvent(ev state.Event) {
 		ToolName: ev.ToolName,
 		Summary:  ev.ToolSummary,
 	})
+}
+
+// handleQuestionEvent opens/closes the boss question hold. Boss/primary
+// requests (pending ToolState) park the turn: the open hold REPLACES the
+// textarea with a free-text answer modal (opencode waits at the question
+// reply API — typing a chat message would queue but never resume it, the
+// reported deadlock). "resolved" closes the matching hold silently.
+// Employee questions never open a modal — activity line only, like
+// employee thoughts/permissions.
+func (m *Model) handleQuestionEvent(ev state.Event) {
+	if ev.ToolState == "resolved" {
+		if m.question != nil && hasQuestionID(m.question.IDs, ev.QuestionID) {
+			m.question = nil
+			m.chat.SetQuestion(nil)
+		}
+		if m.questionEscd != nil && hasQuestionID(m.questionEscd.IDs, ev.QuestionID) {
+			m.questionEscd = nil
+		}
+		return
+	}
+	if ev.EmployeeName != "" && ev.EmployeeName != "boss" {
+		return // child question: activity line only, no modal
+	}
+	if ev.QuestionID == "" {
+		return
+	}
+	// v1: while ANY hold is outstanding, a fresh pending boss question is
+	// folded into it — a question call batching several QuestionIDs emits
+	// one event per id; one typed answer unblocks every batched id.
+	if m.question != nil {
+		m.question.IDs = append(m.question.IDs, ev.QuestionID)
+		return
+	}
+	if m.questionEscd != nil {
+		m.questionEscd.IDs = append(m.questionEscd.IDs, ev.QuestionID)
+		return
+	}
+	m.parkForQuestion()
+	m.question = &questionHold{IDs: []string{ev.QuestionID},
+		Text: ev.Text, Options: ev.ToolSummary}
+	m.chat.SetQuestion(&panels.QuestionView{
+		ID:      ev.QuestionID,
+		Text:    ev.Text,
+		Options: ev.ToolSummary,
+	})
+}
+
+// parkForQuestion marks the turn parked at the question reply API: any
+// pending boss typing placeholder ("boss-N") is dropped (the turn is
+// WAITING, not typing), the status line reads "waiting for your answer",
+// and the chat placeholder/enqueue gate flips to question-waiting.
+func (m *Model) parkForQuestion() {
+	m.questionParked = true
+	kept := make([]state.ChatMsg, 0, len(m.st.Chat))
+	for _, c := range m.st.Chat {
+		if c.From == "boss" && c.Pending && strings.HasPrefix(c.ID, "boss-") {
+			continue
+		}
+		kept = append(kept, c)
+	}
+	m.st.Chat = kept
+	m.parkedStatus = m.st.StatusLine
+	m.st.StatusLine = "[question] boss is waiting for your answer…"
+	if m.chat != nil {
+		m.chat.SetQuestionWaiting(true)
+	}
+}
+
+func hasQuestionID(ids []string, id string) bool {
+	for _, i := range ids {
+		if i == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Model) resize(w, h int) {
@@ -837,6 +1000,23 @@ func reducer(st state.OfficeState, ev state.Event) state.OfficeState {
 
 	case state.EvQuestion:
 		{
+			// a resolved boss question MUTATES the original Kind "question"
+			// chat entry in place: Meta gains a trailing "␟answered" unit-
+			// separator token (the options stay ahead of it) so the panel
+			// renders the dim "✓ answered" suffix instead of the hint.
+			if ev.ToolState == "resolved" && ev.QuestionID != "" {
+				id := "q-" + ev.QuestionID
+				for i, m := range st.Chat {
+					if m.Kind == "question" && m.ID == id &&
+						!strings.HasSuffix(m.Meta, "\x1fanswered") {
+						next := append([]state.ChatMsg(nil), st.Chat...)
+						next[i].Meta = m.Meta + "\x1fanswered"
+						st.Chat = next
+						break
+					}
+				}
+				return st
+			}
 			// boss questions: Kind "question" chat entry (yellow "boss asks ›").
 			// Employee questions are activity-line only (describeEvent), like
 			// employee thoughts — the deep-work stream belongs to the boss.
@@ -935,6 +1115,7 @@ const slashHelp = `commands:
   /queue             show enqueued messages
   /queue clear       drop all enqueued messages
   /perm              re-open an esc'd permission prompt
+  /question          re-open a deferred boss question
   /status            office status
   /quit              exit grafeio`
 
@@ -1016,6 +1197,22 @@ func (m *Model) applySlash(input string) tea.Cmd {
 			ID:       m.perm.ID,
 			ToolName: m.perm.ToolName,
 			Summary:  m.perm.Summary,
+		})
+	case "/question":
+		if m.question != nil {
+			m.notice("boss question is open — answer it or esc to defer")
+			return nil
+		}
+		if m.questionEscd == nil || len(m.questionEscd.IDs) == 0 {
+			m.notice("no deferred boss question (/question re-opens a deferred question)")
+			return nil
+		}
+		m.question = m.questionEscd
+		m.questionEscd = nil
+		m.chat.SetQuestion(&panels.QuestionView{
+			ID:      m.question.IDs[0],
+			Text:    m.question.Text,
+			Options: m.question.Options,
 		})
 	case "/status":
 		var pend, doing, done int

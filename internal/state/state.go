@@ -196,5 +196,17 @@ type Backend interface {
 	// AnswerPermission replies to a pending permission prompt. response is
 	// "once" | "always" | "reject" (opencode serve permission.reply enum).
 	AnswerPermission(permissionID, response string) error
+	// AnswerQuestion replies to a pending question request (the boss used
+	// the question tool; the agent loop is PARKED at question.asked until
+	// the question API gets this reply — a normal chat prompt does NOT
+	// answer it, which is the question-loop deadlock). answers is one
+	// string per asked question, in order (ui picks one label or free-form
+	// text per question); the backend wraps each in its own array for the
+	// wire shape (QuestionAnswer = string[], payload answers = string[][]).
+	AnswerQuestion(requestID string, answers []string) error
+	// RejectQuestion declines a pending question request outright, freeing
+	// the parked turn without an answer (opencode serve exposes a true
+	// reject route: POST /question/{requestID}/reject, /doc 1.18.19).
+	RejectQuestion(requestID string) error
 	Stop() error
 }

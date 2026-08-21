@@ -2,32 +2,38 @@
 //
 // Layout inside the tab panel (top → bottom):
 //
-//	viewport  — the whole conversation, glamour-rendered markdown.
-//	            user turns are plain-wrapped and prefixed cyan "you › ";
-//	            boss turns are rendered THROUGH GLAMOUR as markdown
-//	            (**bold**, lists, fences format + wrap) with a yellow
-//	            "boss › " hanging indent.
-//	            Kind "think" entries render as dim-italic thinking blocks —
-//	            LIVE while their CallID streams (spinner header, growing
-//	            tail, always expanded), then COLLAPSED to
-//	            "thinking · N lines" until ctrl+t expands all;
-//	            Kind "tool" entries render as dim one-liners merged by CallID;
-//	            From "office" entries render as dim local notices (red when
-//	            Meta == "error").
-//	spinner   — shown only while a boss reply is pending WITH NO TEXT YET
-//	            (" boss is typing…"). A pending boss bubble WITH text renders
-//	            in the viewport itself as a streaming "boss ›" turn: glamour
-//	            markdown re-rendered per delta plus a blinking dim caret "▌"
-//	            at the tail (blink follows the office tick) — the spinner row
-//	            disappears once the bubble speaks for itself.
-//	divider
-//	textarea  — multiline input; Enter sends, Shift+Enter (or Ctrl+J) is a
-//	            newline, placeholder "talk to the boss…". NEVER locked: while
-//	            the boss is typing, Enter ENQUEUES (the app owns the queue)
-//	            and the placeholder reads "boss is typing… · N queued".
-//	            While a permission prompt is open, the prompt MODAL replaces
-//	            this region: y/a/n answers, esc defers; every other key still
-//	            types into the (hidden) textarea.
+//		viewport  — the whole conversation, glamour-rendered markdown.
+//		            user turns are plain-wrapped and prefixed cyan "you › ";
+//		            boss turns are rendered THROUGH GLAMOUR as markdown
+//		            (**bold**, lists, fences format + wrap) with a yellow
+//		            "boss › " hanging indent.
+//		            Kind "think" entries render as dim-italic thinking blocks —
+//		            LIVE while their CallID streams (spinner header, growing
+//		            tail, always expanded), then COLLAPSED to
+//		            "thinking · N lines" until ctrl+t expands all;
+//		            Kind "tool" entries render as dim one-liners merged by CallID;
+//		            From "office" entries render as dim local notices (red when
+//		            Meta == "error").
+//		spinner   — shown only while a boss reply is pending WITH NO TEXT YET
+//		            (" boss is typing…"). A pending boss bubble WITH text renders
+//		            in the viewport itself as a streaming "boss ›" turn: glamour
+//		            markdown re-rendered per delta plus a blinking dim caret "▌"
+//		            at the tail (blink follows the office tick) — the spinner row
+//		            disappears once the bubble speaks for itself.
+//		divider
+//		textarea  — multiline input; Enter sends, Shift+Enter (or Ctrl+J) is a
+//		            newline, placeholder "talk to the boss…". NEVER locked: while
+//		            the boss is typing, Enter ENQUEUES (the app owns the queue)
+//	           and the placeholder reads "boss is typing… · N queued".
+//		            While a permission prompt is open, the prompt MODAL replaces
+//		            this region: y/a/n answers, esc defers; every other key still
+//		            types into the (hidden) textarea.
+//		question  — while a boss question hold is open, the QUESTION MODAL
+//		            replaces this region: a free-text input (enter submits via
+//		            AnswerQuestion, esc defers → /question re-opens); the
+//		            textarea is DISABLED. While the hold is outstanding
+//		            (open or deferred) the placeholder reads "boss is waiting
+//		            for your answer… · N queued" and Enter still enqueues.
 //
 // Scroll: mouse wheel + PgUp/PgDn always scroll the conversation; ↑/↓ move
 // inside a multi-line draft and scroll the conversation otherwise. ctrl+t
@@ -61,6 +67,7 @@ const (
 
 	placeholderIdle = "talk to the boss…"
 	placeholderBusy = "boss is typing…"
+	placeholderWait = "boss is waiting for your answer…"
 
 	textareaH = 3 // rows of multiline input at the bottom of the tab
 )
@@ -94,6 +101,18 @@ type PermissionView struct {
 	Summary  string
 }
 
+// QuestionView is the open boss question modal the chat panel renders in
+// place of the textarea (set/cleared by the app via SetQuestion). Unlike
+// the permission prompt — choice keys, text stays live — the question
+// modal OWNS every typed key into its own free-text input line: the turn
+// is parked at the question reply API, so the textarea is disabled until
+// the answer goes through AnswerQuestion (or esc defers).
+type QuestionView struct {
+	ID      string // pending wire request id ("que-…")
+	Text    string // the boss's question
+	Options string // dim options list ("a | b | c"), may be empty
+}
+
 // Chat is the chat tab panel.
 type Chat struct {
 	vp     viewport.Model
@@ -101,12 +120,21 @@ type Chat struct {
 	sp     spinner.Model
 	onSend func(text string) tea.Cmd
 
-	// Queue + permission seams (set by the app at build time).
-	onEnqueue    func(text string) tea.Cmd // Enter while boss pending
+	// Queue + permission + question seams (set by the app at build time).
+	onEnqueue    func(text string) tea.Cmd // Enter while boss pending / question parked
 	onPermAnswer func(response string) tea.Cmd
 	onPermLater  func() tea.Cmd // esc defers the prompt
 	perm         *PermissionView
 	queueLen     int
+
+	// Question modal — open boss question hold replaces the textarea
+	// entirely (questionWaiting survives esc-defer: the turn stays parked
+	// and typed text ENQUEUES until the resolved + completed boss reply).
+	question         *QuestionView
+	onQuestionAnswer func(text string) tea.Cmd
+	onQuestionLater  func() tea.Cmd
+	qInput           string // the modal's own free-text input buffer
+	questionWaiting  bool   // question hold outstanding (open or deferred)
 
 	chat    []state.ChatMsg // rendered snapshot
 	pending bool
@@ -235,6 +263,33 @@ func (c *Chat) SetPermissionHandlers(answer func(response string) tea.Cmd, later
 // replaces the textarea region.
 func (c *Chat) SetPermission(p *PermissionView) { c.perm = p }
 
+// SetQuestionHandlers wires the app's question answer/defer callbacks:
+// Enter submits the modal input (→ AnswerQuestion), esc defers (/question
+// re-opens).
+func (c *Chat) SetQuestionHandlers(answer func(text string) tea.Cmd, later func() tea.Cmd) {
+	c.onQuestionAnswer, c.onQuestionLater = answer, later
+}
+
+// SetQuestion opens (non-nil) or closes (nil) the boss question modal that
+// replaces the textarea region. Opening clears the modal's input buffer;
+// the modal height differs from the textarea's, so the layout splits again.
+func (c *Chat) SetQuestion(q *QuestionView) {
+	c.question = q
+	if q != nil {
+		c.qInput = ""
+	}
+	c.SetSize(c.w, c.h)
+}
+
+// SetQuestionWaiting marks whether a boss question hold is outstanding
+// (open or esc-deferred). While waiting the placeholder reads "boss is
+// waiting for your answer…" and Enter ENQUEUES — the turn is parked at
+// the question reply API, not typing.
+func (c *Chat) SetQuestionWaiting(on bool) {
+	c.questionWaiting = on
+	c.refreshPlaceholder()
+}
+
 // SetQueueLen updates the queue count shown in the busy placeholder
 // ("boss is typing… · N queued"). The queue itself lives in the app model.
 func (c *Chat) SetQueueLen(n int) {
@@ -243,17 +298,24 @@ func (c *Chat) SetQueueLen(n int) {
 }
 
 // refreshPlaceholder recomputes the textarea placeholder from pending +
-// queue state.
+// queue + question-hold state. A parked question turn (WAITING, not
+// typing) wins over the typing text in both wording and queue badge.
 func (c *Chat) refreshPlaceholder() {
-	if !c.pending {
+	base := ""
+	switch {
+	case c.questionWaiting:
+		base = placeholderWait
+	case c.pending:
+		base = placeholderBusy
+	default:
 		c.ta.Placeholder = placeholderIdle
 		return
 	}
 	if c.queueLen > 0 {
-		c.ta.Placeholder = placeholderBusy + " · " + itoa(c.queueLen) + " queued"
+		c.ta.Placeholder = base + " · " + itoa(c.queueLen) + " queued"
 		return
 	}
-	c.ta.Placeholder = placeholderBusy
+	c.ta.Placeholder = base
 }
 
 // SetShowThinking shows/hides collected thinking blocks (/thinking on|off).
@@ -316,7 +378,8 @@ func (c *Chat) Pending() bool { return c.pending }
 func (c *Chat) SpinnerKick() tea.Cmd { return c.sp.Tick }
 
 // SetSize implements Tab: splits content height across viewport / spinner /
-// divider / textarea.
+// divider / bottom region (textarea, permission modal, or question modal —
+// the question modal is the one region with a DIFFERENT row count).
 func (c *Chat) SetSize(w, h int) {
 	if w < 4 {
 		w = 4
@@ -326,7 +389,11 @@ func (c *Chat) SetSize(w, h int) {
 	if c.pendingSpin {
 		spH = 1
 	}
-	vpH := h - textareaH - 1 /* divider */ - spH
+	regionH := textareaH
+	if c.question != nil {
+		regionH = c.questionModalH()
+	}
+	vpH := h - regionH - 1 /* divider */ - spH
 	if vpH < 1 {
 		vpH = 1
 	}
@@ -404,6 +471,53 @@ func (c *Chat) SetState(st state.OfficeState) {
 func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
+		// While a boss question modal is open, the normal textarea is
+		// DISABLED entirely: typed text edits the modal's OWN input line,
+		// enter submits the answer, esc defers. Scrolling still works.
+		if c.question != nil {
+			switch msg.String() {
+			case "enter":
+				text := strings.TrimSpace(c.qInput)
+				if text == "" {
+					return nil
+				}
+				c.follow = true
+				c.vp.GotoBottom()
+				if c.onQuestionAnswer != nil {
+					return c.onQuestionAnswer(text)
+				}
+				return nil
+			case "esc":
+				if c.onQuestionLater != nil {
+					return c.onQuestionLater()
+				}
+				return nil
+			case "backspace":
+				if r := []rune(c.qInput); len(r) > 0 {
+					c.qInput = string(r[:len(r)-1])
+				}
+				return nil
+			case "ctrl+u":
+				c.qInput = ""
+				return nil
+			case "up", "down", "pgup", "pgdown":
+				var cmd tea.Cmd
+				c.vp, cmd = c.vp.Update(msg)
+				if msg.String() == "down" || msg.String() == "pgdown" {
+					if c.vp.AtBottom() {
+						c.follow = true
+					}
+				} else {
+					c.follow = false
+				}
+				return cmd
+			default:
+				if msg.Text != "" {
+					c.qInput += msg.Text
+				}
+				return nil
+			}
+		}
 		// While a permission prompt is open, y/a/n/esc are RESERVED (they
 		// never reach the textarea); every other key keeps typing normally
 		// — the prompt is non-modal to text.
@@ -448,7 +562,7 @@ func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 				}
 				return nil
 			}
-			if c.pending && c.onEnqueue != nil {
+			if (c.pending || c.questionWaiting) && c.onEnqueue != nil {
 				return c.onEnqueue(text)
 			}
 			if c.onSend != nil {
@@ -504,13 +618,62 @@ func (c *Chat) View() string {
 	b.WriteString("\n")
 	b.WriteString(chrome.DimText.Render(fitPlain(strings.Repeat("─", c.w), c.w)))
 	b.WriteString("\n")
-	if c.perm != nil {
+	if c.question != nil {
+		// the question modal REPLACES the textarea region, full width
+		b.WriteString(c.renderQuestionModal())
+	} else if c.perm != nil {
 		// the permission modal REPLACES the textarea region, full width
 		b.WriteString(c.renderPermission())
 	} else {
 		b.WriteString(c.ta.View())
 	}
 	return b.String()
+}
+
+// questionModalH — rows the open question modal occupies: header + dim
+// options (when present) + 2 input rows (wrap budget) + footer hint.
+func (c *Chat) questionModalH() int {
+	n := 2 + 2 // header + footer hint + input budget
+	if c.question != nil && c.question.Options != "" {
+		n++
+	}
+	return n
+}
+
+// renderQuestionModal draws the boss question modal in the textarea region
+// (questionModalH rows, full width): yellow bold "boss asks: <question>"
+// header with a dim options list, then the free-text input line (2-row
+// wrap budget — longer answers scroll to their tail), then the hint.
+func (c *Chat) renderQuestionModal() string {
+	lines := make([]string, 0, c.questionModalH())
+	lines = append(lines, chrome.QuestionText.Bold(true).Render(
+		fitPlain("boss asks: "+c.question.Text, c.w)))
+	if c.question.Options != "" {
+		lines = append(lines, chrome.DimText.Render(
+			fitPlain("  "+c.question.Options, c.w)))
+	}
+	wrapped := strings.Split(strings.TrimRight(wrapPlain(c.qInput, c.w-2), "\n"), "\n")
+	if len(wrapped) > 2 {
+		// over budget: keep the tail visible (the caret end)
+		wrapped = wrapped[len(wrapped)-2:]
+	}
+	for i := 0; i < 2; i++ {
+		row := ""
+		if i < len(wrapped) {
+			row = wrapped[i]
+		}
+		prefix := chrome.Fg(chrome.Accent, "› ")
+		if i == 1 {
+			prefix = "  " // wrap continuation hangs under the prompt
+			if row == "" {
+				prefix = ""
+			}
+		}
+		lines = append(lines, fitPlain(prefix+row, c.w))
+	}
+	lines = append(lines, chrome.DimText.Italic(true).Render(
+		fitPlain("enter: answer · esc: answer later", c.w)))
+	return strings.Join(lines, "\n")
 }
 
 // renderPermission draws the permission prompt modal in the textarea
@@ -675,9 +838,16 @@ func renderTool(m state.ChatMsg) string {
 }
 
 // renderQuestion renders one Kind="question" entry (boss question tool):
-// yellow "boss asks › <text>", dim options inline when present, and the
-// "(answer by typing below)" hint.
+// yellow "boss asks › <text>", dim options inline when present, then the
+// "(answer by typing below)" hint while pending — or a dim "✓ answered"
+// suffix once the resolved event landed (the app reducer marks Meta with
+// a trailing ␟answered unit-separator token, keeping the options intact).
 func (c *Chat) renderQuestion(b *strings.Builder, m state.ChatMsg) {
+	options := m.Meta
+	answered := false
+	if parts := strings.Split(m.Meta, diffMetaSep); len(parts) == 2 && parts[1] == "answered" {
+		options, answered = parts[0], true
+	}
 	qPrefix := "boss asks › "
 	indent := strings.Repeat(" ", len(qPrefix))
 	wrapW := c.w - len(qPrefix) - 1 // prefix + panel padding, before vp soft-wrap
@@ -686,12 +856,16 @@ func (c *Chat) renderQuestion(b *strings.Builder, m state.ChatMsg) {
 		lines[i] = chrome.QuestionText.Render(lines[i])
 	}
 	writePrefixed(b, chrome.QuestionText.Bold(true).Render(qPrefix), indent, lines)
-	if m.Meta != "" {
-		for _, ln := range strings.Split(strings.TrimRight(wrapPlain("("+m.Meta+")", wrapW), "\n"), "\n") {
+	if options != "" {
+		for _, ln := range strings.Split(strings.TrimRight(wrapPlain("("+options+")", wrapW), "\n"), "\n") {
 			b.WriteString(indent + chrome.DimText.Render(ln) + "\n")
 		}
 	}
-	b.WriteString(indent + chrome.DimText.Italic(true).Render("(answer by typing below)"))
+	if answered {
+		b.WriteString(indent + chrome.DimText.Render("✓ answered") + "\n")
+	} else {
+		b.WriteString(indent + chrome.DimText.Italic(true).Render("(answer by typing below)"))
+	}
 }
 
 // renderDiff renders one Kind="diff" entry opencode-style. Collapsed

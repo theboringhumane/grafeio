@@ -31,6 +31,21 @@
 //	                                A message is typed mid-stream to prove the
 //	                                queue holds until the final bubble; the
 //	                                ordering trace prints enqueue/done/flush.)
+//	                    [--ask-answer] (question-hold proof: boss EvQuestion q-1
+//	                                opens the answer modal at 1.5s (parked turn —
+//	                                typing placeholder removed); typing "the
+//	                                toggle one" + enter at 2.5s must hit
+//	                                AnswerQuestion, the entry gains a dim
+//	                                "✓ answered", the resumed boss reply closes
+//	                                the turn. Prints BOTH frames + the capture
+//	                                log; an employee question stays activity-only.)
+//	                    [--ask-esc]   (esc defers the hold with a notice,
+//	                                /question re-opens it, answer still via
+//	                                AnswerQuestion)
+//	                    [--ask-queue] (queue-hold proof: a line typed while the
+//	                                hold is outstanding ENQUEUES; flush fires
+//	                                only after resolved + completed boss reply —
+//	                                ordering trace prints it)
 package main
 
 import (
@@ -142,9 +157,11 @@ type stubBackend struct {
 	flushQueue bool              // --debug: script resolves the round-2 pending boss
 	thinkMode  bool              // --think: script streams one think CallID instead
 	streamMode bool              // --stream: script streams one "bossmsg-" reply instead
+	askMode    string            // --ask-*: "" | "answer" | "esc" | "queue" (question-hold proof)
 	permAnswer string            // recorded by AnswerPermission for the final print
 	sendSeq    int               // unique reply IDs per Send (replace-by-ID safety)
-	trace      func(line string) // --stream: ordering-trace sink
+	answerLog  []string          // recorded by AnswerQuestion/RejectQuestion (the capture proof)
+	trace      func(line string) // --stream/--ask-*: ordering-trace sink
 }
 
 func mail(id, from, to, subject, body string, kind state.MailKind) state.MailItem {
@@ -174,6 +191,10 @@ func (b *stubBackend) script() {
 	}
 	if b.streamMode {
 		b.scriptStream(at)
+		return
+	}
+	if b.askMode != "" {
+		b.scriptAsk(at)
 		return
 	}
 
@@ -218,9 +239,19 @@ func (b *stubBackend) script() {
 
 	// deep-work stream: boss question (chat entry, yellow) + an employee
 	// question (activity line ONLY — no chat entry), then diffs for both.
+	// The boss question opens the answer modal — resolve it quickly after
+	// the entry has landed so LATER scripted workloads (--slash typing at
+	// ~1950ms, --perm at 3s, the queue typing at ~3060ms) are not
+	// swallowed by the modal (the entry keeps the dim "✓ answered").
 	at(1920, state.Event{Kind: state.EvQuestion, EmployeeName: "boss", QuestionID: "q-1",
 		Text:        "Which DB should the leaderboard use?",
 		ToolSummary: "postgres | sqlite | keep it in memory"})
+	at(1935, state.Event{Kind: state.EvQuestion, EmployeeName: "boss", QuestionID: "q-1",
+		ToolSummary: "answered", ToolState: "resolved"})
+	// the resumed server finishes the parked turn with a completed reply
+	// (the contract that unblocks the parked queue path again)
+	at(1975, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("b2", "boss",
+		"sqlite it is — local, zero setup, fits the leaderboard.", false)})
 	at(1960, state.Event{Kind: state.EvQuestion, EmployeeName: "tekton-1", QuestionID: "q-2",
 		Text: "employee question — activity line only, no chat entry"})
 	at(2000, state.Event{Kind: state.EvFileDiff, EmployeeName: "boss",
@@ -308,6 +339,30 @@ func (b *stubBackend) scriptThink(at func(ms int, ev state.Event)) {
 	at(2900, thought("th-1", part4, true)) // Done: final accumulated text
 }
 
+// scriptAsk (--ask-*) — the question-hold deadlock proof: the boss parks
+// the turn at the question reply API and a plain typed chat message must
+// NOT be Send()n — it must go through AnswerQuestion. Timeline: user
+// message + typing placeholder at 150/200ms, a REGRESSION employee
+// question at 1200ms (activity line only, never a modal), then the boss
+// EvQuestion q-1 pending at 1500ms — the modal opens, the "boss-1"
+// placeholder is REMOVED (parked, not typing), and the hold waits for the
+// harness (see ask*Workload). Answering → the stub emits "resolved" +
+// a completed boss reply (scriptAsk's server-resume leg lives in
+// AnswerQuestion, like the real opencode round trip).
+func (b *stubBackend) scriptAsk(at func(ms int, ev state.Event)) {
+	at(50, state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — question-hold stub online"})
+	at(150, state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
+		"summarize the flagged rows", false)})
+	at(200, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-1", "boss", "", true)})
+	// regression: an employee question stays activity-line only, no chat
+	// entry, no modal — even while the boss hold opens a beat later
+	at(1200, state.Event{Kind: state.EvQuestion, EmployeeName: "tekton-1", QuestionID: "q-2",
+		Text: "employee question — activity line only, no chat entry"})
+	at(1500, state.Event{Kind: state.EvQuestion, EmployeeName: "boss", QuestionID: "q-1",
+		Text:        "Which toggle do you want me to flip — the feature flag or the dark-mode switch?",
+		ToolSummary: "the toggle one | dark mode | both"})
+}
+
 func (b *stubBackend) Mode() state.Mode { return state.ModeDemo }
 
 func (b *stubBackend) Start(emit func(state.Event)) error {
@@ -391,6 +446,54 @@ func (b *stubBackend) AnswerPermission(permissionID, response string) error {
 	return nil
 }
 
+// AnswerQuestion records the reply (capture proof for --ask-*) and plays
+// the resumed server: the matching "resolved" event a beat later, then a
+// COMPLETED boss reply — the contract leg that unblocks the parked queue.
+func (b *stubBackend) AnswerQuestion(requestID string, answers []string) error {
+	line := fmt.Sprintf("AnswerQuestion(%s, [%s])", requestID, strings.Join(answers, ", "))
+	b.answerLog = append(b.answerLog, line)
+	if b.trace != nil {
+		b.trace("[ask] " + line)
+	}
+	if b.emit != nil {
+		emit := b.emit
+		time.AfterFunc(200*time.Millisecond, func() {
+			if b.trace != nil {
+				b.trace("[ask] resolved: " + requestID)
+			}
+			emit(state.Event{Kind: state.EvQuestion, QuestionID: requestID,
+				EmployeeName: "boss", ToolSummary: "answered", ToolState: "resolved"})
+		})
+		time.AfterFunc(450*time.Millisecond, func() {
+			if b.trace != nil {
+				b.trace("[ask] server resumed: completed boss reply")
+			}
+			b.sendSeq++
+			emit(state.Event{Kind: state.EvChatBoss, Msg: chatMsg(
+				fmt.Sprintf("bq-%d", b.sendSeq),
+				"boss", "flipped — thanks, that clears it.", false)})
+		})
+	}
+	return nil
+}
+
+// RejectQuestion records the reply; the hold resolves like an answer.
+func (b *stubBackend) RejectQuestion(requestID string) error {
+	line := fmt.Sprintf("RejectQuestion(%s)", requestID)
+	b.answerLog = append(b.answerLog, line)
+	if b.trace != nil {
+		b.trace("[ask] " + line)
+	}
+	if b.emit != nil {
+		emit := b.emit
+		time.AfterFunc(200*time.Millisecond, func() {
+			emit(state.Event{Kind: state.EvQuestion, QuestionID: requestID,
+				EmployeeName: "boss", ToolSummary: "rejected", ToolState: "resolved"})
+		})
+	}
+	return nil
+}
+
 func (b *stubBackend) Stop() error { return nil }
 
 // slashWorkload simulates the user typing a slash command into the chat
@@ -443,6 +546,58 @@ func permWorkload(p *tea.Program) {
 func diffsWorkload(p *tea.Program) {
 	time.Sleep(2200 * time.Millisecond)
 	p.Send(tea.KeyPressMsg(tea.Key{Code: 'd', Mod: tea.ModCtrl}))
+}
+
+// askTypeLine types a line into the open boss question modal rune by rune
+// and hits Enter — the text must land in the modal's OWN input (the
+// textarea is disabled while the hold is open).
+func askTypeLine(p *tea.Program, s string) {
+	for _, r := range s {
+		p.Send(tea.KeyPressMsg(tea.Key{Code: r, Text: string(r)}))
+		time.Sleep(8 * time.Millisecond)
+	}
+	p.Send(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	time.Sleep(60 * time.Millisecond)
+}
+
+// askEsc presses esc — with an open question modal this DEFERS the hold
+// (notice "(question deferred — /question to reopen)").
+func askEsc(p *tea.Program) {
+	p.Send(tea.KeyPressMsg(tea.Key{Code: tea.KeyEscape}))
+	time.Sleep(60 * time.Millisecond)
+}
+
+// askAnswerWorkload (--ask-answer): at 2.5s the user types "the toggle
+// one" + enter into the open modal → must hit AnswerQuestion, never Send.
+func askAnswerWorkload(p *tea.Program) {
+	time.Sleep(2500 * time.Millisecond)
+	askTypeLine(p, "the toggle one")
+}
+
+// askEscWorkload (--ask-esc): esc defers the hold, /question re-opens it,
+// the answer still routes through AnswerQuestion.
+func askEscWorkload(p *tea.Program) {
+	time.Sleep(2300 * time.Millisecond)
+	askEsc(p)
+	time.Sleep(500 * time.Millisecond)
+	askTypeLine(p, "/question")
+	time.Sleep(300 * time.Millisecond)
+	askTypeLine(p, "the toggle one")
+}
+
+// askQueueWorkload (--ask-queue): the queue-hold proof — a message typed
+// while the hold is DEFERRED-but-outstanding must ENQUEUE (the turn is
+// parked, flushing it would re-create the deadlock); answering q-1 then
+// resolving + the completed boss reply must flush it, in that order.
+func askQueueWorkload(p *tea.Program) {
+	time.Sleep(2300 * time.Millisecond)
+	askEsc(p)
+	time.Sleep(300 * time.Millisecond)
+	askTypeLine(p, "fix the badge too") // enqueued — turn is parked
+	time.Sleep(600 * time.Millisecond)
+	askTypeLine(p, "/question") // re-open the deferred hold
+	time.Sleep(300 * time.Millisecond)
+	askTypeLine(p, "the toggle one") // AnswerQuestion → resume → flush
 }
 
 // runThinkShot runs one fresh app+program against a think-mode stub for
@@ -554,6 +709,77 @@ func runStreamShot(dur time.Duration) (string, []string, error) {
 	return fm.Frame(), lines, nil
 }
 
+// runAskShot runs one fresh app+program against a question-hold stub for
+// `dur`, driving the ask workload for `mode`, then returns the final
+// frame, the ordering trace, and the stub's captured answer calls.
+func runAskShot(mode string, dur time.Duration) (string, []string, []string, error) {
+	tl := &traceLog{start: time.Now()}
+	backend := &stubBackend{done: make(chan struct{}), askMode: mode, trace: tl.add}
+	m := app.New(backend)
+	if !m.SelectTab("chat") {
+		return "", nil, nil, fmt.Errorf("unknown tab %q", "chat")
+	}
+	p := tea.NewProgram(m,
+		tea.WithWindowSize(shotCols, shotRows),
+		tea.WithoutRenderer(),
+		tea.WithInput(nil),
+		tea.WithOutput(io.Discard),
+	)
+	app.QueueDebugf = func(format string, args ...any) {
+		tl.add("[queue] " + fmt.Sprintf(format, args...))
+	}
+	emit := func(ev state.Event) { p.Send(ev) }
+	if err := backend.Start(emit); err != nil {
+		return "", nil, nil, err
+	}
+	switch mode {
+	case "answer":
+		go askAnswerWorkload(p)
+	case "esc":
+		go askEscWorkload(p)
+	case "queue":
+		go askQueueWorkload(p)
+	}
+	go func() {
+		time.Sleep(dur)
+		p.Quit()
+	}()
+	final, err := p.Run()
+	if err != nil {
+		return "", nil, nil, err
+	}
+	fm, ok := final.(app.Model)
+	if !ok {
+		return "", nil, nil, fmt.Errorf("unexpected final model type %T", final)
+	}
+	app.QueueDebugf = nil
+	tl.mu.Lock()
+	lines := append([]string(nil), tl.lines...)
+	tl.mu.Unlock()
+	return fm.Frame(), lines, backend.answerLog, nil
+}
+
+// printAskCapture prints the stub's captured AnswerQuestion/RejectQuestion
+// calls and FAILS the run when the expected capture is missing (the
+// deadlock regression: the answer must never fall through to Send).
+func printAskCapture(capture []string, want string) {
+	fmt.Println("--- stub capture log ---")
+	found := false
+	for _, line := range capture {
+		fmt.Println(line)
+		if strings.Contains(line, want) {
+			found = true
+		}
+	}
+	if len(capture) == 0 {
+		fmt.Println("<empty>")
+	}
+	if !found {
+		fmt.Fprintf(os.Stderr, "uishot: expected capture %q missing\n", want)
+		os.Exit(1)
+	}
+}
+
 func main() {
 	tab := flag.String("tab", defaultTab, "active tab: chat|agents|board|mail|activity")
 	theme := flag.String("theme", "", "force a ui theme: "+strings.Join(chrome.ThemeNames(), "|"))
@@ -564,10 +790,13 @@ func main() {
 	think := flag.Bool("think", false, "think-stream proof: one CallID streamed in accumulated updates, prints BOTH frames (t=2.0s mid-stream expanded, t=3.2s collapsed after Done)")
 	thinkStop := flag.String("think-stop", "", "with --think: print ONE frame only (mid = t=2.0s streaming, done = t=3.2s collapsed) for the gallery shot")
 	stream := flag.Bool("stream", false, "chat-stream proof: one \"bossmsg-m1\" reply streamed as 5 accumulated pending updates then pinned; prints frame mid-stream (bubble + caret, spinner gone) and after done (single settled bubble) plus the enqueue/done/flush ordering trace")
+	askAnswer := flag.Bool("ask-answer", false, "question-hold proof: boss EvQuestion opens the answer modal (typing placeholder removed, park status line); typing + enter routes through AnswerQuestion — prints BOTH frames (modal open / after answered) + the stub capture log")
+	askEsc := flag.Bool("ask-esc", false, "question-hold proof: esc defers the modal (notice), /question re-opens it, the answer still routes through AnswerQuestion")
+	askQueue := flag.Bool("ask-queue", false, "queue-hold proof: a message typed while the question hold is outstanding must ENQUEUE; AnswerQuestion → resolved → completed boss reply → flush, ordering trace printed")
 	flag.Parse()
 
-	// keystroke workloads only reach the textarea / prompt on the chat tab
-	if (*slash || *perm || *diffs || *debug || *think) && *tab == defaultTab {
+	// keystroke workloads only reach the textarea / modal on the chat tab
+	if (*slash || *perm || *diffs || *debug || *think || *askAnswer || *askEsc || *askQueue) && *tab == defaultTab {
 		*tab = "chat"
 	}
 
@@ -577,6 +806,48 @@ func main() {
 				strings.Join(chrome.ThemeNames(), ", "))
 			os.Exit(2)
 		}
+	}
+
+	if *askAnswer || *askEsc || *askQueue {
+		mode, stop2, label2 := "answer", 3600*time.Millisecond,
+			"frame 2 — t=3.6s (AFTER ANSWER: modal closed, dim ✓ answered on the entry, resumed boss reply)"
+		switch {
+		case *askEsc:
+			mode, stop2, label2 = "esc", 4300*time.Millisecond,
+				"frame 2 — t=4.3s (deferred notice → /question reopen → ✓ answered)"
+		case *askQueue:
+			mode, stop2, label2 = "queue", 4700*time.Millisecond,
+				"frame 2 — t=4.7s (queued line held through the hold, flushed after the resumed reply)"
+		}
+		stops := []struct {
+			at    time.Duration
+			label string
+		}{
+			{2200 * time.Millisecond, "frame 1 — t=2.2s (MODAL OPEN: boss asks, typing placeholder REMOVED — parked, not typing)"},
+			{stop2, label2},
+		}
+		var trace, capture []string
+		for i, s := range stops {
+			frame, t, c, err := runAskShot(mode, s.at)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "uishot: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("===== UI SHOT · %s =====\n", s.label)
+			fmt.Println(frame)
+			fmt.Println("===== UI SHOT =====")
+			if i == len(stops)-1 {
+				trace, capture = t, c
+			}
+		}
+		if len(trace) > 0 {
+			fmt.Println("--- ordering trace ---")
+			for _, ln := range trace {
+				fmt.Println(ln)
+			}
+		}
+		printAskCapture(capture, "AnswerQuestion(q-1, [the toggle one])")
+		return
 	}
 
 	if *think {

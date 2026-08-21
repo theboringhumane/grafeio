@@ -160,22 +160,23 @@ type ocSSEEvent struct {
 // normCtx is the mutable reducer-side context (TS: NormCtx). Not
 // goroutine-safe on its own — the owning backend holds a mutex.
 type normCtx struct {
-	employees      map[string]state.Employee // child session id -> employee
-	tasks          map[string]state.BoardTask
-	nameCounts     map[state.EmployeeRole]int // role -> last issued number
-	seatSeq        int
-	lastWorkingAt  map[string]int64    // child id -> last "working" emit time (ms)
-	returned       map[string]bool     // child sessions that already returned
-	fired          map[string]bool     // dedupe delete-event vs delete-call
-	pendingPerms   map[string]permHold // permission/question request id -> hold
-	diffSeen       map[string]bool     // sessionID|path -> already surfaced
-	reasoningParts map[string]bool     // part id -> a message.part.updated said "reasoning"
-	reasoningAccum map[string]string   // part id -> delta-accumulated transcript so far
-	deltaBuffer    map[string]string   // part id -> deltas seen BEFORE the part was classified
-	textParts      map[string]bool     // part id -> message.part.updated classified a STREAMING text part (primary only)
-	textPartMsg    map[string]string   // text part id -> its messageID (deltas key the boss bubble)
-	textAccum      map[string]string   // messageID -> delta-accumulated answer text so far
-	textStart      map[string]int64    // messageID -> stream start (ms; Msg.At for every update of the bubble)
+	employees        map[string]state.Employee // child session id -> employee
+	tasks            map[string]state.BoardTask
+	nameCounts       map[state.EmployeeRole]int // role -> last issued number
+	seatSeq          int
+	lastWorkingAt    map[string]int64    // child id -> last "working" emit time (ms)
+	returned         map[string]bool     // child sessions that already returned
+	fired            map[string]bool     // dedupe delete-event vs delete-call
+	pendingPerms     map[string]permHold // permission request id -> hold
+	pendingQuestions map[string]permHold // question request id -> hold (mirror of pendingPerms; question replies free the PARKED turn)
+	diffSeen         map[string]bool     // sessionID|path -> already surfaced
+	reasoningParts   map[string]bool     // part id -> a message.part.updated said "reasoning"
+	reasoningAccum   map[string]string   // part id -> delta-accumulated transcript so far
+	deltaBuffer      map[string]string   // part id -> deltas seen BEFORE the part was classified
+	textParts        map[string]bool     // part id -> message.part.updated classified a STREAMING text part (primary only)
+	textPartMsg      map[string]string   // text part id -> its messageID (deltas key the boss bubble)
+	textAccum        map[string]string   // messageID -> delta-accumulated answer text so far
+	textStart        map[string]int64    // messageID -> stream start (ms; Msg.At for every update of the bubble)
 }
 
 // thoughtCapRunes bounds a thought transcript. Raised from the old 400 (a
@@ -200,21 +201,22 @@ type permHold struct {
 
 func newNormCtx() *normCtx {
 	return &normCtx{
-		employees:      make(map[string]state.Employee),
-		tasks:          make(map[string]state.BoardTask),
-		nameCounts:     make(map[state.EmployeeRole]int),
-		lastWorkingAt:  make(map[string]int64),
-		returned:       make(map[string]bool),
-		fired:          make(map[string]bool),
-		pendingPerms:   make(map[string]permHold),
-		diffSeen:       make(map[string]bool),
-		reasoningParts: make(map[string]bool),
-		reasoningAccum: make(map[string]string),
-		deltaBuffer:    make(map[string]string),
-		textParts:      make(map[string]bool),
-		textPartMsg:    make(map[string]string),
-		textAccum:      make(map[string]string),
-		textStart:      make(map[string]int64),
+		employees:        make(map[string]state.Employee),
+		tasks:            make(map[string]state.BoardTask),
+		nameCounts:       make(map[state.EmployeeRole]int),
+		lastWorkingAt:    make(map[string]int64),
+		returned:         make(map[string]bool),
+		fired:            make(map[string]bool),
+		pendingPerms:     make(map[string]permHold),
+		pendingQuestions: make(map[string]permHold),
+		diffSeen:         make(map[string]bool),
+		reasoningParts:   make(map[string]bool),
+		reasoningAccum:   make(map[string]string),
+		deltaBuffer:      make(map[string]string),
+		textParts:        make(map[string]bool),
+		textPartMsg:      make(map[string]string),
+		textAccum:        make(map[string]string),
+		textStart:        make(map[string]int64),
 	}
 }
 
@@ -756,7 +758,7 @@ func mapQuestionAsked(p ocQuestionReq, ctx *normCtx, primaryID string) []state.E
 	if summary == "" {
 		summary = "free-form answer"
 	}
-	ctx.pendingPerms[id] = permHold{
+	ctx.pendingQuestions[id] = permHold{
 		SessionID: p.SessionID, EmployeeID: empID, EmployeeName: empName,
 		Title: "question", Summary: summary,
 	}
@@ -779,11 +781,11 @@ func mapQuestionResolved(p ocQuestionReq, ctx *normCtx, primaryID string) []stat
 	if id == "" {
 		id = p.ID
 	}
-	hold, ok := ctx.pendingPerms[id]
+	hold, ok := ctx.pendingQuestions[id]
 	if !ok {
 		return nil
 	}
-	delete(ctx.pendingPerms, id)
+	delete(ctx.pendingQuestions, id)
 	return []state.Event{{
 		Kind: state.EvQuestion, QuestionID: id, SessionID: hold.SessionID,
 		EmployeeID: hold.EmployeeID, EmployeeName: hold.EmployeeName,
