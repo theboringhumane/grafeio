@@ -16,6 +16,7 @@ package app
 import (
 	"fmt"
 	"math/rand"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -32,11 +33,11 @@ import (
 )
 
 const (
-	mailCap      = 30
-	chatCap      = 30
-	thinkCap     = 20  // thinking blocks kept in chat
-	toolCap      = 20  // tool one-liners kept in chat
-	bubbleCap    = 3   // never more than 3 concurrent balloons (drop oldest)
+	mailCap   = 30
+	chatCap   = 30
+	thinkCap  = 20 // thinking blocks kept in chat
+	toolCap   = 20 // tool one-liners kept in chat
+	bubbleCap = 3  // never more than 3 concurrent balloons (drop oldest)
 
 	// Sidebar sizing: the default is 68 cols; brain.json ui.sidebarWidth is
 	// clamped to 26..80 (explicit config wins over /compact); the compact
@@ -46,9 +47,9 @@ const (
 	sidebarMin      = 26
 	sidebarMax      = 80
 
-	degradeCols  = 100 // below this, the sidebar shrinks instead of the floor
-	minCols      = 40
-	minRows      = 12
+	degradeCols = 100 // below this, the sidebar shrinks instead of the floor
+	minCols     = 40
+	minRows     = 12
 
 	// Message queue — the INTELLIGENT BACKLOG: Enter while a boss reply is
 	// pending enqueues a numbered item; the turn-complete flush sends the
@@ -66,6 +67,12 @@ const (
 	// batchRespawnWindow — a session.error on the primary inside this window
 	// of the batch send counts as "the boss died on the batch": ONE respawn.
 	batchRespawnWindow = 5 * time.Second
+
+	// delegatingQuietTicks — boss-side quiet horizon for the delegation
+	// state: a pending boss placeholder with no stream/thought/primary-
+	// tool activity for MORE than this many ticks (and busy workers on the
+	// floor) flips BossDelegating on instead of the lonely "typing…" spin.
+	delegatingQuietTicks = 6
 )
 
 // batchMarker prefixes the ONE composed batch prompt. Machine format (the
@@ -85,10 +92,33 @@ type teamBackend interface {
 	ResetPrimary(forceNew bool) error
 }
 
-// queueEntry — one backlog item: the typed text plus the board row id
-// QueueItemStart handed back ("" when the backend has no team seam).
+// attachmentBackend — the chat-input attachment seam live and demo backends
+// expose beyond state.Backend (same type-assert pattern as teamBackend).
+// The interface method stays out of state.Backend on purpose: harness
+// stubs (uishot/headless) keep their plain-text Send and simply never
+// attach. SendWith sends one prompt carrying file parts for atts (the
+// backend reads each Attachment.Path at send time).
+type attachmentBackend interface {
+	SendWith(text string, atts []state.Attachment) error
+}
+
+// sendChat pushes one prompt through the attachment seam when the backend
+// implements it, else falls back to the plain-text Send. The fallback can
+// only fire in harness stubs — live and demo both implement the seam.
+func sendChat(b state.Backend, text string, atts []state.Attachment) error {
+	if ab, ok := b.(attachmentBackend); ok {
+		return ab.SendWith(text, atts)
+	}
+	return b.Send(text)
+}
+
+// queueEntry — one backlog item: the typed text, its chat-input
+// attachments (they must survive the busy wait and ride the flush), and
+// the board row id QueueItemStart handed back ("" when the backend has no
+// team seam).
 type queueEntry struct {
 	text    string
+	atts    []state.Attachment
 	boardID string
 }
 
@@ -100,6 +130,40 @@ func qdebugf(format string, args ...any) {
 	if QueueDebugf != nil {
 		QueueDebugf(format, args...)
 	}
+}
+
+// cleanupAttachments removes panel-created temp dirs (pasted images live in
+// os.MkdirTemp "grafeio-paste-*", Attachment.Temp). Best-effort, and ONLY
+// ever called after a send has resolved: enqueue must not clean (the flush
+// still needs the file), and the batch respawn path keeps them for its one
+// retry — the cleanup fires on success or on the terminal failure.
+func cleanupAttachments(atts []state.Attachment) {
+	seen := map[string]bool{}
+	for _, a := range atts {
+		if a.Temp != "" && !seen[a.Temp] {
+			seen[a.Temp] = true
+			_ = os.RemoveAll(a.Temp)
+		}
+	}
+}
+
+// cleanupEntries is cleanupAttachments over a batch of queue entries
+// (their attachments concatenate the same way the flush send sees them).
+func cleanupEntries(items []queueEntry) {
+	for _, it := range items {
+		cleanupAttachments(it.atts)
+	}
+}
+
+// attachNames is the " · "-joined display-name projection of an attachment
+// list (board titles; the backend has its own unexported twin — packages
+// don't share internals).
+func attachNames(atts []state.Attachment) string {
+	names := make([]string, len(atts))
+	for i, a := range atts {
+		names[i] = a.Name
+	}
+	return strings.Join(names, " · ")
 }
 
 // SoundBus — the sound engine seam (the sound dev owns the engine; the app
@@ -202,6 +266,11 @@ type Model struct {
 	// EvChatBoss (pending placeholder OR answer) clears it — a newer boss
 	// turn downgrades older unfinished think entries to collapsed.
 	activeThink map[string]bool
+
+	// lastBossActivity — st.Tick of the last boss-side activity (stream
+	// delta / thought / primary tool / any boss bubble event). Feeds the
+	// delegation reducer hook (applyDelegation, P3).
+	lastBossActivity int
 }
 
 // permPrompt is a pending boss permission request.
@@ -224,6 +293,10 @@ type questionHold struct {
 // the typing placeholder are appended through the normal reducer path.
 type chatSentMsg struct{ text string }
 
+// chatNoticeMsg is the chat panel's office-notice seam (attachment events:
+// cap eviction, backspace removal, image-paste platform gaps).
+type chatNoticeMsg struct{ text string }
+
 // sendErrMsg fires when the backend rejects a prompt.
 type sendErrMsg struct{ err error }
 
@@ -242,8 +315,12 @@ type queueSendErrMsg struct {
 type slashMsg struct{ text string }
 
 // enqueueMsg fires when Enter lands while a boss reply is pending — the
-// text joins the model-level queue instead of reaching the backend.
-type enqueueMsg struct{ text string }
+// text joins the model-level queue instead of reaching the backend. The
+// staged attachments ride along so the flush still has their files.
+type enqueueMsg struct {
+	text string
+	atts []state.Attachment
+}
 
 // queueFlushMsg (400ms tick chain) flushes the next queued message.
 type queueFlushMsg struct{}
@@ -285,7 +362,7 @@ func New(b state.Backend, cfg *config.Config) Model {
 	}
 
 	termTab := newTermTabWrap()
-	chat := panels.NewChat(func(text string) tea.Cmd {
+	chat := panels.NewChat(func(text string, atts []state.Attachment) tea.Cmd {
 		return func() tea.Msg {
 			// Slash commands dispatch locally, never touch the backend, and
 			// never echo as chat-user.
@@ -293,9 +370,11 @@ func New(b state.Backend, cfg *config.Config) Model {
 				return slashMsg{text: text}
 			}
 			if b != nil {
-				if err := b.Send(text); err != nil {
+				if err := sendChat(b, text, atts); err != nil {
+					cleanupAttachments(atts) // nobody will retry this prompt
 					return sendErrMsg{err: err}
 				}
+				cleanupAttachments(atts)
 			}
 			return chatSentMsg{text: text}
 		}
@@ -305,16 +384,16 @@ func New(b state.Backend, cfg *config.Config) Model {
 	agents.SetBossName(bossName)
 	activity := panels.NewActivity()
 	m := Model{
-		backend:     b,
-		cfg:         cfg,
-		gov:         &governor{lastBusy: time.Now()},
-		bossName:    bossName,
-		bossShort:   bossShort,
-		st:          initialState(b.Mode()),
-		chat:        chat,
-		activity:    activity,
-		termTab:     termTab,
-		activeThink: map[string]bool{},
+		backend:          b,
+		cfg:              cfg,
+		gov:              &governor{lastBusy: time.Now()},
+		bossName:         bossName,
+		bossShort:        bossShort,
+		st:               initialState(b.Mode()),
+		chat:             chat,
+		activity:         activity,
+		termTab:          termTab,
+		activeThink:      map[string]bool{},
 		social:           newSocialClock(),
 		lastDispatchTick: -1,
 		tabs: panels.NewTabs(
@@ -330,8 +409,13 @@ func New(b state.Backend, cfg *config.Config) Model {
 	// Queue + permission seams: the panel owns the keys, the model owns the
 	// queue/prompt state; callbacks ferry over tea.Msgs so the model value
 	// copy in Update stays the single writer.
-	chat.SetEnqueue(func(text string) tea.Cmd {
-		return func() tea.Msg { return enqueueMsg{text: text} }
+	chat.SetEnqueue(func(text string, atts []state.Attachment) tea.Cmd {
+		return func() tea.Msg { return enqueueMsg{text: text, atts: atts} }
+	})
+	// Attachment notices (cap eviction, chip removal, image-paste platform
+	// gaps) surface as office chat notices like every other local outcome.
+	chat.SetNoticeHandler(func(text string) tea.Cmd {
+		return func() tea.Msg { return chatNoticeMsg{text: text} }
 	})
 	chat.SetPermissionHandlers(
 		func(response string) tea.Cmd {
@@ -436,6 +520,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// nothing local: backend.Send owns the echo (chat-user + pending boss
 		// bubble) via the event stream — applying them here duplicated the bubbles.
 		m.playSound("send")
+	case chatNoticeMsg:
+		// the chat panel's attachment notices join the office notice feed
+		m.notice(msg.text)
 	case sendErrMsg:
 		m.playSound("error")
 		cmds = append(cmds, m.applyEvent(state.Event{
@@ -448,6 +535,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// fresh session. A retry failure just surfaces the error.
 		if msg.batch && !msg.retry && !m.batchRespawned {
 			if _, ok := m.team(); ok {
+				// no cleanup here — the respawn retry resends the SAME
+				// files, so the temp dirs must still exist.
 				m.batchRespawned = true
 				m.batchSentAt = time.Now()
 				m.respawns++
@@ -457,6 +546,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
+		// terminal failure: no retry is coming for these attachments
+		cleanupEntries(msg.items)
 		m.playSound("error")
 		cmds = append(cmds, m.applyEvent(state.Event{
 			Kind: state.EvStatus,
@@ -472,13 +563,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case enqueueMsg:
 		if len(m.queue) >= queueCap {
 			m.noticeErr(fmt.Sprintf("backlog full (%d) — wait for the boss to catch up, or /queue clear", queueCap))
+			cleanupAttachments(msg.atts) // never queued — nobody else will
 		} else {
 			n := len(m.queue) + 1
-			ent := queueEntry{text: msg.text}
+			ent := queueEntry{text: msg.text, atts: msg.atts}
 			if tb, ok := m.team(); ok {
 				// board row for the backlog item: title is the machine
-				// first-N-chars clip of the typed text.
-				ent.boardID = tb.QueueItemStart(n, clipRunes(msg.text, batchTitleClip))
+				// first-N-chars clip of the typed text (an attach-only
+				// item derives its title from the attachment names instead).
+				title := clipRunes(msg.text, batchTitleClip)
+				if msg.text == "" && len(msg.atts) > 0 {
+					title = clipRunes("attachments: "+attachNames(msg.atts), batchTitleClip)
+				}
+				ent.boardID = tb.QueueItemStart(n, title)
 			}
 			m.queue = append(m.queue, ent)
 			if m.chat != nil {
@@ -681,6 +778,11 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 			m.chat.ToggleDiffs()
 			return nil
 		}
+	case "ctrl+g":
+		if chatActive {
+			m.chat.ToggleThreads()
+			return nil
+		}
 	}
 	return m.tabs.Update(msg)
 }
@@ -802,6 +904,7 @@ func (m *Model) applyEvent(ev state.Event) tea.Cmd {
 
 	prevPending := hasPendingBoss(m.st)
 	m.st = reducer(m.st, ev)
+	m.applyDelegation(ev) // P3 — before panels see the state
 	if m.chat != nil {
 		m.chat.SetStreamingThink(m.activeThink)
 	}
@@ -880,6 +983,48 @@ func (m *Model) applyEvent(ev state.Event) tea.Cmd {
 	return nil
 }
 
+// applyDelegation — P3: while the boss dispatched work to children the
+// primary session can sit quiet at its typing placeholder for minutes
+// (dead feedback: "typing…" while nobody is typing). Track the last
+// boss-side activity and, on every event, recompute st.BossDelegating:
+// a pending boss placeholder exists AND no boss stream/thought/primary-
+// tool activity for > delegatingQuietTicks AND ≥1 hired employee is
+// visibly busy (working/to-manager/meeting). It clears instantly — any
+// boss stream/thought/tool/bubble event refreshes the clock the same
+// reduce, so the >-horizon comparison can never trigger.
+func (m *Model) applyDelegation(ev state.Event) {
+	if isBossActivity(ev) {
+		m.lastBossActivity = m.st.Tick
+	}
+	busy := 0
+	for _, e := range m.st.Employees {
+		if e.Role == state.RoleManager {
+			continue
+		}
+		switch e.Sprite {
+		case state.SpriteWorking, state.SpriteToManager, state.SpriteMeeting:
+			busy++
+		}
+	}
+	m.st.BossDelegating = hasPendingBoss(m.st) && busy > 0 &&
+		m.st.Tick-m.lastBossActivity > delegatingQuietTicks
+}
+
+// isBossActivity — the boss-side event set that resets the delegation
+// quiet clock: any boss chat event (stream delta, placeholder, pinned or
+// error bubble), a boss EvThought, a primary-session EvTool.
+func isBossActivity(ev state.Event) bool {
+	switch ev.Kind {
+	case state.EvChatBoss:
+		return true
+	case state.EvThought:
+		return ev.EmployeeID == "boss" || ev.EmployeeName == "" || ev.EmployeeName == "boss"
+	case state.EvTool:
+		return ev.EmployeeName == "" || ev.EmployeeName == "boss"
+	}
+	return false
+}
+
 // team type-asserts the optional teamBackend seam (live/demo backends).
 func (m *Model) team() (teamBackend, bool) {
 	if m.backend == nil {
@@ -892,6 +1037,8 @@ func (m *Model) team() (teamBackend, bool) {
 // composeBatch builds the ONE batch-dispatch prompt the boss session
 // decomposes per its manager discipline: numbered independent work items,
 // parallel sub-agents for the non-trivial ones, a closing status table.
+// Attachment-carrying items get a machine " 📎N" suffix on their numbered
+// line; the actual file parts ride the same send (dispatchQueued).
 func composeBatch(items []queueEntry) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "[BATCH DISPATCH — %d requests arrived while you were busy. "+
@@ -900,7 +1047,11 @@ func composeBatch(items []queueEntry) string {
 		"manager discipline; then finalize with a one-line-per-item status table.]\n",
 		len(items))
 	for i, it := range items {
-		fmt.Fprintf(&sb, "%d. %s\n", i+1, it.text)
+		fmt.Fprintf(&sb, "%d. %s", i+1, it.text)
+		if n := len(it.atts); n > 0 {
+			fmt.Fprintf(&sb, " 📎%d", n)
+		}
+		sb.WriteString("\n")
 	}
 	return strings.TrimRight(sb.String(), "\n")
 }
@@ -934,8 +1085,10 @@ func (m *Model) dispatchQueued(manual bool) tea.Cmd {
 	}
 	texts := make([]string, len(items))
 	var boardIDs []string
+	var batchAtts []state.Attachment // every item's chips ride the flush
 	for i, it := range items {
 		texts[i] = it.text
+		batchAtts = append(batchAtts, it.atts...)
 		if it.boardID != "" {
 			boardIDs = append(boardIDs, it.boardID)
 		}
@@ -967,9 +1120,12 @@ func (m *Model) dispatchQueued(manual bool) tea.Cmd {
 			return slashMsg{text: texts[0]}
 		}
 		if b != nil {
-			if err := b.Send(sendText); err != nil {
+			if err := sendChat(b, sendText, batchAtts); err != nil {
+				// no cleanup: a respawn retry (queueSendErrMsg) may still
+				// need the files; IT owns the cleanup on terminal failure.
 				return queueSendErrMsg{err: err, items: items, batch: batch, retry: false}
 			}
+			cleanupEntries(items)
 		}
 		return chatSentMsg{text: sendText}
 	}
@@ -977,10 +1133,15 @@ func (m *Model) dispatchQueued(manual bool) tea.Cmd {
 }
 
 // resendBatchCmd — the ONE failure respawn: ResetPrimary(true) then resend
-// the SAME composed batch on the fresh session. Errors come back with
-// retry=true so the loop can never respawn twice for one flush call.
+// the SAME composed batch (attachments included) on the fresh session.
+// Errors come back with retry=true so the loop can never respawn twice for
+// one flush call.
 func (m *Model) resendBatchCmd(items []queueEntry) tea.Cmd {
 	text := composeBatch(items)
+	var atts []state.Attachment
+	for _, it := range items {
+		atts = append(atts, it.atts...)
+	}
 	b := m.backend
 	tb, _ := m.team()
 	return func() tea.Msg {
@@ -990,9 +1151,10 @@ func (m *Model) resendBatchCmd(items []queueEntry) tea.Cmd {
 			}
 		}
 		if b != nil {
-			if err := b.Send(text); err != nil {
+			if err := sendChat(b, text, atts); err != nil {
 				return queueSendErrMsg{err: err, items: items, batch: true, retry: true}
 			}
+			cleanupEntries(items)
 		}
 		return chatSentMsg{text: text}
 	}
@@ -1478,26 +1640,41 @@ func reducer(st state.OfficeState, ev state.Event) state.OfficeState {
 	case state.EvTool:
 		{
 			// tool one-liners merge by CallID: running → done replaces the line.
+			// BOSS/primary tools keep the classic inline "tool" Kind;
+			// EMPLOYEE tools get Kind "wtool" — the chat panel lifts them
+			// out of the flow into the per-agent workers-thread region at
+			// the end (P2), so a sub-agent storm can't drown the boss
+			// conversation. Their Meta carries the tool state plus the
+			// latest activity tick (␟ separator) for the staleness
+			// auto-collapse; merging is scoped per agent+CallID.
 			name := ev.EmployeeName
 			if name == "" {
 				name = "boss"
+			}
+			kind := "tool"
+			id := "tool-" + ev.CallID
+			meta := ev.ToolState
+			if name != "boss" {
+				kind = "wtool"
+				id = "wtool-" + name + "-" + ev.CallID
+				meta = ev.ToolState + "\x1f" + strconv.Itoa(st.Tick)
 			}
 			text := ev.ToolName
 			if ev.ToolSummary != "" {
 				text += " · " + ev.ToolSummary
 			}
 			line := state.ChatMsg{
-				ID:   "tool-" + ev.CallID,
+				ID:   id,
 				From: name,
-				Kind: "tool",
+				Kind: kind,
 				Text: strings.ReplaceAll(text, "\n", " "), // chat rows are one-liners
-				Meta: ev.ToolState,
+				Meta: meta,
 				At:   time.Now().UnixMilli(),
 			}
 			merged := false
 			next := append([]state.ChatMsg(nil), st.Chat...)
 			for i, msg := range next {
-				if msg.Kind == "tool" && msg.ID == line.ID {
+				if msg.Kind == line.Kind && msg.ID == line.ID {
 					next[i] = line
 					merged = true
 					break
@@ -1634,6 +1811,7 @@ const slashHelp = `commands:
   /queue             show the backlog (numbered items batched on flush)
   /queue clear       drop all queued backlog items
   /route             force-dispatch the backlog now (bypasses the busy gate)
+  @<file>            attach file (popover picker) · ctrl+v pastes images
   /perm              re-open an esc'd permission prompt
   /question          re-open a deferred boss question
   /status            office status
@@ -1652,6 +1830,9 @@ func (m *Model) applySlash(input string) tea.Cmd {
 		m.notice(slashHelp)
 	case "/clear":
 		m.st.Chat = nil
+		if m.chat != nil {
+			m.chat.ClearAttachments() // staged chips die with the visible chat
+		}
 		m.tabs.SetState(m.st)
 	case "/theme":
 		if len(fields) < 2 {
@@ -1780,6 +1961,9 @@ func (m *Model) applySlash(input string) tea.Cmd {
 	case "/queue":
 		if len(fields) >= 2 {
 			if fields[1] == "clear" {
+				// dropping the items also drops their sends — the temp
+				// dirs go now (no flush is coming for them).
+				cleanupEntries(m.queue)
 				m.queue = nil
 				if m.chat != nil {
 					m.chat.SetQueueLen(0)
@@ -1802,6 +1986,10 @@ func (m *Model) applySlash(input string) tea.Cmd {
 		}
 		for i, e := range m.queue {
 			fmt.Fprintf(&sb, "\n  %d. %s", i+1, e.text)
+			if n := len(e.atts); n > 0 {
+				// same machine suffix the batch prompt gets
+				fmt.Fprintf(&sb, " 📎%d", n)
+			}
 		}
 		m.notice(sb.String())
 	case "/route":

@@ -279,13 +279,24 @@ func (b *demoBackend) Start(emit func(state.Event)) error {
 
 // ---------------------------------------------------------------- send
 
-// Send: the demo boss always answers cheerily — the ack STREAMS (four
-// accumulated updates on one bubble id over 500ms, final pin at 600ms,
-// mirroring the live text-delta stream), and one ad-hoc dispatch cycle
-// (900ms) proves the request landed.
+// Send: plain-text state.Backend contract — delegates to the attachment
+// seam SendWith, mirroring the live backend.
 func (b *demoBackend) Send(text string) error {
+	return b.SendWith(text, nil)
+}
+
+// SendWith — the demo twin of the live attachment send. Files never leave
+// the box (there is no server to receive parts), but the twin stays
+// honest: the user-bubble echo carries the names in Meta exactly like
+// live (the chat renders the dim " · 📎 N" suffix), and the scripted boss
+// ack NAMES the attachments so a paste/@ attach visibly round-trips
+// through the office. The ack STREAMS (four accumulated updates on one
+// bubble id over 500ms, final pin at 600ms, mirroring the live text-delta
+// stream), and one ad-hoc dispatch cycle (900ms) proves the request
+// landed.
+func (b *demoBackend) SendWith(text string, atts []state.Attachment) error {
 	trimmed := strings.TrimSpace(text)
-	if trimmed == "" || b.fl.isStopped() {
+	if (trimmed == "" && len(atts) == 0) || b.fl.isStopped() {
 		return nil
 	}
 	b.mu.Lock()
@@ -295,6 +306,7 @@ func (b *demoBackend) Send(text string) error {
 
 	b.fl.emit(state.Event{Kind: state.EvChatUser, Msg: state.ChatMsg{
 		ID: "user-" + itoa(seq), From: "user", Text: trimmed, At: nowMs(),
+		Meta: state.AttachMeta(attachmentNames(atts)),
 	}})
 
 	// The demo boss always answers cheerily, naming the request — and it
@@ -302,7 +314,14 @@ func (b *demoBackend) Send(text string) error {
 	// growing EvChatBoss updates on ONE bubble id (Pending:true) inside a
 	// 500ms window, then the final Pending:false bubble at 600ms. The UI
 	// watches one bubble grow, then pin.
-	ack := `On it: "` + shortTitle(trimmed, 40) + `" is on the board - watch the floor.`
+	named := `"` + shortTitle(trimmed, 40) + `"`
+	if trimmed == "" {
+		named = "the attachments"
+	}
+	ack := "On it: " + named + " is on the board - watch the floor."
+	if names := attachmentNames(atts); len(names) > 0 {
+		ack += " I see " + itoa(len(names)) + " attachment(s): " + strings.Join(names, ", ") + "."
+	}
 	ackRunes := []rune(ack)
 	bossID := "boss-" + itoa(seq)
 	streamBeats := []time.Duration{100, 250, 400, 500}

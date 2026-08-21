@@ -11,16 +11,28 @@
 //		            LIVE while their CallID streams (spinner header, growing
 //		            tail, always expanded), then COLLAPSED to
 //		            "thinking · N lines" until ctrl+t expands all;
-//		            Kind "tool" entries render as dim one-liners merged by CallID;
+//		            Kind "tool" entries (BOSS/primary) render as dim one-liners
+//		            merged by CallID; Kind "wtool" entries (EMPLOYEE tools)
+//		            never touch the flow — they group into the workers-thread
+//		            region at the END of the conversation: one group per
+//		            agent (newest at the bottom), header "┌ <agent> · <task>"
+//		            over indented "│ [tool] …" rows while the agent is active,
+//		            auto-collapsing to "<agent> · <task> (· N tool calls ✓
+//		            done)" on EvReturned or 120 ticks of quiet, with ctrl+g
+//		            expanding/collapsing all completed threads;
 //		            From "office" entries render as dim local notices (red when
 //		            Meta == "error").
 //		spinner   — shown only while a boss reply is pending WITH NO TEXT YET
 //		            (" <boss> is typing…", named from brain.json boss.name).
-//		            A pending boss bubble WITH text renders
-//		            in the viewport itself as a streaming "boss ›" turn: glamour
-//		            markdown re-rendered per delta plus a blinking dim caret "▌"
-//		            at the tail (blink follows the office tick) — the spinner row
-//		            disappears once the bubble speaks for itself.
+//		            While BossDelegating holds (boss quiet, workers busy)
+//		            the row swaps to a settled dim " <boss>: delegating ·
+//		            N busy" — no spinner. A pending boss bubble WITH text
+//		            renders in the viewport itself as a streaming "boss ›"
+//		            turn: glamour markdown re-rendered per delta plus a
+//		            blinking dim caret "▌" on its OWN bottom row of the
+//		            bubble (hanging at the content indent, never glued onto
+//		            a content line; blink follows the office tick) — the
+//		            spinner row disappears once the bubble speaks for itself.
 //		divider
 //		textarea  — multiline input; Enter sends, Shift+Enter (or Ctrl+J) is a
 //		            newline, placeholder "talk to the boss…". NEVER locked: while
@@ -76,17 +88,25 @@ const (
 	textareaH = 3 // rows of multiline input at the bottom of the tab
 )
 
-// thinkKind / toolKind / questionKind / diffKind / officeFrom / errMeta —
-// chat entry markers the app reducer tags onto state.ChatMsg so this panel
-// can style them without touching the user/boss turn paths.
+// thinkKind / toolKind / wtoolKind / questionKind / diffKind / officeFrom /
+// errMeta — chat entry markers the app reducer tags onto state.ChatMsg so
+// this panel can style them without touching the user/boss turn paths.
+// wtoolKind is the EMPLOYEE tool line: never rendered inline; grouped into
+// the workers-thread region at the end of the conversation.
 const (
 	thinkKind    = "think"
 	toolKind     = "tool"
+	wtoolKind    = "wtool"
 	questionKind = "question"
 	diffKind     = "diff"
 	officeFrom   = "office"
 	errMeta      = "error"
 )
+
+// wtoolStaleTicks — a workers thread auto-collapses after this many ticks
+// with no tool activity from its agent (EvReturned collapses instantly via
+// the sprite). ctrl+g re-expands completed threads.
+const wtoolStaleTicks = 120
 
 // diffMetaSep splits the diff ChatMsg.Meta carrier: path ␟ +adds ␟ -dels
 // (unit separator — paths may contain spaces). Written by the app reducer,
@@ -122,10 +142,10 @@ type Chat struct {
 	vp     viewport.Model
 	ta     textarea.Model
 	sp     spinner.Model
-	onSend func(text string) tea.Cmd
+	onSend func(text string, atts []state.Attachment) tea.Cmd
 
 	// Queue + permission + question seams (set by the app at build time).
-	onEnqueue    func(text string) tea.Cmd // Enter while boss pending / question parked
+	onEnqueue    func(text string, atts []state.Attachment) tea.Cmd // Enter while boss pending / question parked
 	onPermAnswer func(response string) tea.Cmd
 	onPermLater  func() tea.Cmd // esc defers the prompt
 	perm         *PermissionView
@@ -152,11 +172,29 @@ type Chat struct {
 	pendingSpin bool
 	follow      bool // stick to the bottom unless the user scrolled up
 
-	showThinking  bool // /thinking on|off — collected blocks visible (default true)
-	showTools     bool // /tools on|off    — tool one-liners visible (default true)
-	thinkExpanded bool // ctrl+t — thinking expanded; DEFAULT false (collapsed)
-	diffExpanded  bool // ctrl+d or /diffs on|off — diffs expanded; DEFAULT false
-	compactRows   bool // /compact layout — the textarea trims to 2 visible rows
+	showThinking    bool // /thinking on|off — collected blocks visible (default true)
+	showTools       bool // /tools on|off    — tool one-liners visible (default true)
+	thinkExpanded   bool // ctrl+t — thinking expanded; DEFAULT false (collapsed)
+	diffExpanded    bool // ctrl+d or /diffs on|off — diffs expanded; DEFAULT false
+	threadsExpanded bool // ctrl+g — completed worker threads expanded; DEFAULT false
+	compactRows     bool // /compact layout — the textarea trims to 2 visible rows
+
+	// agents — per-name worker rollup captured from st.Employees each
+	// SetState (task title for the thread header, sprite-active for the
+	// live/collapsed decision). The reducer's wtool entries carry only the
+	// name; the roster is the source of their decoration.
+	agents map[string]agentView
+	// workerTasks — sticky last-known task title per worker name. The
+	// EvReturned reducer CLEARS Employee.Task, but a collapsed thread's
+	// summary must still read "tekton-1 · Wire… (· N tool calls ✓ done)".
+	workerTasks map[string]string
+
+	// delegating/delegatingN — P3: BossDelegating flips the pending-spin
+	// row from the typing spinner to a settled " <boss>: delegating ·
+	// N busy" (dim, no spinner). N = hired (non-manager) employees in
+	// working/to-manager/meeting sprites.
+	delegating  bool
+	delegatingN int
 
 	// streamingThink — CallIDs with an OPEN boss EvThought stream (set by
 	// the app from its model-owned active set). Streaming blocks always
@@ -171,12 +209,28 @@ type Chat struct {
 	mdWidth   int
 	renderRev uint64 // cheap changed-detection for SetState
 
+	// Attachment state (chat_attach.go): staged chips above the textarea
+	// plus the @ file-picker popover. The chips drain into onSend/onEnqueue
+	// on Enter; temp paste dirs are removed by the app's send closures (or
+	// here when a chip is dropped before ever sending).
+	atts             []chatAttachment
+	atOpen           bool                      // @ picker visible
+	atFrag           string                    // live "@fragment" filter (tail-derived)
+	atFiles          []string                  // walked repo files; nil until the walk answers
+	atFiltered       []string                  // refilterAttach's visible slice
+	atSel            int                       // selected row inside atFiltered
+	pasteSeq         int                       // paste-N.png naming for image attaches
+	pasteUnsupported bool                      // non-darwin notice latch (fire once)
+	onNotice         func(text string) tea.Cmd // office-notice seam (cap/drop/platform)
+
 	diffCache map[string]diffCacheEntry // parsed+hilighted diff rows by msg ID
 }
 
 // NewChat builds the panel; onSend is invoked on Enter with a non-empty
-// draft (the app turns it into backend.Send + chat-user/pending events).
-func NewChat(onSend func(text string) tea.Cmd) *Chat {
+// draft (or any staged attachments) — the app turns it into backend.Send +
+// chat-user/pending events. Attachments ride the second argument (nil for
+// a plain text send).
+func NewChat(onSend func(text string, atts []state.Attachment) tea.Cmd) *Chat {
 	vp := viewport.New(viewport.WithWidth(10), viewport.WithHeight(5))
 	vp.SoftWrap = true
 	vp.MouseWheelEnabled = true
@@ -202,7 +256,8 @@ func NewChat(onSend func(text string) tea.Cmd) *Chat {
 	)
 
 	c := &Chat{vp: vp, ta: ta, sp: sp, onSend: onSend, follow: true,
-		showThinking: true, showTools: true, diffCache: map[string]diffCacheEntry{}}
+		showThinking: true, showTools: true, diffCache: map[string]diffCacheEntry{},
+		workerTasks: map[string]string{}}
 	c.SetSize(30, 10)
 	return c
 }
@@ -244,6 +299,14 @@ func (c *Chat) ToggleDiffs() {
 	c.forceRender()
 }
 
+// ToggleThreads expands/collapses ALL completed worker threads in the
+// conversation (ctrl+g, routed by the app keymap). Independent of the
+// thinking toggles — live threads always render expanded regardless.
+func (c *Chat) ToggleThreads() {
+	c.threadsExpanded = !c.threadsExpanded
+	c.forceRender()
+}
+
 // SetDiffsExpanded shows diffs expanded (on) or collapsed (off) —
 // /diffs on|off.
 func (c *Chat) SetDiffsExpanded(on bool) {
@@ -258,8 +321,9 @@ func (c *Chat) SetDiffsExpanded(on bool) {
 func (c *Chat) DiffsExpanded() bool { return c.diffExpanded }
 
 // SetEnqueue wires the app's enqueue callback (Enter while a boss reply is
-// pending enqueues instead of sending).
-func (c *Chat) SetEnqueue(fn func(text string) tea.Cmd) { c.onEnqueue = fn }
+// pending enqueues instead of sending). Staged attachments ride along so a
+// queued prompt keeps its files.
+func (c *Chat) SetEnqueue(fn func(text string, atts []state.Attachment) tea.Cmd) { c.onEnqueue = fn }
 
 // SetPermissionHandlers wires the app's permission answer/defer callbacks
 // for the y/a/n/esc keys captured while a prompt is open.
@@ -268,8 +332,14 @@ func (c *Chat) SetPermissionHandlers(answer func(response string) tea.Cmd, later
 }
 
 // SetPermission opens (non-nil) or closes (nil) the permission prompt that
-// replaces the textarea region.
-func (c *Chat) SetPermission(p *PermissionView) { c.perm = p }
+// replaces the textarea region. Opening closes the @ picker (the modal owns
+// the region now); staged chips stay — they belong to the draft.
+func (c *Chat) SetPermission(p *PermissionView) {
+	if p != nil {
+		c.closeAttachPicker()
+	}
+	c.perm = p
+}
 
 // SetQuestionHandlers wires the app's question answer/defer callbacks:
 // Enter submits the modal input (→ AnswerQuestion), esc defers (/question
@@ -285,6 +355,7 @@ func (c *Chat) SetQuestion(q *QuestionView) {
 	c.question = q
 	if q != nil {
 		c.qInput = ""
+		c.closeAttachPicker() // the modal owns the region now (chips stay)
 	}
 	c.SetSize(c.w, c.h)
 }
@@ -323,6 +394,16 @@ func (c *Chat) typingText() string {
 		name = defaultBossShort
 	}
 	return name + " is typing…"
+}
+
+// delegatingText — the P3 delegation wording in place of the typing
+// spinner: "<bossShort>: delegating · <n> busy".
+func (c *Chat) delegatingText() string {
+	name := c.bossShort
+	if name == "" {
+		name = defaultBossShort
+	}
+	return name + ": delegating · " + itoa(c.delegatingN) + " busy"
 }
 
 // refreshPlaceholder recomputes the textarea placeholder from pending +
@@ -427,8 +508,12 @@ func (c *Chat) SetCompact(on bool) {
 }
 
 // SetSize implements Tab: splits content height across viewport / spinner /
-// divider / bottom region (textarea, permission modal, or question modal —
-// the question modal is the one region with a DIFFERENT row count).
+// divider / bottom region. The bottom region is the textarea, permission
+// modal, or question modal (the question modal is the one region with a
+// DIFFERENT row count) — PLUS the attachment surfaces below it: the chips
+// row(s) when files are staged, and the @ picker box while open. Chips and
+// picker consume rows exactly like questionModalH does, so the viewport
+// shrinks for them instead of overlapping.
 func (c *Chat) SetSize(w, h int) {
 	if w < 4 {
 		w = 4
@@ -442,6 +527,7 @@ func (c *Chat) SetSize(w, h int) {
 	if c.question != nil {
 		regionH = c.questionModalH()
 	}
+	regionH += c.chipsH() + c.popoverH()
 	vpH := h - regionH - 1 /* divider */ - spH
 	if vpH < 1 {
 		vpH = 1
@@ -458,8 +544,33 @@ func (c *Chat) SetSize(w, h int) {
 
 // SetState implements Tab: keeps the latest chat slice, re-renders the
 // conversation when it changed, and keeps scroll pinned to the bottom.
+// Also captures the roster rollup (workers-thread decoration) and the
+// delegation state (P3 spinner-row swap) from the incoming state.
 func (c *Chat) SetState(st state.OfficeState) {
 	c.tick = st.Tick
+	agents := make(map[string]agentView, len(st.Employees))
+	busy := 0
+	for _, e := range st.Employees {
+		if e.Role == state.RoleManager {
+			continue
+		}
+		av := agentView{task: e.Task, active: workerSpriteActive(e.Sprite)}
+		agents[e.Name] = av
+		if av.active {
+			busy++
+		}
+	}
+	c.agents = agents
+	c.delegating = st.BossDelegating
+	c.delegatingN = busy
+	if c.workerTasks == nil {
+		c.workerTasks = map[string]string{}
+	}
+	for _, e := range st.Employees {
+		if e.Role != state.RoleManager && e.Task != "" {
+			c.workerTasks[e.Name] = e.Task // sticky: survives EvReturned's task clear
+		}
+	}
 	rev := revision(st.Chat)
 	// fold the stream set into the revision (order-independent) so closing a
 	// stream re-renders even when Done's final text equals the last update.
@@ -473,6 +584,29 @@ func (c *Chat) SetState(st state.OfficeState) {
 		srev ^= h
 	}
 	rev ^= srev
+	// fold the roster rollup + delegation flag in (order-independent) — a
+	// dispatch filling a thread header's task or a delegating flip changes
+	// pixels without touching the chat slice.
+	arev := uint64(14695981039346656037)
+	for name, a := range c.agents {
+		h := uint64(14695981039346656037)
+		for _, s := range []string{name, a.task} {
+			for i := 0; i < len(s); i++ {
+				h ^= uint64(s[i])
+				h *= 1099511628211
+			}
+		}
+		if a.active {
+			h ^= 1
+			h *= 1099511628211
+		}
+		arev ^= h
+	}
+	rev ^= arev
+	if c.delegating {
+		rev ^= 0x9e3779b97f4a7c15
+	}
+	rev ^= uint64(uint32(c.delegatingN))
 	// while any think block streams, re-render on EVERY tick (the header
 	// spinner advances with the office clock even when text is unchanged);
 	// same for a streaming boss bubble — its caret blinks with the tick.
@@ -483,7 +617,20 @@ func (c *Chat) SetState(st state.OfficeState) {
 			break
 		}
 	}
-	if rev == c.renderRev && len(st.Chat) == len(c.chat) && len(c.streamingThink) == 0 && !streamActive {
+	// a worker thread within its staleness horizon must re-render every
+	// tick — the auto-collapse boundary is tick-relative, invisible to rev.
+	wtoolRecent := false
+	for _, m := range st.Chat {
+		if m.Kind != wtoolKind {
+			continue
+		}
+		_, tk := parseWtoolMeta(m.Meta)
+		if c.tick-tk <= wtoolStaleTicks+2 {
+			wtoolRecent = true
+			break
+		}
+	}
+	if rev == c.renderRev && len(st.Chat) == len(c.chat) && len(c.streamingThink) == 0 && !streamActive && !wtoolRecent {
 		return
 	}
 	c.renderRev = rev
@@ -516,7 +663,13 @@ func (c *Chat) SetState(st state.OfficeState) {
 }
 
 // Update implements Interactive: Enter sends, Shift+Enter newline, wheel +
-// pgup/pgdn + (single-line) arrows scroll the conversation.
+// pgup/pgdn + (single-line) arrows scroll the conversation. ctrl+v attaches
+// a clipboard image when there is one (else pastes text); "@" at a word
+// start opens the attach-file popover, which owns ↑/↓/enter/tab/esc while
+// open (the question-modal precedence pattern) — every other key still
+// reaches the textarea. Non-key messages the panel doesn't claim (bracketed
+// paste tea.PasteMsg, the textarea's own clipboard pasteMsgs) fall through
+// the default arm INTO the textarea — the plain-text paste path.
 func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
@@ -594,10 +747,50 @@ func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 				return nil
 			}
 		}
+		// The @ popover owns its nav/attach keys while open (the question-
+		// modal precedence pattern: claimed FIRST, nothing reaches the
+		// textarea); every other key still goes to the textarea below.
+		if c.atOpen {
+			switch msg.String() {
+			case "up":
+				c.atMove(-1)
+				return nil
+			case "down":
+				c.atMove(1)
+				return nil
+			case "enter", "tab":
+				return c.attachPicked()
+			case "esc":
+				c.closeAttachPicker() // keeps the typed fragment
+				return nil
+			}
+		}
 		switch msg.String() {
+		case "ctrl+v":
+			// Image paste probe (async tea.Cmd): a clipboard holding an
+			// image ATTACHES it as a chip; a text/empty clipboard replays
+			// the textarea's own text paste (see onClipPaste).
+			return c.startImagePaste()
+		case "backspace":
+			if c.atOpen {
+				// fragment editing: the picker lives/dies by the tail
+				// recheck after the textarea eats the key
+				var cmd tea.Cmd
+				c.ta, cmd = c.ta.Update(msg)
+				c.afterDraftEdit()
+				return cmd
+			}
+			// an EMPTY draft + staged chips: backspace pops the newest
+			// attachment (the quiet undo for a mis-paste)
+			if strings.TrimSpace(c.ta.Value()) == "" && len(c.atts) > 0 {
+				return c.popAttachment()
+			}
+			var cmd tea.Cmd
+			c.ta, cmd = c.ta.Update(msg)
+			return cmd
 		case "enter":
 			text := strings.TrimSpace(c.ta.Value())
-			if text == "" {
+			if text == "" && len(c.atts) == 0 {
 				return nil
 			}
 			c.ta.Reset()
@@ -605,17 +798,20 @@ func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 			c.vp.GotoBottom()
 			if strings.HasPrefix(text, "/") {
 				// slash commands are local and always immediate — /queue
-				// and /perm must work while the boss is typing
+				// and /perm must work while the boss is typing. Chips are
+				// NOT eaten: a stray /help must not sink a staged paste —
+				// they belong to the next real prompt (/clear drops them).
 				if c.onSend != nil {
-					return c.onSend(text)
+					return c.onSend(text, nil)
 				}
 				return nil
 			}
+			atts := c.drainAttachments()
 			if (c.pending || c.questionWaiting) && c.onEnqueue != nil {
-				return c.onEnqueue(text)
+				return c.onEnqueue(text, atts)
 			}
 			if c.onSend != nil {
-				return c.onSend(text)
+				return c.onSend(text, atts)
 			}
 			return nil
 		case "up", "down":
@@ -638,8 +834,23 @@ func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 			}
 			return cmd
 		default:
+			// "@" at a word boundary opens the attach picker AFTER the
+			// textarea takes the rune (the fragment starts empty). Other
+			// typed keys re-derive the fragment from the draft tail; nav
+			// keys (arrows, ctrl-word ops, home/end) close the picker —
+			// they move the cursor off the tail the picker tracks.
+			opening := !c.atOpen && msg.Text == "@" && c.atWordBoundary()
 			var cmd tea.Cmd
+			if c.atOpen && msg.Text == "" {
+				c.closeAttachPicker()
+			}
 			c.ta, cmd = c.ta.Update(msg)
+			if opening {
+				return tea.Batch(cmd, c.openAttachPicker())
+			}
+			if c.atOpen && msg.Text != "" {
+				c.afterDraftEdit()
+			}
 			return cmd
 		}
 	case tea.MouseWheelMsg:
@@ -651,22 +862,55 @@ func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 		var cmd tea.Cmd
 		c.sp, cmd = c.sp.Update(msg)
 		return cmd
+	case clipPasteMsg:
+		// the ctrl+v image probe answered (chat_attach.go)
+		return c.onClipPaste(msg)
+	case attachWalkMsg:
+		// the @ picker's file walk answered
+		c.onAttachWalk(msg)
+		return nil
+	default:
+		// tea.PasteMsg (bracketed paste) and the textarea's own internal
+		// pasteMsg/pasteErrMsg (its ctrl+v clipboard path) are NOT key
+		// presses — everything unclaimed forwards to the textarea so
+		// plain-text paste reaches the input. (This arm is the paste
+		// regression fix: before it, all of the above were dropped here.)
+		var cmd tea.Cmd
+		c.ta, cmd = c.ta.Update(msg)
+		return cmd
 	}
-	return nil
 }
 
-// View implements Tab.
+// View implements Tab. Below the divider (top → bottom): the dim
+// attachment chips row (when files are staged), the @ picker box (while
+// open), then the input region — the question modal, permission modal, or
+// textarea. SetSize budgets exactly the rows this writes.
 func (c *Chat) View() string {
 	var b strings.Builder
 	b.WriteString(c.vp.View())
 	if c.pendingSpin {
 		b.WriteString("\n")
-		b.WriteString(c.sp.View())
-		b.WriteString(chrome.AccentText.Render(" " + c.typingText()))
+		if c.delegating {
+			// P3 — the boss dispatched out and went quiet: a settled dim
+			// delegation row, NO spinner blinking for minutes
+			b.WriteString(chrome.DimText.Render(" " + c.delegatingText()))
+		} else {
+			b.WriteString(c.sp.View())
+			b.WriteString(chrome.AccentText.Render(" " + c.typingText()))
+		}
 	}
 	b.WriteString("\n")
 	b.WriteString(chrome.DimText.Render(fitPlain(strings.Repeat("─", c.w), c.w)))
 	b.WriteString("\n")
+	if chips := c.renderAttachChips(); chips != "" {
+		// staged attachments sit right above the input they will attach to
+		b.WriteString(chips)
+		b.WriteString("\n")
+	}
+	if c.atOpen {
+		b.WriteString(c.renderAttachPopover())
+		b.WriteString("\n")
+	}
 	if c.question != nil {
 		// the question modal REPLACES the textarea region, full width
 		b.WriteString(c.renderQuestionModal())
@@ -748,9 +992,31 @@ func (c *Chat) renderPermission() string {
 }
 
 // renderConversation rebuilds the full glamour-rendered transcript.
+// Employee tool entries (wtoolKind) never join the flow — they collect
+// into per-agent worker groups rendered as the workers-thread region at
+// the END of the conversation, so a sub-agent tool storm can't drown the
+// boss turns.
 func (c *Chat) renderConversation() string {
 	visible := make([]state.ChatMsg, 0, len(c.chat))
+	var workers []workerGroup
+	workerIdx := map[string]int{}
 	for _, m := range c.chat {
+		if m.Kind == wtoolKind {
+			if !c.showTools {
+				continue // /tools off hides the whole workers region too
+			}
+			idx, ok := workerIdx[m.From]
+			if !ok {
+				idx = len(workers)
+				workerIdx[m.From] = idx
+				workers = append(workers, workerGroup{name: m.From})
+			}
+			workers[idx].lines = append(workers[idx].lines, m)
+			if _, tk := parseWtoolMeta(m.Meta); tk > workers[idx].lastTick {
+				workers[idx].lastTick = tk
+			}
+			continue
+		}
 		if m.From == "boss" && m.Pending && m.Text == "" {
 			continue // the spinner line speaks for the EMPTY typing placeholder;
 			// a pending bubble WITH text renders below (streaming reply)
@@ -763,7 +1029,7 @@ func (c *Chat) renderConversation() string {
 		}
 		visible = append(visible, m)
 	}
-	if len(visible) == 0 {
+	if len(visible) == 0 && len(workers) == 0 {
 		return chrome.DimText.Render("  no messages yet — ask the boss for something.")
 	}
 	var b strings.Builder
@@ -785,21 +1051,116 @@ func (c *Chat) renderConversation() string {
 		case m.From == "user":
 			prefix := chrome.Fg(chrome.Info, userPrefix)
 			lines := strings.Split(strings.TrimRight(wrapPlain(m.Text, c.mdWidth+1), "\n"), "\n")
+			if names, ok := state.ParseAttachMeta(m.Meta); ok && len(names) > 0 {
+				// the backend's chat-user echo carries the attachment
+				// names in Meta — history shows the dim " · 📎 N" suffix
+				lines[len(lines)-1] += chrome.DimText.Render(" · 📎 " + itoa(len(names)))
+			}
 			writePrefixed(&b, prefix, strings.Repeat(" ", len(userPrefix)), lines)
 		default:
 			prefix := chrome.Fg(chrome.Accent, bossPrefix)
 			lines := cleanMarkdown(c.renderMarkdown(m.Text))
-			if m.Pending {
-				// streaming reply: blinking dim caret pinned to the last
-				// line — it grows mark-by-mark as deltas land
-				if c.tick%2 == 0 {
-					lines[len(lines)-1] += " " + chrome.DimText.Render("▌")
-				}
+			if m.Pending && c.tick%2 == 0 {
+				// streaming reply: the blinking dim caret lives on its OWN
+				// bottom row of the bubble (hanging at the content indent)
+				// — never glued onto a content line, and only while the
+				// bubble HAS text (an empty placeholder keeps the spinner
+				// row, no caret). Every render rebuilds `lines` from
+				// markdown, so the blink row replaces cleanly between
+				// coalesced updates (no accumulation possible).
+				lines = append(lines, chrome.DimText.Render("▌"))
 			}
 			writePrefixed(&b, prefix, strings.Repeat(" ", len(bossPrefix)), lines)
 		}
 	}
+	c.renderWorkers(&b, workers)
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// agentView — a roster rollup entry for the workers-thread decoration:
+// the agent's dispatch task (header) and sprite-liveness (collapse rule).
+type agentView struct {
+	task   string
+	active bool
+}
+
+// workerGroup — one agent's merged wtool entries (chat order) plus the
+// latest activity tick, rendered as one work thread.
+type workerGroup struct {
+	name     string
+	lines    []state.ChatMsg
+	lastTick int
+}
+
+// workerSpriteActive — the sprite states that count as "the agent is still
+// at work" for the thread's live/expanded decision.
+func workerSpriteActive(s state.SpriteState) bool {
+	switch s {
+	case state.SpriteWorking, state.SpriteToManager, state.SpriteMeeting:
+		return true
+	}
+	return false
+}
+
+// parseWtoolMeta decodes the employee-tool Meta carrier the reducer
+// writes: toolState ␟ tick. A Meta without the separator yields tick 0
+// (immediately stale → collapsed).
+func parseWtoolMeta(meta string) (toolState string, tick int) {
+	if i := strings.IndexByte(meta, diffMetaSep[0]); i >= 0 {
+		return meta[:i], atoiHead(meta[i+1:])
+	}
+	return meta, 0
+}
+
+// workerToolLine renders one merged employee tool entry, same shape as
+// the boss's inline one-liner ("[tool] read · x ✓/✗/… running").
+func workerToolLine(m state.ChatMsg) string {
+	toolState, _ := parseWtoolMeta(m.Meta)
+	line := "[tool] " + m.Text
+	switch toolState {
+	case "done":
+		return line + " ✓"
+	case "error":
+		return line + " ✗"
+	default: // running (or anything unexpected)
+		return line + " … running"
+	}
+}
+
+// renderWorkers draws the workers-thread region after the conversation:
+// one group per agent, newest at the bottom. An ACTIVE agent (busy sprite
+// + activity within wtoolStaleTicks) renders its header and merged tool
+// lines; on EvReturned/the quiet horizon it auto-collapses to one dim
+// summary line. ctrl+g re-expands every completed thread at once.
+func (c *Chat) renderWorkers(b *strings.Builder, groups []workerGroup) {
+	for _, g := range groups {
+		task := c.workerTasks[g.name] // sticky: a returned agent keeps its task
+		active := false
+		if av, ok := c.agents[g.name]; ok {
+			active = av.active
+			if av.task != "" {
+				task = av.task
+			}
+		}
+		expanded := (active && c.tick-g.lastTick <= wtoolStaleTicks) || c.threadsExpanded
+		head := g.name
+		if task != "" {
+			head += " · " + task
+		}
+		if expanded {
+			b.WriteString("\n" + chrome.DimText.Render(clipPlain("┌ "+head, c.w)))
+			for _, m := range g.lines {
+				b.WriteString("\n" + chrome.ToolStyle.Render(clipPlain("│ "+workerToolLine(m), c.w)))
+			}
+			continue
+		}
+		unit := "tool calls"
+		if len(g.lines) == 1 {
+			unit = "tool call"
+		}
+		b.WriteString("\n" + chrome.DimText.Render(clipPlain(
+			head+" (· "+itoa(len(g.lines))+" "+unit+" ✓ done)", c.w)))
+	}
 }
 
 // thinkStreamLines caps the visible body of a STREAMING think block —

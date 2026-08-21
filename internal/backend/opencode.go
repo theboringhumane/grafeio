@@ -91,6 +91,7 @@ type liveBackend struct {
 	amTasks       map[string]string // id -> dedupe key
 	amMails       map[string]bool
 	lastUserText  string // belt-and-braces echo dedupe (see Send)
+	lastUserMeta  string // attachment carrier of the last echo (same gate)
 	lastUserAt    int64
 	respawnFresh  bool   // ResetPrimary(true) latched: next Send respawns a fresh session once
 	respawnOldID  string // primary id ResetPrimary dropped, so Send can un-seat it
@@ -187,28 +188,43 @@ func (b *liveBackend) Start(emit func(state.Event)) error {
 
 // ---------------------------------------------------------------- send
 
-// Send pushes user chat to the boss: echo chat-user, stage ONE pending
-// boss bubble (FIFO id boss-N), POST the prompt async. Completed assistant
-// messages arrive over SSE and emit their own pinned "bossmsg-"+<messageID>
+// Send pushes user chat to the boss. It is the plain-text state.Backend
+// contract; chat-input attachments ride the optional SendWith seam below
+// (the app type-asserts it — see attachmentBackend in internal/app).
+func (b *liveBackend) Send(text string) error {
+	return b.SendWith(text, nil)
+}
+
+// SendWith is Send + chat-input attachments: the user-bubble echo carries
+// their names in ChatMsg.Meta (state.AttachMeta — "att ␟ name ␟ name…",
+// the chat panel renders the dim " · 📎 N" suffix from it) and the prompt
+// posts one file part per readable attachment (parts.go). Semantics of
+// the plain Send otherwise: echo chat-user, stage ONE pending boss bubble
+// (FIFO id boss-N), POST the prompt async. Completed assistant messages
+// arrive over SSE and emit their own pinned "bossmsg-"+<messageID>
 // bubbles; the FIRST of them strips the pending placeholder (the reducer
 // drops pending bubbles on any EvChatBoss), later ones append. A prompt
 // error re-emits the SAME pending id with the failure note instead.
-func (b *liveBackend) Send(text string) error {
+func (b *liveBackend) SendWith(text string, atts []state.Attachment) error {
 	trimmed := strings.TrimSpace(text)
-	if trimmed == "" || b.fl.isStopped() {
+	if (trimmed == "" && len(atts) == 0) || b.fl.isStopped() {
 		return nil
 	}
+	meta := state.AttachMeta(attachmentNames(atts))
 
 	// Belt-and-braces echo dedupe: the chat-user echo fires exactly once
 	// per prompt. This backend never maps SSE message.updated (user role)
-	// to chat again, but if the same text would fire twice within 2s
-	// (double Send, retry path, app-side echo raced back in), swallow the
-	// second echo — the prompt POST below still always runs.
+	// to chat again, but if the same text (with the same attachments)
+	// would fire twice within 2s (double Send, retry path, app-side echo
+	// raced back in), swallow the second echo — the prompt POST below
+	// still always runs.
 	b.mu.Lock()
 	now := nowMs()
-	duplicate := trimmed == b.lastUserText && b.lastUserText != "" && now-b.lastUserAt < 2000
+	duplicate := trimmed == b.lastUserText && meta == b.lastUserMeta &&
+		b.lastUserText != "" && now-b.lastUserAt < 2000
 	if !duplicate {
 		b.lastUserText = trimmed
+		b.lastUserMeta = meta
 		b.lastUserAt = now
 	}
 	b.chatSeq++
@@ -216,7 +232,7 @@ func (b *liveBackend) Send(text string) error {
 	b.mu.Unlock()
 	if !duplicate {
 		b.fl.emit(state.Event{Kind: state.EvChatUser, Msg: state.ChatMsg{
-			ID: userID, From: "user", Text: trimmed, At: now, Kind: "user",
+			ID: userID, From: "user", Text: trimmed, At: now, Kind: "user", Meta: meta,
 		}})
 	}
 
@@ -282,7 +298,7 @@ func (b *liveBackend) Send(text string) error {
 		ID: pendingID, From: "boss", Text: "", At: nowMs(), Pending: true,
 	}})
 
-	err := b.postPrompt(primaryID, trimmed)
+	err := b.postPrompt(primaryID, trimmed, atts)
 	if err != nil {
 		b.mu.Lock()
 		for i, id := range b.pendingBoss {
@@ -607,16 +623,29 @@ func (b *liveBackend) ResetPrimary(forceNew bool) error {
 
 // postPrompt is promptAsync: POST /session/{id}/prompt_async (204 on ok).
 //
+// The parts array is one text part (when text is non-empty) plus one file
+// part per attachment — {"type":"file","mime","filename","url"} with the
+// url a base64 data URL. Wire shape verified 2026-08-21 against serve
+// 1.18.19: GET /doc documents FilePartInput for session.prompt_async
+// (required type/mime/url), and a live POST with a data-URL file part is
+// accepted (HTTP 204). Attachments that fail to read are skipped with a
+// status note rather than sinking the prompt (parts.go).
+//
 // cfg.Boss.Model rides as {"model":{"providerID","modelID"}} — the exact
 // shape serve 1.18.19 documents in GET /doc for prompt_async (verified
 // 2026-08-21 against the spawned server). A ModelRef without a
 // "provider/model" slash is ignored with a status note. If a serve ever
 // rejects the model field with 400 (an older/foreign server), the override
 // latches off and the prompt retries bare — degrade open, never fake it.
-func (b *liveBackend) postPrompt(sessionID, text string) error {
-	payload := map[string]any{
-		"parts": []map[string]any{{"type": "text", "text": text}},
+func (b *liveBackend) postPrompt(sessionID, text string, atts []state.Attachment) error {
+	parts, skipped := payloadParts(text, atts)
+	if len(skipped) > 0 {
+		// The prompt still goes out with whatever parts survived — the
+		// member sees exactly which attachment didn't make it.
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] could not attach " +
+			strings.Join(skipped, ", ") + " (file unreadable) — sent without it"})
 	}
+	payload := map[string]any{"parts": parts}
 	provider, model := splitModelRef(string(b.cfg.Boss.Model))
 	b.mu.Lock()
 	rejected := b.promptModelRejected
@@ -635,9 +664,7 @@ func (b *liveBackend) postPrompt(sessionID, text string) error {
 		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] boss model override unavailable in serve (see /doc session.prompt_async): retrying bare prompt"})
 		// Retry bare exactly once: the member-visible cost of the failed
 		// POST was zero (rejected before the turn started).
-		payload = map[string]any{
-			"parts": []map[string]any{{"type": "text", "text": text}},
-		}
+		payload = map[string]any{"parts": parts}
 		body, _ = json.Marshal(payload)
 		err = b.doJSON(http.MethodPost, "/session/"+sessionID+"/prompt_async", body, nil)
 	}

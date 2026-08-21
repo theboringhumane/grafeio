@@ -3,6 +3,61 @@
 // backend never renders.
 package state
 
+import "strings"
+
+// Attachment — one chat-input attachment riding the outgoing boss prompt
+// as an opencode prompt_async file part ({type:"file", mime, filename,
+// url} — url carries the base64 data URL). The chat panel builds them
+// (a clipboard-image paste lands in a temp PNG; the @ picker points at a
+// repo file); the backend reads Path's bytes at SEND time. The backend
+// seam is OPTIONAL: state.Backend.Send stays plain text, and backends
+// that take files implement the AttachmentSender seam the app
+// type-asserts (the same pattern model.go uses for teamBackend).
+type Attachment struct {
+	Name string `json:"name"`           // display name AND the wire "filename"
+	Mime string `json:"mime,omitempty"` // resolved at attach time; senders re-sniff when empty
+	Path string `json:"path"`           // the file the sender base64s into the data URL
+	// Temp — non-empty when Path lives in a panel-created temp dir
+	// (os.MkdirTemp "grafeio-paste-*"): the app removes the dir once the
+	// send resolves (best effort — a queued send must find the file at
+	// flush time, so removal never happens at enqueue).
+	Temp string `json:"-"`
+}
+
+// AttachMetaSep splits the user-bubble Meta attachment carrier:
+// "att" ␟ name ␟ name… (unit separator — names may contain spaces).
+// Written by backends on the EvChatUser echo, read by the chat panel
+// renderer for the dim " · 📎 N" suffix. Same separator trick as the
+// diff Meta carrier (diffMetaSep in panels/chat.go).
+const AttachMetaSep = "\x1f"
+
+// AttachMetaPrefix tags a user bubble's Meta as the attachment carrier
+// (every other Meta user — think/tool/question/diff/office-error — owns
+// its own Kind or From, so the prefix cannot collide).
+const AttachMetaPrefix = "att"
+
+// AttachMeta builds the ChatMsg.Meta carrier from attachment names;
+// "" when there are none (a plain user turn keeps an empty Meta).
+func AttachMeta(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	return AttachMetaPrefix + AttachMetaSep + strings.Join(names, AttachMetaSep)
+}
+
+// ParseAttachMeta decodes the carrier back into names; ok is false when
+// Meta isn't an attachment list at all.
+func ParseAttachMeta(meta string) (names []string, ok bool) {
+	if !strings.HasPrefix(meta, AttachMetaPrefix+AttachMetaSep) {
+		return nil, false
+	}
+	rest := strings.TrimPrefix(meta, AttachMetaPrefix+AttachMetaSep)
+	if rest == "" {
+		return nil, false
+	}
+	return strings.Split(rest, AttachMetaSep), true
+}
+
 // SpriteState — where an employee is / what they're doing (drives glyphs+walkers).
 type SpriteState string
 
@@ -123,6 +178,14 @@ type OfficeState struct {
 	// BossThinking — the primary session is between a prompt and its reply,
 	// with a live EvThought open. UI dims the desk glyph / shows a spinner.
 	BossThinking bool `json:"bossThinking,omitempty"`
+	// BossDelegating — a boss typing placeholder is outstanding but the
+	// primary session has been quiet (no stream/thought/primary-tool) for
+	// >6 ticks while hired employees are visibly busy (working/to-manager/
+	// meeting): the boss is MANAGING, not generating. The UI swaps the
+	// noisy typing spinner for a settled "delegating" row and stamps the
+	// floor nameplate "[delegat]". Clears the moment any boss-side
+	// activity lands.
+	BossDelegating bool `json:"bossDelegating,omitempty"`
 }
 
 // EventKind — Go has no tagged unions; one Event struct with a Kind + optional fields.
@@ -191,7 +254,12 @@ type Backend interface {
 	// Start wires events; f MUST be safe to call from backend goroutines
 	// (the app hands it tea.Program.Send).
 	Start(emit func(Event)) error
-	// Send pushes user chat to the boss.
+	// Send pushes user chat to the boss. Plain text on purpose: chat-input
+	// attachments ride an OPTIONAL second seam — SendWith(text, atts
+	// []Attachment) — that the app type-asserts (see attachmentBackend in
+	// internal/app/model.go, the same pattern as the team board seam).
+	// Keeping them out of this interface means harness stubs (uishot,
+	// headless) unchanged: they simply never attach files.
 	Send(text string) error
 	// AnswerPermission replies to a pending permission prompt. response is
 	// "once" | "always" | "reject" (opencode serve permission.reply enum).

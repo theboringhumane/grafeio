@@ -103,12 +103,20 @@ Sounds: `ui.sounds = on | bell | off` (or `GRAFEIO_MUTE=1`).
 | `↑` `↓` `pgup` `pgdn` / wheel | scroll the active panel |
 | `enter` | send to the boss (chat) |
 | `shift+enter` | newline |
+| `@` at a word start (chat) | open the attach-file picker — `↑`/`↓` choose · `enter`/`tab` attach · `esc` close |
+| `ctrl+v` (chat) | paste text — attaches the image instead when the clipboard holds one (macOS: `pngpaste` or osascript) |
+| `backspace` on an empty input | drop the newest attachment chip |
 | `ctrl+t` | expand/collapse completed thinking blocks |
 | `ctrl+d` | expand/collapse diff blocks |
 | `ctrl+o` | release the embedded terminal's focus back to the panels |
 | `ctrl+q` | quit (works inside the embedded terminal too) |
 | `y` `a` `n` `esc` | answer a permission prompt |
 | `q` / `ctrl+c` | quit |
+
+Attachments stage as dim `📎` chips above the input (cap 5 — the oldest
+drops past it), ride the message queue like text, and go out as prompt file
+parts; the echoed user bubble shows a `· 📎 N` suffix. `/clear` or a send
+clears the chips.
 
 ## What v2 (Go) changed
 
