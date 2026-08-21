@@ -96,11 +96,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/theboringhumane/grafeio/internal/app"
 	"github.com/theboringhumane/grafeio/internal/chrome"
@@ -1476,6 +1478,7 @@ func runSocialProof() error {
 	fmt.Println("asserts: OK — modal gate held, tea co-walk fired, gossip 3-beat chain fired, tick-seeded runs byte-identical")
 	return nil
 }
+
 // --- layout-modes proof (--layout) ------------------------------------------
 // THREE frames over the identical scripted window + identical config base,
 // differing ONLY by the layout knobs: NORMAL (defaults, sidebar 44),
@@ -1635,6 +1638,205 @@ func runTerminalProof() error {
 	return nil
 }
 
+// --- fix-wave proof (--focus) ----------------------------------------------
+// Three frames over ONE synchronous driver (no tea.Program, no wall clock):
+// every EvTick is pumped by hand, so tick parity — and therefore the
+// caret-blink phase — is exact. Frame A catches the empty typing
+// placeholder (spinner row, NO caret); frame B catches a streaming partial
+// bubble at an even tick (caret on its OWN bottom row of the bubble);
+// frame C catches two concurrent agents: employee tool calls grouped into
+// per-agent work threads (headers + merged rows), the boss's own tool
+// line still inline, and the boss quiet at its placeholder with workers
+// busy → BossDelegating ("boss: delegating · 2 busy" + [delegat] nameplate).
+
+// focusDriver — minimal synchronous model pump (same shape as socialDriver).
+type focusDriver struct {
+	m app.Model
+}
+
+func newFocusDriver() *focusDriver {
+	backend := &stubBackend{done: make(chan struct{})} // Mode() only — no script
+	m := app.New(backend, config.Default())
+	d := &focusDriver{m: m}
+	d.send(tea.WindowSizeMsg{Width: shotCols, Height: shotRows})
+	return d
+}
+
+func (d *focusDriver) send(msg tea.Msg) {
+	tm, _ := d.m.Update(msg)
+	if fm, ok := tm.(app.Model); ok {
+		d.m = fm
+	}
+}
+
+func (d *focusDriver) pump(n int) {
+	for i := 0; i < n; i++ {
+		d.send(state.Event{Kind: state.EvTick})
+	}
+}
+
+func focusTool(ownerID, ownerName, callID, toolName, summary, toolState string) state.Event {
+	return state.Event{Kind: state.EvTool, EmployeeID: ownerID, EmployeeName: ownerName,
+		ToolName: toolName, ToolSummary: summary, ToolState: toolState, CallID: callID}
+}
+
+func runFocusProof() error {
+	fail := func(format string, args ...any) error { return fmt.Errorf(format, args...) }
+	d := newFocusDriver()
+	d.send(state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — focus stub online"})
+	d.send(state.Event{Kind: state.EvHire, Employee: state.Employee{
+		ID: "dev-1", Name: "tekton-1", Role: state.RoleDeveloper, Sprite: state.SpriteAtDesk}})
+	d.send(state.Event{Kind: state.EvHire, Employee: state.Employee{
+		ID: "sco-1", Name: "skopos-1", Role: state.RoleScout, Sprite: state.SpriteAtDesk}})
+	d.send(state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
+		"wire the sse stream", false)})
+	d.send(state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-1", "boss", "", true)})
+	d.pump(4) // tick 4 — settled placeholder
+	fmt.Println("===== UI SHOT · FOCUS A — empty pending bubble: typing spinner row, NO caret row =====")
+	frameA := d.m.Frame()
+	fmt.Println(frameA)
+	fmt.Println("===== UI SHOT =====")
+
+	// (b) the reply streams in as accumulated pending updates; the
+	// placeholder boss-1 is replaced by the first real-bubble update.
+	d.send(state.Event{Kind: state.EvChatBoss, Msg: chatMsg("bossmsg-m1", "boss",
+		"Wiring the handler —", true)})
+	d.send(state.Event{Kind: state.EvChatBoss, Msg: chatMsg("bossmsg-m1", "boss",
+		"Wiring the handler — the **SSE stream** fans out to both workers now.", true)})
+	d.pump(2) // tick 6 — even phase: caret row visible
+	fmt.Println("===== UI SHOT · FOCUS B — streaming partial: caret on its OWN bottom row of the bubble =====")
+	frameB := d.m.Frame()
+	fmt.Println(frameB)
+	fmt.Println("===== UI SHOT =====")
+	for _, ln := range strings.Split(frameB, "\n") {
+		if !strings.Contains(ln, "▌") {
+			continue
+		}
+		// the chat panel's segment of this full-frame line, raw ANSI:
+		// border → (hanging indent) → dim ▌ → border — nothing else.
+		start := strings.Index(ln, "│")
+		end := strings.LastIndex(ln, "│")
+		if start >= 0 && end > start {
+			fmt.Printf("--- caret row, raw ANSI (dedicated-row proof; prefix = hanging indent, then NOTHING but ▌) ---\n%s\n",
+				strconv.Quote(ln[start:end+len("│")]))
+		}
+		break
+	}
+
+	// (c) settle the round-1 bubble, dispatch two workers, storm tool
+	// calls for BOTH (interleaved — merge per agent+CallID), one boss
+	// inline tool, then a fresh user turn whose placeholder goes quiet.
+	d.send(state.Event{Kind: state.EvChatBoss, Msg: chatMsg("bossmsg-m1", "boss",
+		"Wiring the handler — the **SSE stream** fans out to both workers now. Watch their threads below.", false)})
+	d.send(state.Event{Kind: state.EvDispatch, EmployeeID: "dev-1",
+		Task: state.BoardTask{ID: "t1", Title: "Wire the SSE stream", At: time.Now().UnixMilli()}})
+	d.send(state.Event{Kind: state.EvWorking, EmployeeID: "dev-1", TaskID: "t1"})
+	d.send(state.Event{Kind: state.EvDispatch, EmployeeID: "sco-1",
+		Task: state.BoardTask{ID: "t2", Title: "Scan the repo", At: time.Now().UnixMilli()}})
+	d.send(state.Event{Kind: state.EvWorking, EmployeeID: "sco-1", TaskID: "t2"})
+	d.send(focusTool("dev-1", "tekton-1", "call-t1", "read", "internal/room/manager.go", "running"))
+	d.send(focusTool("sco-1", "skopos-1", "call-s1", "grep", "SSE, 12 hits", "running"))
+	d.send(focusTool("dev-1", "tekton-1", "call-t1", "read", "internal/room/manager.go", "done"))
+	d.send(focusTool("sco-1", "skopos-1", "call-s1", "grep", "SSE, 12 hits", "done"))
+	d.send(focusTool("dev-1", "tekton-1", "call-t2", "edit", "internal/room/handler.go", "running"))
+	d.send(focusTool("sco-1", "skopos-1", "call-s2", "read", "internal/api/room.go", "done"))
+	d.send(focusTool("boss", "boss", "call-b1", "write", "static/sse.html", "done"))
+	d.send(state.Event{Kind: state.EvChatUser, Msg: chatMsg("u2", "user",
+		"and the reconnect backoff", false)})
+	d.send(state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-2", "boss", "", true)})
+	d.pump(10) // tick 16 — boss quiet for 10 ticks, both workers busy
+	fmt.Println("===== UI SHOT · FOCUS C — concurrent agents grouped into work threads, boss delegating =====")
+	frameC := d.m.Frame()
+	fmt.Println(frameC)
+	fmt.Println("===== UI SHOT =====")
+
+	// asserts — frame A
+	for _, want := range []string{"is typing…"} {
+		if !strings.Contains(frameA, want) {
+			return fail("focus A: frame missing %q", want)
+		}
+	}
+	for _, not := range []string{"▌", "delegating"} {
+		if strings.Contains(frameA, not) {
+			return fail("focus A: frame shows %q (empty placeholder must keep the spinner, no caret, no delegation)", not)
+		}
+	}
+	// asserts — frame B: caret present, and ALWAYS its own chat row (the
+	// only text on the row after the hanging indent; never glued onto
+	// content). The frame is the whole 130-col screen, so isolate the
+	// chat panel's segment between its "│" borders.
+	caretRows := 0
+	for _, ln := range strings.Split(frameB, "\n") {
+		if !strings.Contains(ln, "▌") {
+			continue
+		}
+		caretRows++
+		stripped := ansi.Strip(ln)
+		parts := strings.Split(stripped, "│")
+		if len(parts) < 3 {
+			return fail("focus B: caret outside the chat panel borders: %q", stripped)
+		}
+		seg := parts[len(parts)-2]
+		if strings.TrimSpace(seg) != "▌" {
+			return fail("focus B: caret shares the chat row with content: %q", seg)
+		}
+		if p := seg[:strings.Index(seg, "▌")]; strings.TrimSpace(p) != "" {
+			return fail("focus B: caret glued onto content (prefix %q is not all blank)", p)
+		}
+	}
+	if caretRows == 0 {
+		return fail("focus B: no caret row at tick 6 (even blink phase)")
+	}
+	if caretRows > 1 {
+		return fail("focus B: %d caret rows — double-caret accumulation", caretRows)
+	}
+	// asserts — frame C
+	for _, want := range []string{
+		"┌ tekton-1 · Wire the SSE stream",           // per-agent thread header (task from dispatch)
+		"┌ skopos-1 · Scan the repo",                 // second agent, newer at the bottom
+		"│ [tool] read · internal/room/manager.go ✓", // merged running→done, one row
+		"│ [tool] grep · SSE, 12 hits ✓",
+		"[tool] write · static/sse.html ✓", // boss's own tool stays INLINE (no thread)
+		"delegating · 2 busy",              // settled placeholder text (no spinner)
+		"[delegat]",                        // floor nameplate
+		"reconnect backoff",                // round-2 user turn survived the storm
+	} {
+		if !strings.Contains(frameC, want) {
+			return fail("focus C: frame missing %q", want)
+		}
+	}
+	if strings.Contains(frameC, "│ [tool] write") {
+		return fail("focus C: boss tool line was captured into a worker thread (must stay inline)")
+	}
+	if strings.Contains(frameC, "▌") {
+		return fail("focus C: caret row present on an EMPTY pending bubble")
+	}
+	// collapse leg: tekton-1 returns (sprite leaves the busy set) → its
+	// thread AUTO-COLLAPSES to the one-line summary; ctrl+g expands ALL
+	// completed threads again.
+	d.send(state.Event{Kind: state.EvReturned, EmployeeID: "dev-1", TaskID: "t1",
+		Mail: mail("m1", "tekton-1", "boss", "return: sse stream", "stream is live.", state.MailReturn)})
+	d.pump(1)
+	frameCollapse := d.m.Frame()
+	if !strings.Contains(frameCollapse, "tekton-1 · Wire the SSE stream (· 2 tool calls ✓ done)") {
+		return fail("focus collapse: missing auto-collapsed thread summary for tekton-1")
+	}
+	if strings.Contains(frameCollapse, "┌ tekton-1") {
+		return fail("focus collapse: tekton-1 thread still expanded after EvReturned")
+	}
+	if !strings.Contains(frameCollapse, "┌ skopos-1") {
+		return fail("focus collapse: skopos-1 thread collapsed too — only the RETURNED agent should collapse")
+	}
+	d.send(tea.KeyPressMsg(tea.Key{Code: 'g', Mod: tea.ModCtrl}))
+	frameExpanded := d.m.Frame()
+	if !strings.Contains(frameExpanded, "┌ tekton-1 · Wire the SSE stream") ||
+		!strings.Contains(frameExpanded, "│ [tool] read · internal/room/manager.go ✓") {
+		return fail("focus expand: ctrl+g did not re-expand the completed thread")
+	}
+	fmt.Println("asserts: OK — caret is a dedicated bottom row (empty bubble keeps the spinner, no caret), worker threads grouped + CallID-merged, boss tool inline, delegating row + [delegat] nameplate, EvReturned auto-collapses, ctrl+g re-expands completed threads")
+	return nil
+}
+
 func main() {
 	tab := flag.String("tab", defaultTab, "active tab: chat|terminal|agents|board|mail|activity")
 	theme := flag.String("theme", "", "force a ui theme: "+strings.Join(chrome.ThemeNames(), "|"))
@@ -1654,7 +1856,16 @@ func main() {
 	social := flag.Bool("social", false, "social-clock proof: synchronous tick pump — three frames (tea ask / both walking / gossip chain), banter chain trace, question-modal gate assert, tick-seeded determinism check")
 	layout := flag.Bool("layout", false, "layout-modes proof: three frames over the same window — NORMAL (sidebar 44), compact (sidebar 30, short tab labels, 2-row chat input, compressed topbar), wide 56 — with computed width asserts per frame")
 	terminal := flag.Bool("terminal", false, "terminal-tab proof: the stub TermPanel wires through app.SpawnTerminal — lazy-spawn on first visit, keys routed into the shell surface, frame + asserts")
+	focus := flag.Bool("focus", false, "fix-wave proof, THREE synchronous-tick frames: (a) empty pending bubble — typing spinner row, NO caret; (b) streaming partial bubble — caret on its OWN bottom row of the bubble (raw-ANSI row printed); (c) two concurrent agents — per-agent work threads grouped (headers + merged rows), boss tool line still inline, boss idle at the placeholder in delegating state (dim row, [delegat] nameplate)")
 	flag.Parse()
+
+	if *focus {
+		if err := runFocusProof(); err != nil {
+			fmt.Fprintf(os.Stderr, "uishot: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *layout {
 		if err := runLayoutProof(); err != nil {

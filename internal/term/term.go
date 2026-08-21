@@ -71,6 +71,7 @@ type Session struct {
 	cmd  *exec.Cmd
 	mf   *os.File // pty master
 	sb   *Scrollback
+	grid *Grid  // live screen model (same bytes as sb, parsed)
 	name string // shell basename (ps/pgrep proofs)
 
 	mu     sync.Mutex
@@ -118,6 +119,7 @@ func Spawn(cfg TermConfig) (*Session, error) {
 		cmd:   cmd,
 		mf:    mf,
 		sb:    NewScrollback(defaultScrollback),
+		grid:  NewGrid(cfg.Cols, cfg.Rows),
 		name:  filepath.Base(cfg.Shell),
 		alive: true,
 		code:  -1,
@@ -132,8 +134,12 @@ func Spawn(cfg TermConfig) (*Session, error) {
 // MUST never block the TUI: all output lands behind the scrollback mutex.
 func (s *Session) startReader() {
 	go func() {
-		// io.Copy on the master: EOF when every slave closes.
-		if _, err := io.Copy(s.sb, s.mf); err != nil {
+		// io.Copy on the master: EOF when every slave closes. Every byte
+		// lands in BOTH the raw scrollback (durable history) and the grid
+		// (live screen model) — one parse per delta, O(bytes), and the
+		// grid nudges the app repaint channel on the way through.
+		dst := io.MultiWriter(s.sb, s.grid)
+		if _, err := io.Copy(dst, s.mf); err != nil {
 			s.mu.Lock()
 			s.err = err
 			s.mu.Unlock()
@@ -203,6 +209,9 @@ func (s *Session) Resize(cols, rows int) error {
 	s.mu.Lock()
 	s.cfg.Cols, s.cfg.Rows = cols, rows
 	s.mu.Unlock()
+	// reshape the screen model first so the SIGWINCH reprint paints into
+	// the new geometry (top-left content kept by the grid).
+	s.grid.SetSize(cols, rows)
 	return pty.Setsize(s.mf, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})
 }
 
@@ -281,3 +290,7 @@ func (s *Session) ShellName() string { return s.name }
 
 // Scrollback exposes the output buffer (last-N rendering, search, etc).
 func (s *Session) Scrollback() *Scrollback { return s.sb }
+
+// Grid exposes the live screen model (cursor-positioned, SGR-styled cells)
+// panels paint from — the alt screen's content while ?1049 is set.
+func (s *Session) Grid() *Grid { return s.grid }

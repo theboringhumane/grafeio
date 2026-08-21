@@ -94,7 +94,7 @@ func nameplateRow(t *testing.T, st state.OfficeState) string {
 		b.WriteRune(c.Ch)
 	}
 	line := b.String()
-	return line[plan.Nameplate.X:plan.Nameplate.X+10]
+	return line[plan.Nameplate.X : plan.Nameplate.X+10]
 }
 
 func TestNameplate(t *testing.T) {
@@ -115,11 +115,21 @@ func TestNameplate(t *testing.T) {
 	})
 	t.Run("meetin while someone is at the boss desk", func(t *testing.T) {
 		plate := nameplateRow(t, state.OfficeState{
-			Tick:       0,
-			Employees:  []state.Employee{emp("t1", "tekton-1", state.RoleDeveloper, "dev-1", state.SpriteMeeting)},
-			Chat:       []state.ChatMsg{{ID: "m1", From: "boss", Pending: true}}, // meetin wins over typing
+			Tick:      0,
+			Employees: []state.Employee{emp("t1", "tekton-1", state.RoleDeveloper, "dev-1", state.SpriteMeeting)},
+			Chat:      []state.ChatMsg{{ID: "m1", From: "boss", Pending: true}}, // meetin wins over typing
 		})
 		if plate != "[meetin]  " {
+			t.Fatalf("got %q", plate)
+		}
+	})
+	t.Run("delegat while the boss delegated to busy workers", func(t *testing.T) {
+		plate := nameplateRow(t, state.OfficeState{
+			Tick:           0,
+			BossDelegating: true,
+			Chat:           []state.ChatMsg{{ID: "m1", From: "boss", Pending: true}}, // delegat supersedes typing
+		})
+		if plate != "[delegat] " {
 			t.Fatalf("got %q", plate)
 		}
 	})

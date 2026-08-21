@@ -1,6 +1,10 @@
 // termshot — headless proof harness for internal/term: spawns a real PTY
 // shell, round-trips a command, resizes, sanitizes, exits, and zombie-
 // checks the process group. Prints "TERM OK" when every proof holds.
+//
+// termshot --grid — the vt-screen-model proof suite: drives a real shell
+// through clear/color/cursor/bs/resize/burst scenarios and asserts against
+// the parsed GRID (not the raw byte stream). Ends with "TERM-GRID OK".
 package main
 
 import (
@@ -49,6 +53,12 @@ func waitFor(d time.Duration, what string, cond func() bool) {
 }
 
 func main() {
+	for _, a := range os.Args[1:] {
+		if a == "--grid" {
+			runGridSuite()
+			return
+		}
+	}
 	fmt.Println("== termshot: PTY proof suite ==")
 
 	shell := term.DefaultShell()
@@ -187,4 +197,146 @@ func main() {
 	ok("no zombies: pgrep %s before=%d after=%d; pgroup %d empty after Kill", name, before, after, pid2)
 
 	fmt.Println("TERM OK")
+}
+
+// ---------------------------------------------------------------------------
+// --grid: the vt screen-model proof suite. Drives /bin/sh on a real PTY and
+// asserts against the parsed grid state (cells, colors, cursor), not the
+// raw byte stream. Each subtest starts with `clear` so screen state is
+// known, and ends with a unique marker echo for synchronization.
+// ---------------------------------------------------------------------------
+
+// waitGrid polls cond against the session grid until true or deadline.
+func waitGrid(sess *term.Session, d time.Duration, what string, cond func(g *term.Grid) bool) {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond(sess.Grid()) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	dump := sess.Grid().ScreenText()
+	fail("timed out waiting for %s\n-- screen dump --\n%s", what, dump)
+}
+
+// gridCmd sends a command line to the shell.
+func gridCmd(sess *term.Session, line string) {
+	if _, err := sess.Write([]byte(line + "\n")); err != nil {
+		fail("write %q: %v", line, err)
+	}
+}
+
+// printFrame dumps the active grid rows as a bordered frame (panorama).
+func printFrame(g *term.Grid, title string) {
+	fmt.Printf("-- %s (%dx%d) --\n", title, g.Cols(), g.Rows())
+	for y := 0; y < g.Rows(); y++ {
+		fmt.Printf("| %s\n", g.LineText(y))
+	}
+}
+
+func runGridSuite() {
+	fmt.Println("== termshot --grid: vt screen-model proof suite ==")
+
+	sess, err := term.Spawn(term.TermConfig{Shell: "/bin/sh", Cols: 80, Rows: 24})
+	if err != nil {
+		fail("spawn: %v", err)
+	}
+	defer sess.Close()
+	g := sess.Grid()
+	ok("spawned /bin/sh pid %d on 80x24 grid", sess.Pid())
+
+	waitGrid(sess, 5*time.Second, "first prompt", func(g *term.Grid) bool {
+		return g.ScreenText() != strings.Repeat("\n", g.Rows())
+	})
+	cx, cy := g.Cursor()
+	ok("grid receiving bytes (screen non-blank, cursor at %d,%d)", cx, cy)
+
+	// settle: let the first prompt fully land before driving
+	time.Sleep(300 * time.Millisecond)
+
+	// (a) clear repaints cleanly: `printf 'A'; clear; printf 'B\n'`
+	//     → row0 shows B ONLY.
+	gridCmd(sess, "printf 'A'; clear; printf 'B\\n'; echo GA_DONE")
+	waitGrid(sess, 5*time.Second, "GA_DONE marker", func(g *term.Grid) bool {
+		return strings.Contains(g.ScreenText(), "GA_DONE")
+	})
+	if got := g.LineText(0); got != "B" {
+		printFrame(g, "subtest a failed")
+		fail("(a) clear redraw: row0 = %q, want %q", got, "B")
+	}
+	ok("(a) printf 'A'; clear; printf 'B\\n' → row0 is exactly \"B\"")
+
+	// (b) colors: `tput setaf 1; echo RED` → the R cell carries fg code 31.
+	gridCmd(sess, "clear; tput setaf 1; echo RED; echo GB_DONE")
+	waitGrid(sess, 5*time.Second, "GB_DONE marker", func(g *term.Grid) bool {
+		return strings.Contains(g.ScreenText(), "GB_DONE")
+	})
+	if c := g.CellAt(0, 0); c.Ch != 'R' || c.Fg != 31 {
+		fail("(b) setaf 1: cell(0,0) = %+v, want Ch 'R' Fg 31", c)
+	}
+	if c := g.CellAt(2, 0); c.Ch != 'D' || c.Fg != 31 {
+		fail("(b) setaf 1: cell(2,0) = %+v, want Ch 'D' Fg 31", c)
+	}
+	ok("(b) tput setaf 1; echo RED → cells carry fg code 31 (red)")
+
+	// (c) cursor addressing: `tput cup 5 10; echo MARK` → 'M' at (10,5).
+	gridCmd(sess, "clear; tput cup 5 10; echo MARK; echo GC_DONE")
+	waitGrid(sess, 5*time.Second, "GC_DONE marker", func(g *term.Grid) bool {
+		return strings.Contains(g.ScreenText(), "GC_DONE")
+	})
+	if c := g.CellAt(10, 5); c.Ch != 'M' {
+		fail("(c) tput cup 5 10: cell(10,5) = %+v, want 'M'", c)
+	}
+	ok("(c) tput cup 5 10; echo MARK → 'M' painted at (col=10,row=5)")
+
+	// (d) backspace: `printf 'x\bX'` → cursor handling, cell shows X.
+	gridCmd(sess, "clear; printf 'x\\bX'; echo GD_DONE")
+	waitGrid(sess, 5*time.Second, "GD_DONE marker", func(g *term.Grid) bool {
+		return strings.Contains(g.ScreenText(), "GD_DONE")
+	})
+	if c := g.CellAt(0, 0); c.Ch != 'X' {
+		fail("(d) printf 'x\\bX': cell(0,0) = %+v, want 'X'", c)
+	}
+	ok("(d) printf 'x\\bX' → BS moves left, next print overwrites: cell shows X")
+
+	// (e) resize 60x20: grid shape adjusts, top-left content keeps.
+	prevCell := g.CellAt(0, 0)
+	if err := sess.Resize(60, 20); err != nil {
+		fail("(e) resize: %v", err)
+	}
+	if g.Cols() != 60 || g.Rows() != 20 {
+		fail("(e) grid shape after resize = %dx%d, want 60x20", g.Cols(), g.Rows())
+	}
+	if c := g.CellAt(0, 0); c != prevCell {
+		fail("(e) resize lost top-left content: %+v → %+v", prevCell, c)
+	}
+	gridCmd(sess, "clear; echo GE_DONE")
+	waitGrid(sess, 5*time.Second, "GE_DONE marker", func(g *term.Grid) bool {
+		return strings.Contains(g.ScreenText(), "GE_DONE")
+	})
+	ok("(e) resize 60x20 → grid reshaped, top-left content kept, shell follows")
+
+	// (f) typing burst through the PTY + in-process parse budget.
+	gridCmd(sess, "clear; head -c 200 /dev/zero | tr '\\0' y; echo GF_DONE")
+	burstStart := time.Now()
+	waitGrid(sess, 5*time.Second, "GF_DONE marker", func(g *term.Grid) bool {
+		return strings.Contains(g.ScreenText(), "GF_DONE")
+	})
+	e2e := time.Since(burstStart)
+
+	// pure parse budget: 200-char burst including SGR, far under 50ms
+	bench := term.NewGrid(80, 24)
+	raw := []byte(strings.Repeat("abcdefghij\x1b[32mgreen\x1b[0m ", 12)) // ~300 B
+	p0 := time.Now()
+	_, _ = bench.Write(raw)
+	parse := time.Since(p0)
+	if parse > 50*time.Millisecond {
+		fail("(f) grid parse of %d bytes = %s, want <50ms", len(raw), parse)
+	}
+	fmt.Printf("-- typeburst frame (60x20 after 200-char burst, e2e %s, parse %s) --\n", e2e.Round(time.Millisecond), parse)
+	printFrame(g, "panorama")
+	ok("(f) 200-char burst: end-to-end %s, grid parse of %d bytes %s (<50ms)",
+		e2e.Round(time.Millisecond), len(raw), parse)
+
+	fmt.Println("TERM-GRID OK")
 }

@@ -2,8 +2,12 @@
 // sidebar. Backed by internal/term.Session (a real PTY running the user's
 // shell). The panel:
 //
-//	body    — the sanitized last-N rows of the shell's scrollback
-//	         (SGR colors pass through; the live idle prompt included).
+//	body    — the live screen model (internal/term.Grid): cursor-positioned,
+//	         SGR-styled cells painted directly with lipgloss. The prompt
+//	         stays put, clear/redraw repaints cleanly, and ?1049 alt-screen
+//	         apps paint their alternate screen until exit. Mouse-wheel
+//	         scroll (and the dead-shell view) fall back to the sanitized
+//	         raw scrollback, which holds the full retained byte stream.
 //	footer  — a one-row badge: "[tty] focused · ctrl+o to release" while
 //	         the terminal owns the keyboard; "[tty] inactive" (dim) when
 //	         the app owns keys again; a red "terminal exited (code N) —
@@ -21,6 +25,7 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/theboringhumane/grafeio/internal/chrome"
 	"github.com/theboringhumane/grafeio/internal/state"
@@ -135,11 +140,15 @@ func (p *TermPanel) SetSize(w, h int) {
 }
 
 // SetState implements Tab: the office tick is our refresh clock — every
-// push invalidates the render cache if the scrollback moved (rev-check
-// keeps the no-op case free).
+// push invalidates the render cache if the screen model moved (grid rev is
+// the live signal while the shell runs; scrollback rev covers the edges).
 func (p *TermPanel) SetState(st state.OfficeState) {
-	if p.sess != nil && p.sess.Scrollback().Rev() != p.rev {
-		p.rev = p.sess.Scrollback().Rev()
+	if p.sess == nil {
+		return
+	}
+	rev := p.sess.Grid().Rev() + p.sess.Scrollback().Rev()
+	if rev != p.rev {
+		p.rev = rev
 		p.cached = ""
 	}
 }
@@ -170,6 +179,7 @@ func (p *TermPanel) Update(msg tea.Msg) tea.Cmd {
 			}
 			if b, ok := keyToBytes(msg); ok {
 				_, _ = p.sess.Write(b)
+				p.cached = "" // the echo repaints on the next frame
 			}
 			return nil // every key is consumed while focused
 		}
@@ -286,17 +296,37 @@ func (p *TermPanel) View() string {
 		for i := 1; i < p.bodyH(); i++ {
 			b.WriteString("\n" + fitPlain("", p.w))
 		}
+	} else if p.scroll == 0 {
+		// LIVE PATH — paint the screen model: cursor-positioned rows with
+		// real SGR styling and a block caret. No sanitizer, no flatten.
+		grid := p.sess.Grid()
+		rows := grid.Render()
+		cx, cy := grid.Cursor()
+		for y, row := range rows {
+			if y > 0 {
+				b.WriteString("\n")
+			}
+			if y == cy && p.focused {
+				b.WriteString(gridRowString(row, cx))
+			} else {
+				b.WriteString(gridRowString(row, -1))
+			}
+		}
+		for i := len(rows); i < p.bodyH(); i++ {
+			if len(rows) > 0 || i > 0 {
+				b.WriteString("\n")
+			}
+			b.WriteString(fitPlain("", p.w))
+		}
 	} else {
+		// HISTORY PATH — mouse-wheel scrollback: the raw byte window,
+		// sanitized (legacy behavior).
 		rows := p.sess.Scrollback().Render(p.bodyH()+p.scroll, p.w)
-		// apply scroll offset: keep the slice ending scroll-rows above the tail
-		if p.scroll > 0 && len(rows) > p.scroll {
+		if len(rows) > p.scroll {
 			rows = rows[:len(rows)-p.scroll]
 		}
-		if p.scroll > 0 {
-			// viewing history: align to bottom of viewport naturally
-			for len(rows) > p.bodyH() {
-				rows = rows[1:]
-			}
+		for len(rows) > p.bodyH() {
+			rows = rows[1:]
 		}
 		for i, r := range rows {
 			if i > 0 {
@@ -330,4 +360,74 @@ func (p *TermPanel) View() string {
 
 	p.cached = b.String()
 	return p.cached
+}
+
+// ---------------------------------------------------------------------------
+// Grid painting: Cells → lipgloss runs. Contiguous same-styled cells join
+// into one Render call so a full row costs a handful of SGR sequences.
+// ---------------------------------------------------------------------------
+
+// cellKey is the comparable style signature of one cell (run breaks on ≠).
+type cellKey struct {
+	fg, bg                string
+	bold, dim, under, rev bool
+}
+
+// gridRowString renders one screen row. caretCol >= 0 forces reverse video
+// on that cell (the block caret — drawn here, never mutating the grid).
+func gridRowString(row term.Row, caretCol int) string {
+	var b strings.Builder
+	var run strings.Builder
+	var key cellKey
+	var style lipgloss.Style
+	started := false
+
+	flush := func() {
+		if run.Len() == 0 {
+			return
+		}
+		if key == (cellKey{}) {
+			b.WriteString(run.String()) // plain default run, no escapes
+		} else {
+			b.WriteString(style.Render(run.String()))
+		}
+		run.Reset()
+	}
+
+	for x, c := range row {
+		rev := c.Reverse
+		if x == caretCol {
+			rev = !rev
+		}
+		k := cellKey{
+			fg:    term.LipColor(c.Fg),
+			bg:    term.LipColor(c.Bg),
+			bold:  c.Bold,
+			dim:   c.Dim,
+			under: c.Underline,
+			rev:   rev,
+		}
+		if started && k != key {
+			flush()
+		}
+		if !started || k != key {
+			key = k
+			style = lipgloss.NewStyle()
+			if k.fg != "" {
+				style = style.Foreground(lipgloss.Color(k.fg))
+			}
+			if k.bg != "" {
+				style = style.Background(lipgloss.Color(k.bg))
+			}
+			style = style.Bold(k.bold).Faint(k.dim).Underline(k.under).Reverse(k.rev)
+			started = true
+		}
+		ch := c.Ch
+		if ch == 0 {
+			ch = ' '
+		}
+		run.WriteRune(ch)
+	}
+	flush()
+	return b.String()
 }

@@ -432,7 +432,9 @@ func BuildRows(st state.OfficeState, width, height int) []Row {
 	put(g, W, H, plan.Hot.Clock.X, plan.Hot.Clock.Y, TickClock(st.Tick), &style{fg: "white"})
 
 	// boss nameplate is a STATUS line: typing when a boss chat answer is
-	// pending, meetin while anyone is at the boss desk, awaiting otherwise
+	// pending, meetin while anyone is at the boss desk, delegat while the
+	// boss delegated to busy workers (BossDelegating — still a pending
+	// placeholder, but managing not generating), awaiting otherwise
 	plate := "[awaiting]"
 	pendingBoss := false
 	for _, m := range st.Chat {
@@ -451,6 +453,8 @@ func BuildRows(st state.OfficeState, width, height int) []Row {
 	switch {
 	case meeting:
 		plate = "[meetin]"
+	case st.BossDelegating: // implies pendingBoss — the stricter branch first
+		plate = "[delegat]"
 	case pendingBoss:
 		plate = "[typing]"
 	}
@@ -665,6 +669,9 @@ func floorRenderRev(st state.OfficeState) string {
 			b.WriteString("P")
 			break
 		}
+	}
+	if st.BossDelegating { // nameplate "[delegat]" — a new render input
+		b.WriteString("D")
 	}
 	b.WriteString(ansiColors["gray"]) // theme epoch: re-paint on /theme
 	b.WriteString(ansiColors["yellow"])
