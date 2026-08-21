@@ -46,64 +46,76 @@ const (
 		"```"
 )
 
-// bossDiffBody — a diff long enough to prove the 30-line "+N more" clip
-// when expanded (34 body lines).
-const bossDiffBody = `--- a/internal/app/model.go
-+++ b/internal/app/model.go
-@@ -52,11 +52,14 @@ type Model struct {
- 	backend state.Backend
- 	st      state.OfficeState
--	width, height int
--	middleH       int
--	sidebar       int
--	floorW        int
--	tabs          *panels.Tabs
--	chat          *panels.Chat
--	activity      *panels.Activity
--	keys          KeyMap
-+	width, height int
-+	middleH       int
-+	sidebar       int
-+	floorW        int
-+	tabs          *panels.Tabs
-+	chat          *panels.Chat
-+	activity      *panels.Activity
-+	keys          KeyMap
-+	// Message queue (model-level so it survives tab switches).
-+	queue []string
-+	// Permission prompts (boss/primary session only).
-+	perm     *permPrompt
-+	permEscd *permPrompt
- }
-@@ -219,7 +222,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
- 	case sendErrMsg:
--		m.applyEvent(state.Event{
--			Kind: state.EvStatus,
--			Text: "send failed",
--		})
-+		cmds = append(cmds, m.applyEvent(state.Event{
-+			Kind: state.EvStatus,
-+			Text: fmt.Sprintf("[grafeio] send failed: %v", msg.err),
-+		}))
-+	case enqueueMsg:
-+		m.queue = append(m.queue, msg.text)
-+	case queueFlushMsg:
-+		cmds = append(cmds, m.flushQueued())
- 	}
- 	return m, tea.Batch(cmds...)
- }`
+// bossDiffBody — a markdown-heavy README.md diff close to the reference
+// panel: **bold** and `code` spans inside tinted rows (proves chroma paints
+// md on top of the tints), realistic @@ old/new numbers, and >30 rows total
+// so the expanded "+N more" clip still fires.
+const bossDiffBody = "--- a/README.md\n" +
+	"+++ b/README.md\n" +
+	"@@ -40,6 +40,7 @@ renders **bold**, *italic*, `code` and lists.\n" +
+	" \n" +
+	" ## What you get\n" +
+	"   format and wrap inside the panel instead of bleeding through the UI.\n" +
+	" \n" +
+	"- **Bug:** Scrolling everywhere (viewport), mouse wheel, multi-line input,\n" +
+	"   typing spinner while the `boss` works.\n" +
+	"- Native single binary. The **Ink/Node** v0.1 app is preserved under\n" +
+	"   [`node-legacy/`](node-legacy/) (tagged `node-v0.1.0`).\n" +
+	"+ Native single binary. Themes: `--theme noir|paper|mono|dracula`\n" +
+	"+ (also `/theme` in-app, persisted to `~/.config/grafeio/theme`).\n" +
+	" \n" +
+	"   ## Behind the glass\n" +
+	"@@ -49,6 +50,10 @@ renders **bold**, *italic*, `code` and lists.\n" +
+	"   Boss turns stream as markdown; user turns wrap plain.\n" +
+	"- ~90 MB of RAM idle, **instant** startup.\n" +
+	"+ ~12 MB of RAM idle, **instant** startup.\n" +
+	"- See [docs/](docs/) for the tour.\n" +
+	"+ See [docs/](docs/) for the full tour, [AGENTS.md](AGENTS.md) for rules.\n" +
+	" \n" +
+	"   ### Run it\n" +
+	"-```sh\n" +
+	"-cd grafeio && go build ./...\n" +
+	"-```\n" +
+	"+```sh\n" +
+	"+go run ./cmd/grafeio --theme dracula\n" +
+	"+grafeio --theme paper\n" +
+	"+```\n" +
+	" \n" +
+	" | Key | Action |\n" +
+	" |-----|--------|\n" +
+	"-| `ctrl+t` | toggle thinking |\n" +
+	"+| `ctrl+t` | toggle thinking blocks |\n" +
+	"+| `ctrl+d` | toggle expanded diffs |\n" +
+	"+| `/diffs off` | collapse all diffs |\n" +
+	" \n" +
+	" ## Layout\n" +
+	" \n" +
+	"-- side: chat with the boss\n" +
+	"- floor: the office\n" +
+	"-```\n" +
+	"-┌──────┐\n" +
+	"-│ desk │\n" +
+	"-└──────┘\n" +
+	"-```\n" +
+	"+ sidebar: chat with the boss (**all** history)\n" +
+	"+ floor: the office grid, mail, board, activity tabs\n" +
+	"+```text\n" +
+	"+┌────────┬────────┐\n" +
+	"+│  chat  │ floor  │\n" +
+	"+└────────┴────────┘\n" +
+	"+```"
 
-// employeeDiffBody — small child-session diff (also lands in chat + an
-// activity line).
-const employeeDiffBody = `--- a/src/main.go
-+++ b/src/main.go
-@@ -1,4 +1,5 @@
- package main
- func main() {
--	println("hi")
-+	println("hello, grafeio")
-+	run()
- }`
+// employeeDiffBody — a brand-new Go file (--- /dev/null) so the expanded
+// header reads "← New file …" and all rows are additions with Go syntax.
+const employeeDiffBody = "--- /dev/null\n" +
+	"+++ b/src/main.go\n" +
+	"@@ -0,0 +1,5 @@\n" +
+	"+package main\n" +
+	"+\n" +
+	"+func main() {\n" +
+	"+\tprintln(\"hello, grafeio\")\n" +
+	"+run()\n" +
+	"+}"
 
 // stubBackend is the deterministic scripted backend for the shot.
 type stubBackend struct {
@@ -183,9 +195,9 @@ func (b *stubBackend) script() {
 	at(1960, state.Event{Kind: state.EvQuestion, EmployeeName: "tekton-1", QuestionID: "q-2",
 		Text: "employee question — activity line only, no chat entry"})
 	at(2000, state.Event{Kind: state.EvFileDiff, EmployeeName: "boss",
-		DiffPath: "internal/app/model.go", DiffAdd: 40, DiffDel: 12, DiffBody: bossDiffBody})
+		DiffPath: "README.md", DiffAdd: 18, DiffDel: 15, DiffBody: bossDiffBody})
 	at(2050, state.Event{Kind: state.EvFileDiff, EmployeeName: "tekton-1",
-		DiffPath: "src/main.go", DiffAdd: 5, DiffDel: 1, DiffBody: employeeDiffBody})
+		DiffPath: "src/main.go", DiffAdd: 5, DiffDel: 0, DiffBody: employeeDiffBody})
 
 	// a return: desk walk + done task + return mail
 	at(2100, state.Event{Kind: state.EvReturned, EmployeeID: "dev-1", TaskID: "t1",

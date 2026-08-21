@@ -56,6 +56,20 @@ type Theme struct {
 	RoleReviewer color.Color
 	RoleRunner   color.Color
 
+	// Expanded chat diffs (opencode-style): full-row tints + inks.
+	// DiffAddBg/DiffDelBg nil → the row tint is suppressed and mono-style
+	// emphasis steps in (bold additions / underlined deletions).
+	DiffAddBg    color.Color // tint behind addition rows
+	DiffDelBg    color.Color // tint behind deletion rows
+	DiffAddFg    color.Color // addition text ink on the tint
+	DiffDelFg    color.Color // deletion text ink on the tint
+	DiffCtxFg    color.Color // context line ink (untinted rows)
+	DiffGutterFg color.Color // line-number gutter ink
+
+	// Chroma — the chroma styles.Get name used for inline syntax highlighting
+	// inside expanded diff rows (per theme).
+	ChromaStyle string
+
 	// Glamour — the glamour standard style for boss markdown (dark/light/notty/dracula).
 	Glamour string
 }
@@ -79,6 +93,13 @@ var themeList = []Theme{
 		RoleScout:    lipgloss.Color("2"),
 		RoleReviewer: lipgloss.Color("5"),
 		RoleRunner:   lipgloss.Color("4"),
+		DiffAddBg:    lipgloss.Color("#16301d"),
+		DiffDelBg:    lipgloss.Color("#33191c"),
+		DiffAddFg:    lipgloss.Color("#56d364"),
+		DiffDelFg:    lipgloss.Color("#ff7b72"),
+		DiffCtxFg:    lipgloss.Color("8"),
+		DiffGutterFg: lipgloss.Color("8"),
+		ChromaStyle:  "github-dark",
 		Glamour:      "dark",
 	},
 	{ // paper — light bg, dark fg, the same accents re-darkened
@@ -98,6 +119,13 @@ var themeList = []Theme{
 		RoleScout:    lipgloss.Color("#1a7f37"),
 		RoleReviewer: lipgloss.Color("#a626a4"),
 		RoleRunner:   lipgloss.Color("#0969da"),
+		DiffAddBg:    lipgloss.Color("#d2ecd7"),
+		DiffDelBg:    lipgloss.Color("#f5d8d8"),
+		DiffAddFg:    lipgloss.Color("#1a7f37"),
+		DiffDelFg:    lipgloss.Color("#d1242f"),
+		DiffCtxFg:    lipgloss.Color("#57606a"),
+		DiffGutterFg: lipgloss.Color("#8d98a3"),
+		ChromaStyle:  "github",
 		Glamour:      "light",
 	},
 	{ // mono — grayscale; emphasis comes from bold/dim, not hue
@@ -117,6 +145,15 @@ var themeList = []Theme{
 		RoleScout:    lipgloss.Color("#a8a8a8"),
 		RoleReviewer: lipgloss.Color("#949494"),
 		RoleRunner:   lipgloss.Color("#808080"),
+		// mono: NO row tints (nil bg) — additions render bold, deletions
+		// underlined; hue carries no meaning in a grayscale theme.
+		DiffAddBg:    nil,
+		DiffDelBg:    nil,
+		DiffAddFg:    lipgloss.Color("#e4e4e4"),
+		DiffDelFg:    lipgloss.Color("#d0d0d0"),
+		DiffCtxFg:    lipgloss.Color("#6f6f6f"),
+		DiffGutterFg: lipgloss.Color("#6f6f6f"),
+		ChromaStyle:  "bw",
 		Glamour:      "notty",
 	},
 	{ // dracula — canonical palette (draculatheme.com)
@@ -136,6 +173,13 @@ var themeList = []Theme{
 		RoleScout:    lipgloss.Color("#50fa7b"),
 		RoleReviewer: lipgloss.Color("#bd93f9"),
 		RoleRunner:   lipgloss.Color("#ffb86c"),
+		DiffAddBg:    lipgloss.Color("#1f3a2a"),
+		DiffDelBg:    lipgloss.Color("#442a30"),
+		DiffAddFg:    lipgloss.Color("#50fa7b"),
+		DiffDelFg:    lipgloss.Color("#ff5555"),
+		DiffCtxFg:    lipgloss.Color("#8a97c4"),
+		DiffGutterFg: lipgloss.Color("#6272a4"),
+		ChromaStyle:  "dracula",
 		Glamour:      "dracula",
 	},
 	{ // solarized — canonical Solarized Dark palette (ethanschoonover.com/solarized)
@@ -155,6 +199,14 @@ var themeList = []Theme{
 		RoleScout:    lipgloss.Color("#859900"),
 		RoleReviewer: lipgloss.Color("#6c71c4"),
 		RoleRunner:   lipgloss.Color("#268bd2"),
+		// tints over base03 (#002b36): dark green / dark red washes
+		DiffAddBg:    lipgloss.Color("#14362a"),
+		DiffDelBg:    lipgloss.Color("#3c2429"),
+		DiffAddFg:    lipgloss.Color("#859900"),
+		DiffDelFg:    lipgloss.Color("#dc322f"),
+		DiffCtxFg:    lipgloss.Color("#586e75"),
+		DiffGutterFg: lipgloss.Color("#586e75"),
+		ChromaStyle:  "solarized-dark",
 		Glamour:      "light",
 	},
 }
@@ -271,6 +323,21 @@ var (
 // BarBgColor is the inverted bar background of the active theme.
 var BarBgColor color.Color
 
+// Expanded diff slots of the active theme (re-pointed by SetTheme).
+// DiffAddBg/DiffDelBg are nil in themes with suppressed tints (mono).
+var (
+	DiffAddBg    color.Color
+	DiffDelBg    color.Color
+	DiffAddFg    color.Color
+	DiffDelFg    color.Color
+	DiffCtxFg    color.Color
+	DiffGutterFg color.Color
+
+	// DiffChromaStyle is the chroma styles.Get name for inline syntax in
+	// expanded diff rows (nil-safe: styles.Get falls back when unknown).
+	DiffChromaStyle string
+)
+
 // Bar / panel styles — re-derived by SetTheme.
 var (
 	// Bar is the base style for topbar + statusbar rows (inverted bar).
@@ -326,6 +393,11 @@ func applyTheme(t Theme) {
 	WarnText = lipgloss.NewStyle().Foreground(t.Warn)
 	WarnBold = lipgloss.NewStyle().Foreground(t.Warn).Bold(true)
 	QuestionText = lipgloss.NewStyle().Foreground(t.Question)
+
+	DiffAddBg, DiffDelBg = t.DiffAddBg, t.DiffDelBg
+	DiffAddFg, DiffDelFg = t.DiffAddFg, t.DiffDelFg
+	DiffCtxFg, DiffGutterFg = t.DiffCtxFg, t.DiffGutterFg
+	DiffChromaStyle = t.ChromaStyle
 }
 
 // RoleColor — port of node-legacy roster.nameColor: per-theme role ink;

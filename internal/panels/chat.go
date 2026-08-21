@@ -29,6 +29,7 @@
 package panels
 
 import (
+	"image/color"
 	"strings"
 
 	"charm.land/bubbles/v2/key"
@@ -38,6 +39,9 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/glamour/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/alecthomas/chroma/v2"
+	chlexers "github.com/alecthomas/chroma/v2/lexers"
+	chstyles "github.com/alecthomas/chroma/v2/styles"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/theboringhumane/grafeio/internal/chrome"
@@ -110,6 +114,8 @@ type Chat struct {
 	md        *glamour.TermRenderer
 	mdWidth   int
 	renderRev uint64 // cheap changed-detection for SetState
+
+	diffCache map[string]diffCacheEntry // parsed+hilighted diff rows by msg ID
 }
 
 // NewChat builds the panel; onSend is invoked on Enter with a non-empty
@@ -140,7 +146,7 @@ func NewChat(onSend func(text string) tea.Cmd) *Chat {
 	)
 
 	c := &Chat{vp: vp, ta: ta, sp: sp, onSend: onSend, follow: true,
-		showThinking: true, showTools: true}
+		showThinking: true, showTools: true, diffCache: map[string]diffCacheEntry{}}
 	c.SetSize(30, 10)
 	return c
 }
@@ -164,6 +170,7 @@ func (c *Chat) RefreshTheme() {
 	applyTextareaStyles(&c.ta)
 	c.sp.Style = chrome.AccentText
 	c.md = nil
+	c.diffCache = map[string]diffCacheEntry{} // syntax colours are theme-bound
 	c.forceRender()
 }
 
@@ -582,44 +589,62 @@ func (c *Chat) renderQuestion(b *strings.Builder, m state.ChatMsg) {
 	b.WriteString(indent + chrome.DimText.Italic(true).Render("(answer by typing below)"))
 }
 
-// renderDiff renders one Kind="diff" entry. Collapsed (default): a single
-// header line "diff · path +A -D". Expanded (ctrl+d / /diffs on): the body
-// under a tinted left border — deletions red (-), additions green (+),
-// context gray — clipped to diffClip lines with a "+N more" trailer.
+// renderDiff renders one Kind="diff" entry opencode-style. Collapsed
+// (default): a single "diff · path +A -D" line with green/red counts.
+// Expanded (ctrl+d / /diffs on): a dim-bold "← Edit|New file|Delete <path>"
+// header over LINE-NUMBERED unified rows — deletion rows tinted DiffDelBg
+// (dark red), addition rows tinted DiffAddBg (dark green) to the FULL panel
+// width, context rows dim with no tint, @@ hunk headers dim italic with no
+// gutter number. The +/- marker sits inside the tinted row. Text inside the
+// rows is syntax-coloured through chroma (theme-mapped style) on top of the
+// tint when a lexer matches the file. Body is clipped to diffClip rows with
+// a "+N more" trailer.
 func (c *Chat) renderDiff(b *strings.Builder, m state.ChatMsg) {
 	path, adds, dels := parseDiffMeta(m.Meta)
-	header := chrome.DimText.Render("diff · "+path)
-	if adds != "" {
-		header += " " + chrome.OKText.Render(adds)
-	}
-	if dels != "" {
-		header += " " + chrome.ErrText.Render(dels)
-	}
-	b.WriteString(header)
 	if !c.diffExpanded {
+		header := chrome.DimText.Render("diff · " + path)
+		if adds != "" {
+			header += " " + chrome.OKText.Render(adds)
+		}
+		if dels != "" {
+			header += " " + chrome.ErrText.Render(dels)
+		}
+		b.WriteString(header)
 		return
 	}
-	body := strings.Split(strings.TrimRight(m.Text, "\n"), "\n")
-	shown := body
-	more := 0
-	if len(body) > diffClip {
-		shown = body[:diffClip]
-		more = len(body) - diffClip
+	rows, op := c.diffRows(m, path)
+	opWord := "Edit"
+	switch op {
+	case diffOpNew:
+		opWord = "New file"
+	case diffOpDel:
+		opWord = "Delete"
 	}
-	rule := chrome.Fg(chrome.Dim, "▎")
-	for _, ln := range shown {
-		ln = strings.ReplaceAll(ln, "\t", "    ") // vp soft-wrap expands tabs
-		style := chrome.DimText // context
-		switch {
-		case strings.HasPrefix(ln, "+"):
-			style = chrome.OKText
-		case strings.HasPrefix(ln, "-"):
-			style = chrome.ErrText
+	b.WriteString(clipStyled(chrome.DimText.Bold(true), "← "+opWord+" "+path, c.w))
+
+	maxNum := 0
+	for _, r := range rows {
+		if r.num > maxNum {
+			maxNum = r.num
 		}
-		b.WriteString("\n" + rule + style.Render(clipPlain(ln, c.w-3)))
+	}
+	gutterW := 5
+	if n := len(itoa(maxNum)); n > gutterW {
+		gutterW = n
+	}
+	shown := rows
+	more := 0
+	if len(rows) > diffClip {
+		shown = rows[:diffClip]
+		more = len(rows) - diffClip
+	}
+	for i := range shown {
+		b.WriteString("\n")
+		b.WriteString(renderDiffRow(shown[i], gutterW, c.w))
 	}
 	if more > 0 {
-		b.WriteString("\n" + rule + chrome.DimText.Italic(true).Render("+"+itoa(more)+" more"))
+		b.WriteString("\n" + strings.Repeat(" ", gutterW+3) +
+			chrome.DimText.Italic(true).Render("+"+itoa(more)+" more"))
 	}
 }
 
@@ -631,6 +656,335 @@ func parseDiffMeta(meta string) (path, adds, dels string) {
 		return parts[0], parts[1], parts[2]
 	}
 	return meta, "", ""
+}
+
+// --- opencode-style diff rows -------------------------------------------------
+
+type diffOp int
+
+const (
+	diffOpEdit diffOp = iota // --- a/path +++ b/path
+	diffOpNew                // --- /dev/null (file created)
+	diffOpDel                // +++ /dev/null (file removed)
+)
+
+type diffRowKind int
+
+const (
+	dkContext diffRowKind = iota
+	dkAdd
+	dkDel
+	dkHunk // @@ header or "\ No newline…" note — no gutter number
+)
+
+// diffSpan is one styled text segment inside a diff row. fg is "" to
+// inherit the row ink, else "#rrggbb" from the chroma style.
+type diffSpan struct {
+	text                    string
+	fg                      string
+	bold, italic, underline bool
+}
+
+// diffRow — one display row of a parsed unified diff. num is the gutter
+// line number (old-side for deletions+context, new-side for additions; 0
+// for hunk rows). oldLine/newLine index the row's text inside the old-side
+// and new-side source streams (-1 when absent). spans covers the text
+// portion AFTER the +/- marker.
+type diffRow struct {
+	kind             diffRowKind
+	num              int
+	oldLine, newLine int
+	spans            []diffSpan
+}
+
+// diffCacheEntry — parsed+highlighted diff rows keyed by chat msg ID;
+// syntax colours are theme-bound so RefreshTheme clears the map.
+type diffCacheEntry struct {
+	theme string
+	rows  []diffRow
+	op    diffOp
+}
+
+// diffRows parses m.Text (unified diff body) into rows and paints chroma
+// spans from the matching lexer; results are cached per msg ID + theme.
+func (c *Chat) diffRows(m state.ChatMsg, path string) ([]diffRow, diffOp) {
+	if ent, ok := c.diffCache[m.ID]; ok && ent.theme == chrome.CurrentTheme().Name {
+		return ent.rows, ent.op
+	}
+	rows, op, oldBody, newBody := parseDiffBody(m.Text)
+	lx := chlexers.Match(path)
+	if lx != nil && lx.Config() != nil && lx.Config().Name == "fallback" {
+		lx = nil
+	}
+	st := chstyles.Get(chrome.DiffChromaStyle)
+	oldSpans := tokenizeSide(lx, st, oldBody)
+	newSpans := tokenizeSide(lx, st, newBody)
+	for i := range rows {
+		if rows[i].kind == dkHunk {
+			continue
+		}
+		line := rows[i].oldLine
+		spans := oldSpans
+		if rows[i].kind == dkAdd || (line < 0 && rows[i].newLine >= 0) {
+			line, spans = rows[i].newLine, newSpans
+		}
+		// additions read the NEW-side stream, deletions the OLD-side stream;
+		// context prefers new (falls back to old for pure-deletion files)
+		if rows[i].kind == dkContext && rows[i].newLine >= 0 {
+			line, spans = rows[i].newLine, newSpans
+		}
+		if line >= 0 && line < len(spans) {
+			rows[i].spans = spans[line]
+		}
+	}
+	if c.diffCache == nil {
+		c.diffCache = map[string]diffCacheEntry{}
+	}
+	c.diffCache[m.ID] = diffCacheEntry{theme: chrome.CurrentTheme().Name, rows: rows, op: op}
+	return rows, op
+}
+
+// parseDiffBody decodes a unified diff body into display rows and returns
+// the old-side (context+deletions) and new-side (context+additions) source
+// texts for chroma; each row records its line index in both streams.
+func parseDiffBody(body string) (rows []diffRow, op diffOp, oldBody, newBody string) {
+	op = diffOpEdit
+	var oldLines, newLines []string
+	body = strings.ReplaceAll(body, "\t", "    ") // vp soft-wrap expands tabs
+	lines := strings.Split(strings.TrimRight(body, "\n"), "\n")
+	oldN, newN := 1, 1
+	seenHunk := false
+	for _, ln := range lines {
+		switch {
+		case !seenHunk && strings.HasPrefix(ln, "--- "):
+			if strings.TrimSpace(strings.TrimPrefix(ln, "--- ")) == "/dev/null" {
+				op = diffOpNew
+			}
+		case !seenHunk && strings.HasPrefix(ln, "+++ "):
+			if strings.TrimSpace(strings.TrimPrefix(ln, "+++ ")) == "/dev/null" {
+				op = diffOpDel
+			}
+		case strings.HasPrefix(ln, "@@"):
+			seenHunk = true
+			oldN, newN = parseHunkHeader(ln)
+			rows = append(rows, diffRow{kind: dkHunk, oldLine: -1, newLine: -1,
+				spans: []diffSpan{{text: ln}}})
+		case strings.HasPrefix(ln, "\\"):
+			// "\ No newline at end of file" — a note, not source text
+			rows = append(rows, diffRow{kind: dkHunk, oldLine: -1, newLine: -1,
+				spans: []diffSpan{{text: ln}}})
+		case strings.HasPrefix(ln, "-"):
+			rows = append(rows, diffRow{kind: dkDel, num: oldN,
+				oldLine: len(oldLines), newLine: -1})
+			oldLines = append(oldLines, ln[1:])
+			oldN++
+		case strings.HasPrefix(ln, "+"):
+			rows = append(rows, diffRow{kind: dkAdd, num: newN,
+				oldLine: -1, newLine: len(newLines)})
+			newLines = append(newLines, ln[1:])
+			newN++
+		default: // context: " text" or a bare empty line
+			text := ln
+			if strings.HasPrefix(ln, " ") {
+				text = ln[1:]
+			}
+			// context rows carry the OLD gutter number and exist in BOTH
+			// side streams.
+			rows = append(rows, diffRow{kind: dkContext, num: oldN,
+				oldLine: len(oldLines), newLine: len(newLines)})
+			oldLines = append(oldLines, text)
+			newLines = append(newLines, text)
+			oldN++
+			newN++
+		}
+	}
+	return rows, op, strings.Join(oldLines, "\n"), strings.Join(newLines, "\n")
+}
+
+// parseHunkHeader extracts the -o[,l] +n[,m] counters from an @@ header.
+func parseHunkHeader(ln string) (oldN, newN int) {
+	oldN, newN = 1, 1
+	for _, f := range strings.Fields(strings.TrimPrefix(ln, "@@")) {
+		if strings.HasPrefix(f, "-") {
+			oldN = atoiHead(f[1:])
+		} else if strings.HasPrefix(f, "+") {
+			newN = atoiHead(f[1:])
+		}
+	}
+	return
+}
+
+// atoiHead parses the leading digits of s ("52,11" → 52). 0 on garbage.
+func atoiHead(s string) int {
+	n := 0
+	for i := 0; i < len(s) && s[i] >= '0' && s[i] <= '9'; i++ {
+		n = n*10 + int(s[i]-'0')
+	}
+	return n
+}
+
+// tokenizeSide splits `text` into per-line chroma spans using the theme's
+// chroma style. fg of every span maps to a lipgloss hex colour or "" (the
+// row ink wins); backgrounds from chroma are DROPPED so the row tint stays
+// uniform. On any failure (nil lexer, tokenise error) each line is one
+// plain span.
+func tokenizeSide(lx chroma.Lexer, st *chroma.Style, text string) [][]diffSpan {
+	plain := func() [][]diffSpan {
+		ls := strings.Split(text, "\n")
+		out := make([][]diffSpan, len(ls))
+		for i := range ls {
+			out[i] = []diffSpan{{text: ls[i]}}
+		}
+		return out
+	}
+	if text == "" || lx == nil || st == nil {
+		return plain()
+	}
+	it, err := lx.Tokenise(nil, text)
+	if err != nil {
+		return plain()
+	}
+	lines := [][]diffSpan{{}}
+	for _, tok := range it.Tokens() {
+		entry := st.Get(tok.Type)
+		sp := diffSpan{fg: ""}
+		if entry.Colour.IsSet() {
+			sp.fg = entry.Colour.String()
+		}
+		sp.bold = entry.Bold == chroma.Yes
+		sp.italic = entry.Italic == chroma.Yes
+		sp.underline = entry.Underline == chroma.Yes
+		parts := strings.Split(tok.Value, "\n")
+		for i, p := range parts {
+			if i > 0 {
+				lines = append(lines, []diffSpan{})
+			}
+			if p == "" {
+				continue
+			}
+			s := sp
+			s.text = p
+			lines[len(lines)-1] = append(lines[len(lines)-1], s)
+		}
+	}
+	return lines
+}
+
+// renderDiffRow renders one parsed row opencode-style: dim right-aligned
+// gutter number, +/- marker INSIDE the row, text clipped to the panel
+// width and the whole row padded out with the tint background so it reads
+// as a full-width bar. When the theme's bg slot is nil (mono), the tint is
+// suppressed and the ink emphasises instead (bold adds / underline dels).
+func renderDiffRow(row diffRow, gutterW, width int) string {
+	if width < 1 {
+		width = 1
+	}
+	if row.kind == dkHunk {
+		textW := width - gutterW - 3
+		if textW < 1 {
+			textW = 1
+		}
+		return strings.Repeat(" ", gutterW+3) +
+			chrome.DimText.Italic(true).Render(clipPlain(row.spans[0].text, textW))
+	}
+	var fg color.Color = chrome.DiffCtxFg
+	var bg color.Color
+	switch row.kind {
+	case dkAdd:
+		fg, bg = chrome.DiffAddFg, chrome.DiffAddBg
+	case dkDel:
+		fg, bg = chrome.DiffDelFg, chrome.DiffDelBg
+	}
+	base := lipgloss.NewStyle().Foreground(fg)
+	if bg != nil {
+		base = base.Background(bg)
+	} else {
+		// tint suppressed (mono): bold additions / underlined deletions
+		switch row.kind {
+		case dkAdd:
+			base = base.Bold(true)
+		case dkDel:
+			base = base.Underline(true)
+		}
+	}
+	gstyle := lipgloss.NewStyle().Foreground(chrome.DiffGutterFg)
+	if bg != nil {
+		gstyle = gstyle.Background(bg)
+	}
+	gut := itoa(row.num)
+	for len(gut) < gutterW {
+		gut = " " + gut
+	}
+	marker := " "
+	switch row.kind {
+	case dkAdd:
+		marker = "+"
+	case dkDel:
+		marker = "-"
+	}
+	var sb strings.Builder
+	sb.WriteString(gstyle.Render(gut))
+	sb.WriteString(base.Render(" " + marker + " "))
+	textW := width - gutterW - 3 // gutter + " " + marker + " "
+	if textW < 1 {
+		textW = 1
+	}
+	used := 0
+	for _, sp := range clipSpans(row.spans, textW) {
+		st := base
+		if sp.fg != "" {
+			st = st.Foreground(lipgloss.Color(sp.fg))
+		}
+		if sp.bold {
+			st = st.Bold(true)
+		}
+		if sp.italic {
+			st = st.Italic(true)
+		}
+		if sp.underline {
+			st = st.Underline(true)
+		}
+		sb.WriteString(st.Render(sp.text))
+		used += lipgloss.Width(sp.text)
+	}
+	if bg != nil && used < textW {
+		sb.WriteString(base.Render(strings.Repeat(" ", textW-used)))
+	}
+	return sb.String()
+}
+
+// clipSpans truncates a span run to w display cells, splitting spans at the
+// boundary. (spans are plain text — no ANSI.)
+func clipSpans(spans []diffSpan, w int) []diffSpan {
+	if w < 0 {
+		w = 0
+	}
+	var out []diffSpan
+	used := 0
+	for _, sp := range spans {
+		remain := w - used
+		if remain <= 0 {
+			break
+		}
+		sw := lipgloss.Width(sp.text)
+		if sw <= remain {
+			out = append(out, sp)
+			used += sw
+			continue
+		}
+		s := sp
+		s.text = clipPlain(sp.text, remain)
+		if s.text != "" {
+			out = append(out, s)
+		}
+		break
+	}
+	return out
+}
+
+// clipStyled clips plain text to w cells then renders it with style.
+func clipStyled(style lipgloss.Style, s string, w int) string {
+	return style.Render(clipPlain(s, w))
 }
 
 // renderNotice renders a local From="office" notice (slash-command output):

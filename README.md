@@ -23,6 +23,13 @@ grafeio --server http://127.0.0.1:4096   # attach to an existing server
 
 ![agents tab](docs/shots-go/agents.png)
 
+Working detail stays visible: opencode-style diffs (line numbers, full-row
+red/green tints, inline syntax), thinking blocks, tool calls, permission
+prompts (`[y/a/n/esc]`), question prompts, and a message queue that never
+locks you out while the boss types.
+
+![diffs](docs/shots-go/chat-diff.png)
+
 ## Keys
 
 | key | does |
