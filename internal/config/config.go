@@ -48,6 +48,7 @@ type UIConfig struct {
 	Power          PowerMode `json:"power"`          // auto|performance|saver
 	TickMs         int       `json:"tickMs"`         // 0 = power-mode default base (180/500)
 	AmbientChatter bool      `json:"ambientChatter"` // office banter bubbles
+	Sounds         string    `json:"sounds"`         // "on" | "bell" (terminal bell only) | "off"
 }
 
 type BackendConfig struct {
@@ -81,6 +82,7 @@ func Default() *Config {
 			Power:          PowerAuto,
 			TickMs:         0,
 			AmbientChatter: true,
+			Sounds:         "on",
 		},
 		Backend: BackendConfig{
 			AgentmemoryURL:   "http://localhost:3111",

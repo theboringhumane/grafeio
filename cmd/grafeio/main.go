@@ -20,8 +20,14 @@ import (
 	"github.com/theboringhumane/grafeio/internal/chrome"
 	"github.com/theboringhumane/grafeio/internal/config"
 	"github.com/theboringhumane/grafeio/internal/office"
+	"github.com/theboringhumane/grafeio/internal/sound"
 	"github.com/theboringhumane/grafeio/internal/state"
 )
+
+// sndBus adapts *sound.Bus (Play returns error) to the app's Play-void seam.
+type sndBus struct{ *sound.Bus }
+
+func (s sndBus) Play(name string) { _ = s.Bus.Play(name) }
 
 func main() {
 	demo := flag.Bool("demo", os.Getenv("GRAFEIO_DEMO") == "1", "run with simulated events")
@@ -69,7 +75,12 @@ func main() {
 		b = backend.NewLive(*server, mustGetwd(), cfg)
 	}
 
-	p := tea.NewProgram(app.New(b, cfg))
+	model := app.New(b, cfg)
+	if cfg.UI.Sounds != "" && cfg.UI.Sounds != "off" {
+		model.SetSoundBus(sndBus{sound.NewBus(cfg.UI.Sounds, "")})
+	}
+
+	p := tea.NewProgram(model)
 
 	// bridge backend goroutines -> tea loop
 	go func() {

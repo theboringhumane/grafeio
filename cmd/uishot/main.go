@@ -68,6 +68,16 @@
 //	                                override), the /power + /model slash demo
 //	                                (chat frame + persisted brain.json), and a
 //	                                custom boss-name agents frame.
+//	                    [--social]  (social-clock proof: scripted window pumping
+//	                                EvTicks synchronously (no wall clock — tick-
+//	                                seeded = deterministic). THREE frames:
+//	                                SOCIAL A = tea request asked (bubble «<B>:
+//	                                coffee?»), SOCIAL B = both sprites walking
+//	                                to the machine, SOCIAL C = gossip chain
+//	                                mid-fire; plus the banter chain trace, the
+//	                                question-modal gate assert (nothing fires
+//	                                while a modal is open), and a two-run
+//	                                determinism check over the frame triplet.)
 package main
 
 import (
@@ -1218,6 +1228,244 @@ func runPowerProof(mode string) error {
 	return nil
 }
 
+// --- social-clock proof -----------------------------------------------------
+// Deterministic: the model is pumped with SYNCHRONOUS EvTick updates (no
+// tea.Program, no wall clock) and the SocialClock seeds its PRNG from
+// tick+seq, so a repetition replays bit-for-bit — except package-global
+// office walker state across reps, neutralized by prefixing employee IDs
+// per rep (identical NAMES/seats/glyphs; the frame never shows the IDs).
+
+// socialDriver — minimal synchronous model pump (one EvTick per step, the
+// returned tea.Cmd is the tick re-arm timer; not needed here).
+type socialDriver struct {
+	m app.Model
+}
+
+func newSocialDriver(rep int) *socialDriver {
+	backend := &stubBackend{done: make(chan struct{})} // Mode() only — no script
+	m := app.New(backend, config.Default())
+	d := &socialDriver{m: m}
+	d.send(tea.WindowSizeMsg{Width: shotCols, Height: shotRows})
+	pref := fmt.Sprintf("soc%d", rep)
+	d.send(state.Event{Kind: state.EvHire, Employee: state.Employee{
+		ID: pref + "-dev-1", Name: "tekton-1", Role: state.RoleDeveloper, Sprite: state.SpriteAtDesk}})
+	d.send(state.Event{Kind: state.EvHire, Employee: state.Employee{
+		ID: pref + "-sco-1", Name: "skopos-1", Role: state.RoleScout, Sprite: state.SpriteAtDesk}})
+	d.send(state.Event{Kind: state.EvHire, Employee: state.Employee{
+		ID: pref + "-rev-1", Name: "dikastes", Role: state.RoleReviewer, Sprite: state.SpriteAtDesk}})
+	d.m.Frame() // lock the floor plan before any sprite advance
+	return d
+}
+
+func (d *socialDriver) send(msg tea.Msg) {
+	tm, _ := d.m.Update(msg)
+	if fm, ok := tm.(app.Model); ok {
+		d.m = fm
+	}
+}
+
+func (d *socialDriver) pump(n int) {
+	for i := 0; i < n; i++ {
+		d.send(state.Event{Kind: state.EvTick})
+	}
+}
+
+func (d *socialDriver) pumpUntil(desc string, maxTicks int, cond func(state.OfficeState) bool) error {
+	for i := 0; i < maxTicks; i++ {
+		if cond(d.m.State()) {
+			return nil
+		}
+		d.pump(1)
+	}
+	return fmt.Errorf("social: %s did not happen within %d ticks (state: %s, trace missing)",
+		desc, maxTicks, d.m.State().StatusLine)
+}
+
+func hasBubbleContaining(st state.OfficeState, sub string) bool {
+	for _, b := range st.Bubbles {
+		if strings.Contains(b.Text, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func countWalkingToCoffee(st state.OfficeState) int {
+	n := 0
+	for _, e := range st.Employees {
+		if e.Sprite == state.SpriteToCoffee || e.Sprite == state.SpriteCoffee {
+			n++
+		}
+	}
+	return n
+}
+
+// socialFramesSim — the three-printed-frames run: hires, then the forced
+// tea request (frame A: the ask bubble; frame B: both sprites walking),
+// then the forced gossip chain (frame C: all three beats live). Also
+// captures the forced gossip/banter chain traces (speaker › line).
+func socialFramesSim(rep int) (frames [3]string, banter, gossip []string, err error) {
+	var trace []string
+	app.SocialTracef = func(format string, args ...any) {
+		trace = append(trace, fmt.Sprintf(format, args...))
+	}
+	defer func() { app.SocialTracef = nil; app.SocialForceRoll = nil }()
+	roll := 0
+	app.SocialForceRoll = &roll
+
+	d := newSocialDriver(rep)
+
+	// SOCIAL A — tea request (roll 50): the ask bubble by A.
+	roll = 50
+	if err := d.pumpUntil("tea ask bubble", 1500, func(st state.OfficeState) bool {
+		return hasBubbleContaining(st, "coffee?")
+	}); err != nil {
+		return frames, nil, nil, err
+	}
+	roll = -1 // force NOTHING while the sequence plays out (frames stay clean)
+	frames[0] = d.m.Frame()
+
+	// SOCIAL B — co-walking: A (t+2) then B (t+6) drift to the machine.
+	if err := d.pumpUntil("both walkers to the tea machine", 200, func(st state.OfficeState) bool {
+		return countWalkingToCoffee(st) >= 2
+	}); err != nil {
+		return frames, nil, nil, err
+	}
+	frames[1] = d.m.Frame()
+
+	// SOCIAL C — gossip chain (roll 70): the PLAN emits its 3 trace lines at
+	// once (plan time), so wait for the plan, then pump until the third
+	// beat's tick (t0, +5, +10) has landed (+1) before freezing the frame.
+	roll = 70
+	if err := d.pumpUntil("gossip chain plan", 2500, func(st state.OfficeState) bool {
+		n := 0
+		for _, ln := range trace {
+			if strings.HasPrefix(ln, "gossip: ") {
+				n++
+			}
+		}
+		return n >= 3
+	}); err != nil {
+		return frames, nil, nil, err
+	}
+	for _, ln := range trace {
+		if strings.HasPrefix(ln, "gossip: ") {
+			gossip = append(gossip, ln)
+		}
+	}
+	roll = -1
+	d.pump(12) // beats at +0/+5/+10 all armed and rendered
+	frames[2] = d.m.Frame()
+
+	// banter (roll 10): capture the chain for the PROOF section.
+	roll = 10
+	banterMark := len(trace)
+	if err := d.pumpUntil("banter pair dialog", 2500, func(st state.OfficeState) bool {
+		n := 0
+		for _, ln := range trace {
+			if strings.HasPrefix(ln, "banter: ") {
+				n++
+			}
+		}
+		return n >= 2
+	}); err != nil {
+		return frames, nil, nil, err
+	}
+	for _, ln := range trace[banterMark:] {
+		if strings.HasPrefix(ln, "banter: ") {
+			banter = append(banter, ln)
+		}
+	}
+	return frames, banter, gossip, nil
+}
+
+// socialModalGateSim — the scripted-modal assert: a boss question opens the
+// modal; across 400 pumped ticks NO social beat may fire (no trace, no
+// bubbles, no walkers). After the modal resolves, the clock must resume
+// (forced tea request lands).
+func socialModalGateSim() error {
+	var trace []string
+	app.SocialTracef = func(format string, args ...any) {
+		trace = append(trace, fmt.Sprintf(format, args...))
+	}
+	defer func() { app.SocialTracef = nil; app.SocialForceRoll = nil }()
+
+	d := newSocialDriver(99)
+	base := len(d.m.State().Employees)
+	d.send(state.Event{Kind: state.EvQuestion, EmployeeName: "boss", QuestionID: "q-soc",
+		Text: "ship tonight or tomorrow?", ToolSummary: "tonight | tomorrow"})
+	d.pump(400)
+	st := d.m.State()
+	if len(trace) != 0 {
+		return fmt.Errorf("social fired while the question modal was open: %q", trace)
+	}
+	if len(st.Bubbles) != 0 {
+		return fmt.Errorf("social bubble appeared while the question modal was open: %+v", st.Bubbles)
+	}
+	if n := countWalkingToCoffee(st); n != 0 {
+		return fmt.Errorf("sprite walked to coffee while the question modal was open (%d walkers)", n)
+	}
+	if len(st.Employees) != base {
+		return fmt.Errorf("roster changed unexpectedly (%d -> %d)", base, len(st.Employees))
+	}
+	// gate lifts when the modal closes
+	d.send(state.Event{Kind: state.EvQuestion, EmployeeName: "boss", QuestionID: "q-soc",
+		ToolSummary: "answered", ToolState: "resolved"})
+	roll := 50
+	app.SocialForceRoll = &roll
+	if err := d.pumpUntil("social resume after modal close", 1500, func(st state.OfficeState) bool {
+		return hasBubbleContaining(st, "coffee?")
+	}); err != nil {
+		return err
+	}
+	fmt.Println("  modal gate: PASS — 400 ticks, no social beat while the question modal was open; resumed after resolve")
+	return nil
+}
+
+func runSocialProof() error {
+	if err := socialModalGateSim(); err != nil {
+		return err
+	}
+	frames1, banter1, gossip1, err := socialFramesSim(1)
+	if err != nil {
+		return err
+	}
+	frames2, banter2, gossip2, err := socialFramesSim(2)
+	if err != nil {
+		return err
+	}
+	// determinism: tick-seeded — the two script runs must be byte-identical.
+	for i := 0; i < 3; i++ {
+		if frames1[i] != frames2[i] {
+			return fmt.Errorf("social: frame %d differs between tick-seeded runs", i+1)
+		}
+	}
+	if strings.Join(banter1, "\n") != strings.Join(banter2, "\n") ||
+		strings.Join(gossip1, "\n") != strings.Join(gossip2, "\n") {
+		return fmt.Errorf("social: banter/gossip chains differ between tick-seeded runs")
+	}
+	labels := [3]string{
+		"SOCIAL A — tea request: A asks at their desk («<B>: coffee?»)",
+		"SOCIAL B — co-walking: both sprites heading to the tea machine",
+		"SOCIAL C — gossip chain: three bubbles fired over time, absent third named",
+	}
+	for i := 0; i < 3; i++ {
+		fmt.Printf("===== UI SHOT · %s =====\n", labels[i])
+		fmt.Println(frames1[i])
+		fmt.Println("===== UI SHOT =====")
+	}
+	fmt.Println("--- gossip chain (3 beats, absent third named) ---")
+	for _, ln := range gossip1 {
+		fmt.Println("  " + ln)
+	}
+	fmt.Println("--- banter chain (one pair dialog, role-banked) ---")
+	for _, ln := range banter1 {
+		fmt.Println("  " + ln)
+	}
+	fmt.Println("asserts: OK — modal gate held, tea co-walk fired, gossip 3-beat chain fired, tick-seeded runs byte-identical")
+	return nil
+}
+
 func main() {
 	tab := flag.String("tab", defaultTab, "active tab: chat|agents|board|mail|activity")
 	theme := flag.String("theme", "", "force a ui theme: "+strings.Join(chrome.ThemeNames(), "|"))
@@ -1234,7 +1482,16 @@ func main() {
 	batch := flag.Bool("batch", false, "intelligent-backlog proof: three messages enqueue while the boss is busy; the flush is ONE composed [BATCH DISPATCH] send (frame + batch text + stub logs + trace)")
 	batchRespawn := flag.Bool("batch-respawn", false, "failure-respawn proof: the first batch Send is rejected once — the app must ResetPrimary(true) and resend the SAME batch exactly once")
 	power := flag.String("power", "", "power-governor proof: 6s scripted window per mode (auto|saver|performance|all) — tick counts, floor frame-cache hit %, TickDelay table, /power + /model slash demo, custom boss-name frame")
+	social := flag.Bool("social", false, "social-clock proof: synchronous tick pump — three frames (tea ask / both walking / gossip chain), banter chain trace, question-modal gate assert, tick-seeded determinism check")
 	flag.Parse()
+
+	if *social {
+		if err := runSocialProof(); err != nil {
+			fmt.Fprintf(os.Stderr, "uishot: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *power != "" {
 		if err := runPowerProof(*power); err != nil {

@@ -36,7 +36,6 @@ const (
 	degradeCols  = 100 // below this, the sidebar shrinks instead of the floor
 	minCols      = 40
 	minRows      = 12
-	ambientEvery = 140 // ticks between ambient bubbles
 
 	// Message queue — the INTELLIGENT BACKLOG: Enter while a boss reply is
 	// pending enqueues a numbered item; the turn-complete flush sends the
@@ -90,21 +89,11 @@ func qdebugf(format string, args ...any) {
 	}
 }
 
-// ambientLines — pure ASCII; the floor staff typed these, not a program.
-var ambientLines = []string{
-	"big day. lots of meetings.",
-	"shipping friday.",
-	"who took the red mug?",
-	"standup in 5.",
-	"this diff is a crime scene.",
-	"coffee machine is empty again.",
-	"review queue is deep today.",
-	"anyone seen the staging key?",
+// SoundBus — the sound engine seam (the sound dev owns the engine; the app
+// only CALLS Play). Nil by default — manager injects via SetSoundBus.
+type SoundBus interface {
+	Play(name string)
 }
-
-// ambientOn — brain.json ui.ambientChatter, set in New. False silences the
-// auto generator (explicit EvBubble events still render).
-var ambientOn = true
 
 // Model is the tea.Model for the whole app.
 type Model struct {
@@ -112,6 +101,16 @@ type Model struct {
 	st      state.OfficeState
 	cfg     *config.Config // brain.json (nil-tolerant: Default() substituted)
 	gov     *governor      // power/caching bookkeeping, shared across copies
+
+	// social — the office's SocialClock (ambient.go). Pointer, so the plan
+	// survives the value-copy update loop. lastDispatchTick feeds its
+	// "active dispatch in-flight <30 ticks" busy gate.
+	social           *SocialClock
+	lastDispatchTick int // -1 = no dispatch seen yet this run
+
+	// snd — the sound bus (nil by default; manager injects). Reducer hook
+	// points call playSound() which no-ops on nil.
+	snd SoundBus
 
 	// bossName/bossShort — the human boss label from cfg.Boss.Name: the full
 	// string for roster rows ("jorge (El Jefe)"), its first word for the
@@ -291,6 +290,8 @@ func New(b state.Backend, cfg *config.Config) Model {
 		chat:        chat,
 		activity:    activity,
 		activeThink: map[string]bool{},
+		social:           newSocialClock(),
+		lastDispatchTick: -1,
 		tabs: panels.NewTabs(
 			chat,
 			agents,
@@ -330,6 +331,25 @@ func New(b state.Backend, cfg *config.Config) Model {
 // Used by harnesses (uishot) before the run starts.
 func (m *Model) SelectTab(name string) bool {
 	return m.tabs.SetActiveByTitle(name)
+}
+
+// SetSoundBus injects the sound engine's bus (nil disables sound). The app
+// only calls Play — the engine is owned elsewhere.
+func (m *Model) SetSoundBus(bus SoundBus) {
+	m.snd = bus
+}
+
+// playSound — reducer-property sound hook; no-ops while no bus is injected.
+func (m *Model) playSound(name string) {
+	if m.snd != nil {
+		m.snd.Play(name)
+	}
+}
+
+// State returns the current office state (read-only harness seam — uishot
+// --social asserts on bubbles/sprites through it).
+func (m Model) State() state.OfficeState {
+	return m.st
 }
 
 // Init arms the first power-governed tick; applyEvent re-arms every cycle.
@@ -382,7 +402,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case chatSentMsg:
 		// nothing local: backend.Send owns the echo (chat-user + pending boss
 		// bubble) via the event stream — applying them here duplicated the bubbles.
+		m.playSound("send")
 	case sendErrMsg:
+		m.playSound("error")
 		cmds = append(cmds, m.applyEvent(state.Event{
 			Kind: state.EvStatus,
 			Text: fmt.Sprintf("[grafeio] send failed: %v", msg.err),
@@ -402,6 +424,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
+		m.playSound("error")
 		cmds = append(cmds, m.applyEvent(state.Event{
 			Kind: state.EvStatus,
 			Text: fmt.Sprintf("[grafeio] send failed: %v", msg.err),
@@ -428,6 +451,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.chat != nil {
 				m.chat.SetQueueLen(len(m.queue))
 			}
+			m.playSound("queued")
 			qdebugf("enqueued %q as item #%d (board=%q, n=%d)", msg.text, n, ent.boardID, len(m.queue))
 			m.notice(fmt.Sprintf("queued as item #%d — flushes as a batch when the boss frees up", n))
 		}
@@ -624,6 +648,31 @@ func (m *Model) applyEvent(ev state.Event) tea.Cmd {
 		m.batchInFlight && !m.batchRespawned &&
 		!m.batchSentAt.IsZero() && time.Since(m.batchSentAt) <= batchRespawnWindow
 
+	// social-clock busy gate: remember the tick of the latest dispatch —
+	// a dispatch younger than 30 ticks silences the clock (busy !== social).
+	if ev.Kind == state.EvDispatch {
+		m.lastDispatchTick = m.st.Tick
+	}
+
+	// sound hooks (no-op until a bus is injected): reply/dispatch/done/
+	// alert/error at their reducer points.
+	switch ev.Kind {
+	case state.EvChatBoss:
+		if !ev.Msg.Pending {
+			if strings.HasPrefix(ev.Msg.ID, "boss-error-") {
+				m.playSound("error") // session-level failure
+			} else {
+				m.playSound("reply")
+			}
+		}
+	case state.EvReturned:
+		m.playSound("done")
+	case state.EvDispatch:
+		m.playSound("dispatch")
+	case state.EvBlocked:
+		m.playSound("alert")
+	}
+
 	prevPending := hasPendingBoss(m.st)
 	m.st = reducer(m.st, ev)
 	if m.chat != nil {
@@ -641,6 +690,9 @@ func (m *Model) applyEvent(ev state.Event) tea.Cmd {
 	}
 
 	if ev.Kind == state.EvTick {
+		// social clock: plans + fires its beats off the tick (EvBubble/
+		// EvIdleDrift events through the normal reducer path — ambient.go).
+		m.runSocial()
 		// governor: the next delay is chosen from the CURRENT cycle's
 		// busy/idle posture (power.go).
 		return m.tickCmd()
@@ -839,6 +891,7 @@ func (m *Model) handlePermissionEvent(ev state.Event) {
 		return // child permission: activity line only, no modal
 	}
 	m.perm = &permPrompt{ID: ev.PermissionID, ToolName: ev.ToolName, Summary: ev.ToolSummary}
+	m.playSound("alert") // boss permission modal opening
 	m.chat.SetPermission(&panels.PermissionView{
 		ID:       ev.PermissionID,
 		ToolName: ev.ToolName,
@@ -1054,42 +1107,12 @@ func reducer(st state.OfficeState, ev state.Event) state.OfficeState {
 			}
 			st.Tick = tick
 			st.Bubbles = bubbles
-			next := office.AdvanceSprites(st)
-
-			// ambient chatter: every ~140 ticks a random working non-manager
-			// speaks — brain.json ui.ambientChatter=false silences the
-			// generator (explicit EvBubble events are unaffected).
-			if ambientOn && tick%ambientEvery == 0 {
-				var working []state.Employee
-				for _, e := range next.Employees {
-					if e.Role != state.RoleManager && e.Sprite == state.SpriteWorking {
-						working = append(working, e)
-					}
-				}
-				if len(working) > 0 {
-					next = reducer(next, state.Event{
-						Kind:       state.EvBubble,
-						EmployeeID: working[rand.Intn(len(working))].ID,
-						Text:       ambientLines[rand.Intn(len(ambientLines))],
-					})
-				} else if tick%(ambientEvery*2) == 0 {
-					// nobody working: occasionally an idle one breaks the silence
-					var idle []state.Employee
-					for _, e := range next.Employees {
-						if e.Role != state.RoleManager && e.Sprite == state.SpriteAtDesk {
-							idle = append(idle, e)
-						}
-					}
-					if len(idle) > 0 {
-						next = reducer(next, state.Event{
-							Kind:       state.EvBubble,
-							EmployeeID: idle[rand.Intn(len(idle))].ID,
-							Text:       "quiet floor today.",
-						})
-					}
-				}
-			}
-			return next
+			// The legacy "every 140 ticks" chatter generator is gone — the
+			// SocialClock (ambient.go) owns ALL self-originated floor chatter
+			// now, planning beats off each EvTick in the model (its (d)
+			// water-cooler covers the old solo case; the old line bank moved
+			// to socialSoloBank). Explicit EvBubble backend events unchanged.
+			return office.AdvanceSprites(st)
 		}
 
 	case state.EvHire:
