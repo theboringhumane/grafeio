@@ -49,7 +49,7 @@ type UIConfig struct {
 	TickMs         int       `json:"tickMs"`         // 0 = power-mode default base (180/500)
 	AmbientChatter bool      `json:"ambientChatter"` // office banter bubbles
 	Sounds         string    `json:"sounds"`         // "on" | "bell" (terminal bell only) | "off"
-	SidebarWidth   int       `json:"sidebarWidth"`   // right panel cols, 0 = default 68 (26..80)
+	SidebarWidth   int       `json:"sidebarWidth"`   // right panel cols, 0 = default 80 (26..100)
 	Compact        bool      `json:"compact"`        // compact layout mode
 }
 
