@@ -132,12 +132,33 @@ func (b *liveBackend) Mode() state.Mode { return state.ModeLive }
 func (b *liveBackend) Start(emit func(state.Event)) error {
 	b.fl.setEmit(emit)
 
+	// Manager charter (oikonomos) runs FIRST, before server resolution:
+	// any directory grafeio serves gets .opencode/oikonomos.md + the
+	// opencode.json instructions entry wired ahead of a spawned serve
+	// reading its project config. A degradation never blocks the boot —
+	// failures surface on the status line only.
+	charterNotes := emitCharterNotes(emit, b.directory)
+
 	u := b.optURL
 	if u == "" {
 		u = os.Getenv("OPENCODE_SERVER")
 	}
 	if u == "" {
 		spawnedURL, proc, err := spawnServe(b.directory)
+		if err == nil && charterNotes.changed {
+			// opencode spoils its config at start: a serve whose boot
+			// raced/missed the freshly-written instructions entry keeps
+			// running charter-blind. When THIS pass just wired the charter
+			// (first-run wiring, refreshed chart bytes, a newly-merged
+			// entry), restart the spawn once so the serve reads the config
+			// with the merge already on disk. Behind an explicit URL (cfg/OPENCODE_SERVER)
+			// the server is not ours to restart — the note stands and the
+			// charter applies from the server's next boot.
+			b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] manager charter: restarting serve so it picks up the config"})
+			_ = proc.Process.Kill()
+			_ = proc.Wait()
+			spawnedURL, proc, err = spawnServe(b.directory)
+		}
 		if err != nil {
 			return err
 		}

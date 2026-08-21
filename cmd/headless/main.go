@@ -72,6 +72,17 @@
 //	                            prove the overwrite keeps the latest primary
 //	                            in session.json. Prints "PERSIST: NEW".
 //
+//	grafeio-headless --charter-probe
+//	                            oikonomos-charter wiring probe: scratch dir,
+//	                            EnsureCharter twice (identical bytes, second
+//	                            run changed=false), spawn a REAL opencode
+//	                            serve rooted in the scratch with a curated
+//	                            env (GRAFEIO_*/OPENCODE_SERVER stripped),
+//	                            create a session, ask the boss who it is +
+//	                            the dispatch minimum, assert the reply names
+//	                            (manager|oikonomos) AND (three|3). Prints
+//	                            CHARTER-PROBE: ACTIVE (exit 0) else exit 1.
+//
 // The plain demo run also auto-answers its scripted boss question
 // (que-demo-1, 800ms after it surfaces) so the registration + resolved
 // lines always show.
@@ -81,16 +92,25 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/theboringhumane/grafeio/internal/app"
 	"github.com/theboringhumane/grafeio/internal/backend"
+	"github.com/theboringhumane/grafeio/internal/charter"
 	"github.com/theboringhumane/grafeio/internal/config"
 	"github.com/theboringhumane/grafeio/internal/state"
 )
@@ -108,7 +128,15 @@ func main() {
 	persistDemo := flag.Bool("persist-demo", false, "office-session persist proof run 1 (live): send 'say pineapple', wait for the completed bubble, persist the office session, print session.json (PERSIST: SAVED)")
 	persistRestore := flag.Bool("persist-restore", false, "office-session persist proof run 2 (live): restore boot — restore notice + SAME primary id reused (PERSIST: RESTORED)")
 	persistNew := flag.Bool("persist-new", false, "office-session persist proof run 3 (live): /new — fresh primary id != saved id + /new notice + latest-wins overwrite proof (PERSIST: NEW)")
+	charterProbe := flag.Bool("charter-probe", false, "manager-charter wiring probe: scratch dir, EnsureCharter twice (bytes identical), spawn a REAL serve rooted in the scratch, ask the boss who it is + the dispatch minimum, assert (manager|oikonomos)+(three|3) — CHARTER-PROBE: ACTIVE (exit 0) else exit 1")
 	flag.Parse()
+
+	// --charter-probe is a standalone probe with its own harness (own
+	// scratch dir, own serve, own asserts) — it never loads brain.json.
+	if *charterProbe {
+		runCharterProbe()
+		return
+	}
 
 	if *efficiency {
 		runEfficiencySim()
@@ -908,6 +936,287 @@ func persistRunNew(cfg *config.Config, dir string) {
 	}
 	fmt.Printf("PERSIST: NEW-FAIL (%d check(s) failed)\n", failures)
 	os.Exit(1)
+}
+
+// probeHTTPClient is the probe's plain control client (no SSE needed).
+var probeHTTPClient = &http.Client{Timeout: 30 * time.Second}
+
+// probeEnv is os.Environ() minus everything the probe must not inherit:
+// GRAFEIO_* (the strip rule) and OPENCODE_SERVER (must not redirect the
+// spawned-child resolution; serve reads it, ditto GRAFEIO_SERVER).
+func probeEnv() []string {
+	var out []string
+	for _, kv := range os.Environ() {
+		k := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			k = kv[:i]
+		}
+		if strings.HasPrefix(k, "GRAFEIO_") || k == "OPENCODE_SERVER" {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+// spawnServeForProbe mirrors internal/backend's spawnServe ("opencode
+// serve --port 0 --hostname 127.0.0.1", URL scanned from stdout, 10s
+// budget) but rooted in dir and run under probeEnv(). Kept local to the
+// probe: the backend's spawnServe is unexported, and the probe needs the
+// clean-env spawn the app itself does NOT do.
+func spawnServeForProbe(dir string) (string, *exec.Cmd, error) {
+	cmd := exec.Command("opencode", "serve", "--port", "0", "--hostname", "127.0.0.1")
+	cmd.Dir = dir
+	cmd.Env = probeEnv()
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", nil, fmt.Errorf("probe serve spawn failed: %w", err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return "", nil, fmt.Errorf("probe serve spawn failed: %w", err)
+	}
+	urlRe := regexp.MustCompile(`https?://\S+`)
+	type result struct{ url string }
+	urlCh := make(chan result, 1)
+	go func() {
+		sc := bufio.NewScanner(stdout)
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for sc.Scan() {
+			line := sc.Text()
+			fmt.Printf("[serve] %s\n", line)
+			if m := urlRe.FindString(line); m != "" {
+				m = regexp.MustCompile(`[.,;)\]]+$`).ReplaceAllString(m, "")
+				select {
+				case urlCh <- result{url: m}:
+				default:
+				}
+			}
+		}
+	}()
+	exitCh := make(chan error, 1)
+	go func() { exitCh <- cmd.Wait() }()
+	select {
+	case r := <-urlCh:
+		return r.url, cmd, nil
+	case err := <-exitCh:
+		return "", nil, fmt.Errorf("probe serve exited before printing a URL: %v", err)
+	case <-time.After(15 * time.Second):
+		_ = cmd.Process.Kill()
+		<-exitCh
+		return "", nil, fmt.Errorf("probe serve: no listening URL within 15s")
+	}
+}
+
+// probeDoJSON is the probe's minimal x-opencode-directory control call.
+func probeDoJSON(baseURL, dir, method, path string, body []byte, out any) error {
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytes.NewReader(body)
+	}
+	req, err := http.NewRequest(method, baseURL+path, rdr)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("x-opencode-directory", url.QueryEscape(dir))
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	res, err := probeHTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	data, err := io.ReadAll(res.Body)
+	if err != nil {
+		return err
+	}
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return fmt.Errorf("status %d: %s", res.StatusCode, string(data)[:min(200, len(data))])
+	}
+	if out != nil && len(data) > 0 {
+		return json.Unmarshal(data, out)
+	}
+	return nil
+}
+
+// probeCreateSession makes one root session titled title.
+func probeCreateSession(baseURL, dir, title string) (struct{ ID string }, error) {
+	var created struct{ ID string }
+	body, _ := json.Marshal(map[string]any{"title": title})
+	err := probeDoJSON(baseURL, dir, http.MethodPost, "/session", body, &created)
+	return created, err
+}
+
+// probePrompt posts one prompt and polls until an assistant message with a
+// text part appears (bounded by timeout), returning that text.
+func probePrompt(baseURL, dir, sessionID, text string, timeout time.Duration) (string, error) {
+	body, _ := json.Marshal(map[string]any{
+		"parts": []map[string]any{{"type": "text", "text": text}},
+	})
+	if err := probeDoJSON(baseURL, dir, http.MethodPost, "/session/"+sessionID+"/prompt_async", body, nil); err != nil {
+		return "", err
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var rows []struct {
+			Info struct {
+				Role string `json:"role"`
+			} `json:"info"`
+			Parts []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"parts"`
+		}
+		if err := probeDoJSON(baseURL, dir, http.MethodGet, "/session/"+sessionID+"/message", nil, &rows); err != nil {
+			return "", err
+		}
+		for i := len(rows) - 1; i >= 0; i-- {
+			if rows[i].Info.Role != "assistant" {
+				continue
+			}
+			for _, p := range rows[i].Parts {
+				if p.Type == "text" && strings.TrimSpace(p.Text) != "" {
+					return strings.TrimSpace(p.Text), nil
+				}
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return "", fmt.Errorf("no assistant text within %s", timeout)
+}
+
+// --- manager charter probe --------------------------------------------------
+
+// runCharterProbe proves the oikonomos charter is wired end-to-end:
+//
+//  1. scratch temp dir; print the EnsureCharter notes per run;
+//  2. dump the created/merged files' bytes (.opencode/oikonomos.md first
+//     40 lines + the whole opencode.json);
+//  3. run EnsureCharter a SECOND time: changed must be false and the bytes
+//     must be identical (idempotence);
+//  4. spawn a REAL opencode serve rooted in the scratch dir (fresh clean
+//     env for the child: OPENCODE_SERVER + GRAFEIO_* stripped — the probe
+//     proves the WIRING, not the user's machine), create a session, and
+//     prompt: "in 2 sentences: who are you supposed to be and how many
+//     sub-agents minimum for real work";
+//  5. assert the reply mentions (manager|oikonomos) AND (three|3)
+//     (case-insensitive). Prints CHARTER-PROBE: ACTIVE (exit 0) else the
+//     failed checks + exit 1.
+func runCharterProbe() {
+	os.Exit(charterProbeMain())
+}
+
+// charterProbeMain is the probe body with a real return value: every exit
+// path runs through it so the spawned serve is ALWAYS killed+reaped before
+// the process dies (a bare os.Exit(1) under a running serve orphans the
+// child, which keeps the parent's shell pipe open AND burns a port).
+func charterProbeMain() int {
+	failures := 0
+	check := func(ok bool, label string) {
+		if ok {
+			fmt.Printf("[assert] PASS %s\n", label)
+		} else {
+			failures++
+			fmt.Printf("[assert] FAIL %s\n", label)
+		}
+	}
+
+	// 1-3: the EnsureCharter pass + idempotence, in a scratch dir.
+	scratch, err := os.MkdirTemp("", "grafeio-charter-probe")
+	if err != nil {
+		fmt.Printf("[fatal] scratch dir: %v\n", err)
+		return 1
+	}
+	defer os.RemoveAll(scratch)
+	fmt.Printf("[charter-probe] scratch %s\n", scratch)
+
+	changed1, notes1 := backend.EnsureCharter(scratch)
+	fmt.Printf("[charter-probe] EnsureCharter #1 changed=%v notes=%v\n", changed1, notes1)
+	check(changed1, "first EnsureCharter reports changed=true")
+	check(len(notes1) > 0 && strings.Contains(notes1[len(notes1)-1], "manager charter: wired"),
+		"first run's notes announce the wiring")
+
+	chartPath := filepath.Join(scratch, ".opencode", "oikonomos.md")
+	cfgPath := filepath.Join(scratch, ".opencode", "opencode.json")
+	chart1, err1 := os.ReadFile(chartPath)
+	cfg1, err2 := os.ReadFile(cfgPath)
+	check(err1 == nil, "oikonomos.md exists after run 1")
+	check(err2 == nil, "opencode.json exists after run 1")
+	check(string(chart1) == charter.Text, "oikonomos.md is byte-exact the embedded charter")
+
+	// File dumps: the merged config in full, the charter's head.
+	fmt.Printf("--- %s ---\n%s\n", cfgPath, string(cfg1))
+	lines := strings.Split(string(chart1), "\n")
+	head := lines
+	if len(head) > 40 {
+		head = append(head[:40], "... (truncated, "+fmt.Sprint(len(lines)-40)+" more lines)")
+	}
+	fmt.Printf("--- %s (head %d/%d lines) ---\n%s\n", chartPath, len(head), len(lines), strings.Join(head, "\n"))
+
+	changed2, notes2 := backend.EnsureCharter(scratch)
+	fmt.Printf("[charter-probe] EnsureCharter #2 changed=%v notes=%v\n", changed2, notes2)
+	chart2, _ := os.ReadFile(chartPath)
+	cfg2, _ := os.ReadFile(cfgPath)
+	check(!changed2, "second EnsureCharter reports changed=false (idempotent)")
+	check(string(chart2) == string(chart1), "oikonomos.md bytes identical after run 2")
+	check(string(cfg2) == string(cfg1), "opencode.json bytes identical after run 2")
+	check(charter.ContainsPhrases([]string{"MANAGER", "oikonomos", "MINIMUM 3"}),
+		"charter subset probe: manager + oikonomos + MINIMUM 3 all present")
+
+	// 4: the ground-truth serve pass. A fresh child env strips
+	// OPENCODE_SERVER and every GRAFEIO_* so the probe measures ONLY what
+	// the wiring itself does (the user's OPENCODE_SERVER could point at a
+	// serve that loaded other instructions).
+	if failures > 0 {
+		fmt.Printf("CHARTER-PROBE: FAIL (%d wiring check(s) failed) — skipping the serve pass\n", failures)
+		return 1
+	}
+	fmt.Printf("[charter-probe] spawning real serve rooted in %s\n", scratch)
+	baseURL, proc, err := spawnServeForProbe(scratch)
+	if err != nil {
+		fmt.Printf("CHARTER-PROBE: FAIL — serve spawn: %v\n", err)
+		return 1
+	}
+	// kill+reap runs via defer inside charterProbeMain — a real return, so
+	// every exit path (fail or pass) reaps the serve, never os.Exit(1) with
+	// a live child.
+	defer func() {
+		if proc.Process != nil {
+			_ = proc.Process.Kill()
+			_ = proc.Wait()
+		}
+	}()
+	fmt.Printf("[charter-probe] serve at %s\n", baseURL)
+
+	sess, err := probeCreateSession(baseURL, scratch, "charter probe")
+	if err != nil {
+		fmt.Printf("CHARTER-PROBE: FAIL — session create: %v\n", err)
+		return 1
+	}
+	fmt.Printf("[charter-probe] session %s\n", sess.ID)
+
+	prompt := "in 2 sentences: who are you supposed to be and how many sub-agents minimum for real work"
+	fmt.Printf("[charter-probe] prompt %q\n", prompt)
+	reply, err := probePrompt(baseURL, scratch, sess.ID, prompt, 90*time.Second)
+	if err != nil {
+		fmt.Printf("CHARTER-PROBE: FAIL — prompt: %v\n", err)
+		return 1
+	}
+	fmt.Printf("[charter-probe] boss reply: %q\n", reply)
+
+	lower := strings.ToLower(reply)
+	check(strings.Contains(lower, "manager") || strings.Contains(lower, "oikonomos"),
+		"reply mentions manager|oikonomos")
+	check(strings.Contains(lower, "three") || strings.Contains(lower, "3"),
+		"reply mentions the 3-dispatch minimum (three|3)")
+
+	if failures == 0 {
+		fmt.Println("CHARTER-PROBE: ACTIVE")
+		return 0
+	}
+	fmt.Printf("CHARTER-PROBE: FAIL (%d check(s) failed)\n", failures)
+	return 1
 }
 
 func fail(stage string, err error) {

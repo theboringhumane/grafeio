@@ -93,9 +93,11 @@ func TestNoCaretTypingRowAboveInput(t *testing.T) {
 	}})
 	assertState("empty pending", true)
 
-	// streamed text lands — the bubble grows in the viewport but the
+	// streamed text lands (with an attachment chip staged, to show where
+	// the chips row sits) — the bubble grows in the viewport but the
 	// typing row STAYS (liveness for the whole pending period), and the
 	// row budget does not move
+	c.addAttachment(chatAttachment{name: "sse.png", mime: "image/png", path: "/tmp/x/sse.png"})
 	c.SetState(state.OfficeState{Tick: 3, Chat: []state.ChatMsg{
 		{ID: "u1", From: "user", Kind: "user", Text: "hi"},
 		{ID: "b1", From: "boss", Kind: "boss", Pending: true, Text: "working on it —"},
@@ -110,6 +112,7 @@ func TestNoCaretTypingRowAboveInput(t *testing.T) {
 	fmt.Println("---- END PANEL ----")
 
 	// settle: typing row gone, budget returns
+	c.atts = nil
 	c.SetState(state.OfficeState{Tick: 4, Chat: []state.ChatMsg{
 		{ID: "u1", From: "user", Kind: "user", Text: "hi"},
 		{ID: "b1", From: "boss", Text: "working on it — done"},
