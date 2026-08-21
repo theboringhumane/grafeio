@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/theboringhumane/grafeio/internal/config"
 	"github.com/theboringhumane/grafeio/internal/state"
 )
 
@@ -27,6 +28,12 @@ const (
 
 type demoBackend struct {
 	fl *flow
+
+	// cfg is the brain.json the factory received (never nil — NewDemo
+	// substitutes config.Default()). The scripted day is fixed, so the demo
+	// currently reads nothing from it; it is kept so future demo knobs
+	// (names, cadence) surface identically with the live backend.
+	cfg *config.Config
 
 	mu              sync.Mutex // guards the demo board state below
 	roster          []state.Employee
@@ -41,8 +48,9 @@ type demoBackend struct {
 	chatSeq         int
 }
 
-func newDemoBackend() *demoBackend {
+func newDemoBackend(cfg *config.Config) *demoBackend {
 	return &demoBackend{
+		cfg:             cfg,
 		fl:              newFlow(),
 		taskByID:        make(map[string]state.BoardTask),
 		blockedIDs:      make(map[string]bool),

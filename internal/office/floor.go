@@ -623,3 +623,76 @@ func Styled(rows []Row) string {
 func RenderPlain(st state.OfficeState, width, height int) string {
 	return Styleless(BuildRows(st, width, height))
 }
+
+// ---------------------------------------------------------------------------
+// FLOOR_FRAME_CACHE — power-governor seam (the one sanctioned extension):
+// Styled(BuildRows(...)) memoized so repeated identical states skip the
+// grid rebuild entirely. The memo key is (size, planGen, tick, renderRev):
+// the plan generation pins geometry + walker validity, the tick pins every
+// animated surface (sprite beats, blink-z's, wall clock, bubble expiry),
+// and renderRev pins the tick-independent inputs (employee sprites/seats/
+// tasks, bubble spawns, the pending-boss nameplate, the theme paint epoch).
+// Walkers only move inside AdvanceSprites (per EvTick), so the same key is
+// always the same grid — a hit is provably identical, never stale.
+// ---------------------------------------------------------------------------
+
+var (
+	floorCacheKey    string
+	floorCacheFrame  string
+	floorCacheHits   uint64
+	floorCacheMisses uint64
+)
+
+// floorRenderRev — the tick-independent render inputs of BuildRows.
+func floorRenderRev(st state.OfficeState) string {
+	var b strings.Builder
+	for _, e := range st.Employees {
+		b.WriteString(e.ID)
+		b.WriteByte('=')
+		b.WriteString(string(e.Sprite))
+		b.WriteByte('@')
+		b.WriteString(e.Seat)
+		b.WriteByte(':')
+		b.WriteString(e.Task)
+		b.WriteByte(';')
+	}
+	for _, bl := range st.Bubbles {
+		b.WriteString(bl.ID)
+		b.WriteByte(';')
+	}
+	for _, c := range st.Chat { // boss typing → nameplate "[typing]"
+		if c.From == "boss" && c.Pending {
+			b.WriteString("P")
+			break
+		}
+	}
+	b.WriteString(ansiColors["gray"]) // theme epoch: re-paint on /theme
+	b.WriteString(ansiColors["yellow"])
+	return b.String()
+}
+
+// CachedStyled — Styled(BuildRows(st, width, height)) behind the memo.
+func CachedStyled(st state.OfficeState, width, height int) string {
+	plan := ComputePlan(width, height)
+	key := strconv.Itoa(width) + "x" + strconv.Itoa(height) +
+		"|g" + strconv.Itoa(plan.Gen) +
+		"|t" + strconv.Itoa(st.Tick) +
+		"|" + floorRenderRev(st)
+	if key == floorCacheKey {
+		floorCacheHits++
+		return floorCacheFrame
+	}
+	floorCacheMisses++
+	floorCacheKey = key
+	floorCacheFrame = Styled(BuildRows(st, width, height))
+	return floorCacheFrame
+}
+
+// CacheStats — the memo's counters (hits skip the whole grid rebuild).
+func CacheStats() (hits, misses uint64) { return floorCacheHits, floorCacheMisses }
+
+// CacheReset — zero the counters and drop the memo (harness proof runs).
+func CacheReset() {
+	floorCacheKey, floorCacheFrame = "", ""
+	floorCacheHits, floorCacheMisses = 0, 0
+}

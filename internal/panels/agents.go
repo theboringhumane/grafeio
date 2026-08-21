@@ -1,5 +1,6 @@
 // agents.go — AGENTS roster tab (port of node-legacy panels/agents.tsx):
-// boss pinned first as "boss (oikonomos)" yellow bold; one row per employee:
+// boss pinned first (brain.json boss.name, default "boss (oikonomos)")
+// yellow bold; one row per employee:
 //
 //	<name (role color)>  <glyph> <sprite word (semantic color)>   <task, dim, right>
 //
@@ -53,17 +54,39 @@ func wordStyle(word string, s string) string {
 
 // Agents is the roster tab panel.
 type Agents struct {
-	vp   viewport.Model
-	st   state.OfficeState
-	w, h int
-	rev  string
+	vp       viewport.Model
+	st       state.OfficeState
+	w, h     int
+	rev      string
+	bossName string // cfg.Boss.Name — the human label pinned first (default below)
 }
+
+// defaultBossName is the pinned boss label when no config name is set.
+const defaultBossName = "boss (oikonomos)"
 
 // NewAgents builds the roster panel.
 func NewAgents() *Agents {
 	vp := viewport.New(viewport.WithWidth(10), viewport.WithHeight(5))
 	vp.MouseWheelEnabled = true
 	return &Agents{vp: vp}
+}
+
+// SetBossName personalizes the pinned boss row's label (brain.json
+// boss.name). Empty restores the default. Re-renders immediately.
+func (a *Agents) SetBossName(name string) {
+	if a.bossName == name {
+		return
+	}
+	a.bossName = name
+	a.SetState(a.st)
+}
+
+// bossLabel — the pinned first row's human name (config or default).
+func (a *Agents) bossLabel() string {
+	if a.bossName == "" {
+		return defaultBossName
+	}
+	return a.bossName
 }
 
 // Title implements Tab.
@@ -127,7 +150,7 @@ func (a *Agents) render() string {
 		isBoss := e.Role == state.RoleManager
 		label := e.Name
 		if isBoss {
-			label = "boss (oikonomos)"
+			label = a.bossLabel()
 		}
 		word := spriteWord(e.Sprite)
 		c := chrome.RoleColor(label)

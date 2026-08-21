@@ -40,7 +40,51 @@ board rows, flush goes out as one `[BATCH DISPATCH]` the boss decomposes into
 parallel sub-agents (`/route` forces it early), and a dead boss respawns a fresh
 session and resends the batch.
 
+## Configure the brain
+
+One file runs the office: **`~/.grafeio/configs/brain.json`** (created with
+defaults on first run; inspect anytime with `grafeio --print-default-config`).
+
+```jsonc
+{
+  "boss":    { "name": "boss (oikonomos)", "model": "anthropic/claude-sonnet-4-5" },
+  "roles":   { "developer": { "namePrefix": "tekton" }, "scout": { "namePrefix": "skopos" },
+               "reviewer": { "namePrefix": "dikastes" }, "runner": { "namePrefix": "hemerodromos" } },
+  "ui":      { "theme": "noir", "power": "auto", "tickMs": 0, "ambientChatter": true },
+  "backend": { "agentmemoryUrl": "http://localhost:3111", "server": "", "agentmemoryPollS": 5 }
+}
+```
+
+Boss model rides every prompt as `{"model":{"providerID","modelID"}}` (serve
+1.18.19 `/doc`-verified). Role models are noted as best-effort (sub-agent model
+dispatch is opencode's call). `/power`, `/model`, `/theme` all write back.
+
+### Battery (`ui.power`)
+
+| mode | busy | idle | drift (1 min quiet) |
+|---|---|---|---|
+| `auto` (default) | 180ms ticks | 1s | 3s |
+| `performance` | 150ms flat | — | — |
+| `saver` | 400ms | 2s | — |
+
+Idle-detection covers streaming, pending replies, walkers, open modals, ambient
+bubbles. Renders are memoized (frame digest on the app, `(size, planGen, tick,
+renderRev)` on the floor), the agentmemory board poll backs off 2× after five
+quiet syncs (cap 4×, reset on change). The office goes cheap when nothing moves.
+
 ## Keys
+
+| key | does |
+|---|---|
+| `tab` / `shift+tab` / `1..5` | switch panel: chat · agents · board · mail · activity |
+| `↑` `↓` `pgup` `pgdn` / wheel | scroll the active panel |
+| `enter` | send to the boss (chat) |
+| `shift+enter` | newline |
+| `ctrl+t` | expand/collapse completed thinking blocks |
+| `ctrl+d` | expand/collapse diff blocks |
+| `y` `a` `n` `esc` | answer a permission prompt |
+| `q` / `ctrl+c` | quit |
+
 
 | key | does |
 |---|---|

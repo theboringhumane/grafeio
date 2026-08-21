@@ -1,10 +1,12 @@
 // Package app — the root Bubble Tea model for Grafeio v2: state reducer
 // (exact port of node-legacy/src/app.tsx officeReducer + initialState),
-// layout, key routing, and the backend event seam.
+// layout, key routing, the power governor, and the backend event seam.
 //
 // Layout: topbar (1) | middle (floor left flex | right sidebar 44) | statusbar (1).
 // Events arrive as state.Event tea.Msgs (backend goroutine → tea.Program.Send);
-// the 180ms animation tick is a tea.Tick loop emitting state.Event{Kind: EvTick}.
+// the animation tick is a re-arming tea.Tick loop governed by the brain.json
+// power posture (power.go): busy = smooth (180ms/150ms/400ms), idle = cheap
+// (1s/2s), auto drifts to 3s after 60s of quiet.
 package app
 
 import (
@@ -18,6 +20,7 @@ import (
 	"charm.land/lipgloss/v2"
 
 	"github.com/theboringhumane/grafeio/internal/chrome"
+	"github.com/theboringhumane/grafeio/internal/config"
 	"github.com/theboringhumane/grafeio/internal/office"
 	"github.com/theboringhumane/grafeio/internal/panels"
 	"github.com/theboringhumane/grafeio/internal/state"
@@ -33,7 +36,6 @@ const (
 	degradeCols  = 100 // below this, the sidebar shrinks instead of the floor
 	minCols      = 40
 	minRows      = 12
-	tickInterval = 180 * time.Millisecond
 	ambientEvery = 140 // ticks between ambient bubbles
 
 	// Message queue — the INTELLIGENT BACKLOG: Enter while a boss reply is
@@ -100,10 +102,22 @@ var ambientLines = []string{
 	"anyone seen the staging key?",
 }
 
+// ambientOn — brain.json ui.ambientChatter, set in New. False silences the
+// auto generator (explicit EvBubble events still render).
+var ambientOn = true
+
 // Model is the tea.Model for the whole app.
 type Model struct {
 	backend state.Backend
 	st      state.OfficeState
+	cfg     *config.Config // brain.json (nil-tolerant: Default() substituted)
+	gov     *governor      // power/caching bookkeeping, shared across copies
+
+	// bossName/bossShort — the human boss label from cfg.Boss.Name: the full
+	// string for roster rows ("jorge (El Jefe)"), its first word for the
+	// busy placeholder/spinner ("jorge is typing…").
+	bossName  string
+	bossShort string
 
 	width, height int
 	middleH       int
@@ -113,6 +127,12 @@ type Model struct {
 	chat          *panels.Chat
 	activity      *panels.Activity
 	keys          KeyMap
+
+	// frameNonce — bumped on every message that can mutate panel ephemera
+	// the state digest can't see (textarea draft, scroll, spinner, theme
+	// toggles). Part of the frame cache key (digest.go).
+	frameNonce   uint64
+	activityAdds int // total activity-log appends (digest term)
 
 	// Message backlog (model-level so it survives tab switches): texts typed
 	// while a boss reply is pending, each with its board row id.
@@ -223,9 +243,25 @@ type questionAnswerMsg struct{ text string }
 // stays pending, re-openable with /question.
 type questionLaterMsg struct{}
 
-// New builds the app around a backend. backend.Start is NOT called here —
-// main owns that (goroutine → tea.Program.Send).
-func New(b state.Backend) Model {
+// New builds the app around a backend + the brain.json config. cfg is
+// nil-tolerant (config.Default() substituted — headless stubs and harnesses).
+// backend.Start is NOT called here — main owns that (goroutine →
+// tea.Program.Send).
+func New(b state.Backend, cfg *config.Config) Model {
+	if cfg == nil {
+		cfg = config.Default()
+	}
+	ambientOn = cfg.UI.AmbientChatter
+
+	bossName := cfg.Boss.Name
+	if bossName == "" {
+		bossName = "boss (oikonomos)"
+	}
+	bossShort := bossName
+	if i := strings.IndexAny(bossShort, " \t"); i > 0 {
+		bossShort = bossShort[:i]
+	}
+
 	chat := panels.NewChat(func(text string) tea.Cmd {
 		return func() tea.Msg {
 			// Slash commands dispatch locally, never touch the backend, and
@@ -241,16 +277,23 @@ func New(b state.Backend) Model {
 			return chatSentMsg{text: text}
 		}
 	})
+	chat.SetBossShortName(bossShort)
+	agents := panels.NewAgents()
+	agents.SetBossName(bossName)
 	activity := panels.NewActivity()
 	m := Model{
 		backend:     b,
+		cfg:         cfg,
+		gov:         &governor{lastBusy: time.Now()},
+		bossName:    bossName,
+		bossShort:   bossShort,
 		st:          initialState(b.Mode()),
 		chat:        chat,
 		activity:    activity,
 		activeThink: map[string]bool{},
 		tabs: panels.NewTabs(
 			chat,
-			panels.NewAgents(),
+			agents,
 			panels.NewBoard(),
 			panels.NewMail(),
 			activity,
@@ -289,11 +332,38 @@ func (m *Model) SelectTab(name string) bool {
 	return m.tabs.SetActiveByTitle(name)
 }
 
-// Init starts the 180ms tick loop.
+// Init arms the first power-governed tick; applyEvent re-arms every cycle.
 func (m Model) Init() tea.Cmd {
-	return tea.Tick(tickInterval, func(time.Time) tea.Msg {
+	return m.tickCmd()
+}
+
+// tickCmd re-arms the animation tick at the delay the governor picks for
+// THIS cycle (busy signals from the current state + modals + think stream,
+// idle duration from the drift clock). Busy refreshes lastBusy; 60s of
+// continuous quiet in auto mode slips into screensaver cadence.
+func (m *Model) tickCmd() tea.Cmd {
+	modalOpen := m.perm != nil || m.question != nil
+	thinkActive := len(m.activeThink) > 0
+	now := time.Now()
+	if officeBusy(m.st, modalOpen, thinkActive) {
+		m.gov.lastBusy = now
+	}
+	delay := TickDelay(m.st, m.cfg, thinkActive, modalOpen, now.Sub(m.gov.lastBusy))
+	m.gov.tickCount++
+	return tea.Tick(delay, func(time.Time) tea.Msg {
 		return state.Event{Kind: state.EvTick}
 	})
+}
+
+// Ticks — tick commands armed this run (uisot power proof).
+func (m Model) Ticks() int { return m.gov.tickCount }
+
+// Config — the live brain.json (nil-tolerant accessors live elsewhere).
+func (m Model) Config() *config.Config { return m.cfg }
+
+// FrameCacheStats — app-frame cache counters (uisot proof).
+func (m Model) FrameCacheStats() (hits, misses uint64) {
+	return m.gov.frameHits, m.gov.frameMisses
 }
 
 // Update routes keys, backend events and component ticks.
@@ -303,6 +373,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.resize(msg.Width, msg.Height)
 	case tea.KeyPressMsg:
+		// keys can mutate panel ephemera (textarea, scroll) the state
+		// digest can't see — invalidate the frame cache conservatively.
+		m.frameNonce++
 		if cmd := m.handleKey(msg); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
@@ -334,6 +407,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			Text: fmt.Sprintf("[grafeio] send failed: %v", msg.err),
 		}))
 	case slashMsg:
+		// slash handlers mutate panel-only visual state (thinking/tools/
+		// diffs toggles, theme) — cover the frame cache with the nonce.
+		m.frameNonce++
 		if cmd := m.applySlash(msg.text); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
@@ -414,7 +490,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case state.Event:
 		cmds = append(cmds, m.applyEvent(msg))
 	default:
-		// spinner ticks, mouse wheel, etc. → active tab
+		// spinner ticks, mouse wheel, etc. → active tab (panel ephemera →
+		// frame-cache nonce, same reasoning as keypresses)
+		m.frameNonce++
 		if cmd := m.tabs.Update(msg); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
@@ -431,19 +509,30 @@ func (m Model) View() tea.View {
 }
 
 // Frame renders the whole UI as one string — also what snapshot harnesses
-// (cmd/uishot) print after the scripted run.
+// (cmd/uishot) print after the scripted run. Render cost is skipped when
+// nothing changed: the digest cache returns the previous frame string
+// verbatim, and the floor itself is memoized (office.CachedStyled — the
+// same tick+sprites never rebuilds the grid).
 func (m Model) Frame() string {
 	if m.width == 0 {
 		return "grafeio — waiting for terminal size…"
 	}
+	digest := m.frameDigest()
+	if m.gov.frameCached != "" && m.gov.frameKey == digest {
+		m.gov.frameHits++
+		return m.gov.frameCached
+	}
+	m.gov.frameMisses++
 	top := chrome.TopBar(m.st, m.width)
 	floor := lipgloss.NewStyle().Width(m.floorW).Height(m.middleH).
-		Render(office.Styled(office.BuildRows(m.st, m.floorW, m.middleH)))
+		Render(office.CachedStyled(m.st, m.floorW, m.middleH))
 	side := lipgloss.NewStyle().Width(m.sidebar).Height(m.middleH).
 		Render(m.tabs.View())
 	mid := lipgloss.JoinHorizontal(lipgloss.Top, floor, side)
 	bot := chrome.StatusBar(m.st, m.keys.HintLine(), len(m.queue), m.width)
-	return lipgloss.JoinVertical(lipgloss.Left, top, mid, bot)
+	frame := lipgloss.JoinVertical(lipgloss.Left, top, mid, bot)
+	m.gov.frameKey, m.gov.frameCached = digest, frame
+	return frame
 }
 
 // handleKey implements the global keymap; unclaimed keys go to the tabs.
@@ -548,12 +637,13 @@ func (m *Model) applyEvent(ev state.Event) tea.Cmd {
 	isStreamDelta := ev.Kind == state.EvChatBoss && ev.Msg.Pending && ev.Msg.Text != ""
 	if ev.Kind != state.EvTick && !isStreamDelta {
 		m.activity.Add(m.describeEvent(ev))
+		m.activityAdds++
 	}
 
 	if ev.Kind == state.EvTick {
-		return tea.Tick(tickInterval, func(time.Time) tea.Msg {
-			return state.Event{Kind: state.EvTick}
-		})
+		// governor: the next delay is chosen from the CURRENT cycle's
+		// busy/idle posture (power.go).
+		return m.tickCmd()
 	}
 	// A completed boss bubble unblocks a parked question turn: the hold
 	// resolved, the server resumed — the chat goes back to "typing" and
@@ -966,8 +1056,10 @@ func reducer(st state.OfficeState, ev state.Event) state.OfficeState {
 			st.Bubbles = bubbles
 			next := office.AdvanceSprites(st)
 
-			// ambient chatter: every ~140 ticks a random working non-manager speaks
-			if tick%ambientEvery == 0 {
+			// ambient chatter: every ~140 ticks a random working non-manager
+			// speaks — brain.json ui.ambientChatter=false silences the
+			// generator (explicit EvBubble events are unaffected).
+			if ambientOn && tick%ambientEvery == 0 {
 				var working []state.Employee
 				for _, e := range next.Employees {
 					if e.Role != state.RoleManager && e.Sprite == state.SpriteWorking {
@@ -1335,6 +1427,8 @@ const slashHelp = `commands:
   /clear             empty the chat
   /theme <name>      switch theme (persists)
   /themes            list themes
+  /power [mode]      show/set the power governor (auto|performance|saver)
+  /model [ref]       show/set the boss model (provider/model)
   /thinking on|off   show/hide thinking blocks
   /tools on|off      show/hide tool one-liners
   /diffs on|off      expand/collapse file diffs (ctrl+d toggles)
@@ -1378,6 +1472,38 @@ func (m *Model) applySlash(input string) tea.Cmd {
 	case "/themes":
 		m.notice("themes: " + strings.Join(chrome.ThemeNames(), "  ") +
 			"  (current: " + chrome.CurrentTheme().Name + ")")
+	case "/power":
+		if len(fields) < 2 {
+			m.notice(fmt.Sprintf("power: %s (%s) · current tick %s — /power auto|performance|saver",
+				PowerMode(m.cfg), powerDescribe(PowerMode(m.cfg)), m.currentTick()))
+			return nil
+		}
+		mode := config.PowerMode(strings.ToLower(fields[1]))
+		switch mode {
+		case config.PowerAuto, config.PowerPerformance, config.PowerSaver:
+		default:
+			m.noticeErr(fmt.Sprintf("/power: unknown mode %q (auto|performance|saver)", fields[1]))
+			return nil
+		}
+		m.cfg.UI.Power = mode
+		m.notice(fmt.Sprintf("power → %s (%s) · current tick %s · %s",
+			mode, powerDescribe(mode), m.currentTick(), m.persistCfg()))
+	case "/model":
+		if len(fields) < 2 {
+			cur := string(m.cfg.Boss.Model)
+			if cur == "" {
+				cur = "server default"
+			}
+			m.notice(fmt.Sprintf("boss model: %s — set with /model provider/model (the backend honors it on the next send)", cur))
+			return nil
+		}
+		ref := fields[1]
+		if !strings.Contains(ref, "/") {
+			m.noticeErr("/model: usage /model provider/model (e.g. anthropic/claude-haiku-4-5)")
+			return nil
+		}
+		m.cfg.Boss.Model = config.ModelRef(ref)
+		m.notice(fmt.Sprintf("boss model → %s (the backend honors it on the next send) · %s", ref, m.persistCfg()))
 	case "/thinking":
 		m.applyToggle("/thinking", fields, func(on bool) {
 			m.chat.SetShowThinking(on)
@@ -1470,8 +1596,8 @@ func (m *Model) applySlash(input string) tea.Cmd {
 				done++
 			}
 		}
-		m.notice(fmt.Sprintf("mode %s · theme %s · agents %d · board %d/%d/%d\n%s",
-			m.st.Mode, chrome.CurrentTheme().Name, len(m.st.Employees),
+		m.notice(fmt.Sprintf("mode %s · theme %s · power %s · agents %d · board %d/%d/%d\n%s",
+			m.st.Mode, chrome.CurrentTheme().Name, PowerMode(m.cfg), len(m.st.Employees),
 			pend, doing, done, m.st.StatusLine))
 	case "/quit":
 		return tea.Quit
@@ -1495,6 +1621,19 @@ func (m *Model) applyToggle(name string, fields []string, set func(bool)) {
 	}
 	m.tabs.SetState(m.st)
 	m.notice(name + " → " + stateWord)
+}
+
+// persistCfg — brain.json write-through after an in-app mutation (/power,
+// /model), best effort: the return string is the trailing word in the
+// notice ("saved to brain.json" / the failure).
+func (m *Model) persistCfg() string {
+	if m.cfg == nil {
+		return "in-memory config — not persisted"
+	}
+	if err := config.Save(m.cfg); err != nil {
+		return "brain.json save failed: " + err.Error()
+	}
+	return "saved to brain.json"
 }
 
 // notice appends a dim local notice (From "office") to the chat.

@@ -60,12 +60,17 @@ import (
 	"sync"
 	"time"
 
+	"github.com/theboringhumane/grafeio/internal/config"
 	"github.com/theboringhumane/grafeio/internal/state"
 )
 
 type liveBackend struct {
 	directory string
 	optURL    string
+
+	// cfg is the brain.json this backend runs under; NewLive substitutes
+	// config.Default() for nil, so every read below is non-nil.
+	cfg *config.Config
 
 	fl *flow
 
@@ -89,14 +94,20 @@ type liveBackend struct {
 	lastUserAt    int64
 	respawnFresh  bool   // ResetPrimary(true) latched: next Send respawns a fresh session once
 	respawnOldID  string // primary id ResetPrimary dropped, so Send can un-seat it
+	// promptModelRejected latches when a serve rejects the per-prompt model
+	// override with a 400 (an older/foreign server without the /doc model
+	// field). From then on prompts go out without the override — degrade
+	// open, never fake success.
+	promptModelRejected bool
 }
 
-func newLiveBackend(baseURL, directory string) *liveBackend {
+func newLiveBackend(baseURL, directory string, cfg *config.Config) *liveBackend {
 	return &liveBackend{
 		directory:     directory,
 		optURL:        baseURL,
+		cfg:           cfg,
 		fl:            newFlow(),
-		ctx:           newNormCtx(),
+		ctx:           newNormCtx(cfg),
 		bossCompleted: make(map[string]bool),
 		thoughtSlots:  make(map[string]*thoughtSlot),
 		chatSlots:     make(map[string]*thoughtSlot),
@@ -148,16 +159,26 @@ func (b *liveBackend) Start(emit func(state.Event)) error {
 		ID: "hr", Name: "hr", Role: state.RoleHR, Seat: "hr", Sprite: state.SpriteAtDesk,
 	}})
 
-	b.am = probeAgentmemory(os.Getenv("AGENTMEMORY_URL"))
+	// Agentmemory base: the focused env override wins, else brain.json
+	// (which itself defaults to localhost:3111 — identical when absent).
+	amURL := os.Getenv("AGENTMEMORY_URL")
+	if amURL == "" {
+		amURL = b.cfg.Backend.AgentmemoryURL
+	}
+	b.am = probeAgentmemory(amURL)
 	board := "in-memory | agentmemory: offline (in-memory board)"
 	if b.am.kind == "actions" {
 		board = "agentmemory (" + b.am.winner + ")"
 	}
 	b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] live - " + u + " | board: " + board})
 
+	if b.cfg.Boss.Model != "" {
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] boss model override: " + string(b.cfg.Boss.Model)})
+	}
+
 	if b.am.kind == "actions" {
 		b.syncBoard()
-		b.fl.every(5*time.Second, b.syncBoard)
+		go b.pollLoop(amPollBase(b.cfg.Backend.AgentmemoryPollS))
 	}
 
 	go b.pump()
@@ -215,7 +236,7 @@ func (b *liveBackend) Send(text string) error {
 			perr    error
 		)
 		if forceFresh {
-			primary, perr = b.createPrimary("grafeio office · respawn")
+			primary, perr = b.createPrimary(b.bossNameShort() + " · respawn")
 			if perr == nil {
 				b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] primary session respawned fresh (" + primary.ID + ")"})
 			}
@@ -503,14 +524,14 @@ func (b *liveBackend) ensurePrimary() (ocSession, error) {
 			if count > STALE_SESSION_MSG_LIMIT {
 				b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
 					"[grafeio] primary session %s has %d msgs (> %d, stale) — creating fresh", newest.ID, count, STALE_SESSION_MSG_LIMIT)})
-				return b.createPrimary("grafeio office")
+				return b.createPrimary(b.bossName())
 			}
 			b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
 				"[grafeio] primary session: reuse %s (%d msgs)", newest.ID, count)})
 			return *newest, nil
 		}
 	}
-	return b.createPrimary("grafeio office")
+	return b.createPrimary(b.bossName())
 }
 
 // createPrimary makes a brand-new root session with the given title.
@@ -585,11 +606,75 @@ func (b *liveBackend) ResetPrimary(forceNew bool) error {
 }
 
 // postPrompt is promptAsync: POST /session/{id}/prompt_async (204 on ok).
+//
+// cfg.Boss.Model rides as {"model":{"providerID","modelID"}} — the exact
+// shape serve 1.18.19 documents in GET /doc for prompt_async (verified
+// 2026-08-21 against the spawned server). A ModelRef without a
+// "provider/model" slash is ignored with a status note. If a serve ever
+// rejects the model field with 400 (an older/foreign server), the override
+// latches off and the prompt retries bare — degrade open, never fake it.
 func (b *liveBackend) postPrompt(sessionID, text string) error {
-	body, _ := json.Marshal(map[string]any{
+	payload := map[string]any{
 		"parts": []map[string]any{{"type": "text", "text": text}},
-	})
-	return b.doJSON(http.MethodPost, "/session/"+sessionID+"/prompt_async", body, nil)
+	}
+	provider, model := splitModelRef(string(b.cfg.Boss.Model))
+	b.mu.Lock()
+	rejected := b.promptModelRejected
+	b.mu.Unlock()
+	withModel := provider != "" && model != "" && !rejected
+	if withModel {
+		payload["model"] = map[string]any{"providerID": provider, "modelID": model}
+	}
+	body, _ := json.Marshal(payload)
+	err := b.doJSON(http.MethodPost, "/session/"+sessionID+"/prompt_async", body, nil)
+	if err != nil && withModel && strings.Contains(strings.ToLower(err.Error()), "model") {
+		b.mu.Lock()
+		b.promptModelRejected = true
+		b.mu.Unlock()
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] boss model override unavailable on this serve (400 rejected the model field) — continuing without it"})
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] boss model override unavailable in serve (see /doc session.prompt_async): retrying bare prompt"})
+		// Retry bare exactly once: the member-visible cost of the failed
+		// POST was zero (rejected before the turn started).
+		payload = map[string]any{
+			"parts": []map[string]any{{"type": "text", "text": text}},
+		}
+		body, _ = json.Marshal(payload)
+		err = b.doJSON(http.MethodPost, "/session/"+sessionID+"/prompt_async", body, nil)
+	}
+	return err
+}
+
+// splitModelRef parses "provider/model" (ModelRef). Both halves must be
+// non-empty for the override to be honored.
+func splitModelRef(s string) (provider, model string) {
+	parts := strings.SplitN(strings.TrimSpace(s), "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", ""
+	}
+	return parts[0], parts[1]
+}
+
+// ---------------------------------------------------------------- brain.json boss naming
+
+// bossName is the fresh-create session title (cfg.Boss.Name); the cfg
+// contract guarantees non-empty, but a belt-and-braces fallback keeps the
+// historic title so a hand-rolled blank config cannot break the floor.
+func (b *liveBackend) bossName() string {
+	if b.cfg.Boss.Name != "" {
+		return b.cfg.Boss.Name
+	}
+	return "grafeio office"
+}
+
+// bossNameShort strips a trailing "(…)" parenthetical for the respawn
+// title: "boss · respawn" reads like a title; "boss (oikonomos) · respawn"
+// does not.
+func (b *liveBackend) bossNameShort() string {
+	name := b.bossName()
+	if i := strings.LastIndex(name, " ("); i > 0 && strings.HasSuffix(name, ")") {
+		return strings.TrimSpace(name[:i])
+	}
+	return name
 }
 
 // ---------------------------------------------------------------- permission replies
@@ -1196,11 +1281,95 @@ func (b *liveBackend) maybeBossCompleted(info ocMessage) {
 
 // ---------------------------------------------------------------- agentmemory sync
 
-// syncBoard polls agentmemory -> board/mail (5s cadence, only on change).
-func (b *liveBackend) syncBoard() {
-	if b.fl.isStopped() || b.am == nil || b.am.kind != "actions" {
-		return
+// amPollBase derives the board poll cadence from cfg.Backend.AgentmemoryPollS:
+// 0 or negative -> the historic 5s; less than 1s is clamped to 1s.
+func amPollBase(seconds int) time.Duration {
+	if seconds <= 0 {
+		seconds = 5
 	}
+	if seconds < 1 {
+		seconds = 1
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// Backoff tuning: after backoffStep consecutive syncs that observed no board
+// change, the poll interval doubles, capped at backoffMaxFactor x the base.
+// The FIRST observed change resets cadence to base immediately.
+const backoffStep = 5
+const backoffMaxFactor = 4
+
+// BackoffInterval computes the next agentmemory poll wait given the current
+// wait and the running no-change count for the sync that just finished.
+// Pure — exported so cmd/headless --efficiency can simulate the cadence
+// without a live server. It never shortens the interval here (the change
+// path is the caller's base-reset) and never exceeds backoffMaxFactor x base.
+func BackoffInterval(base, current time.Duration, noChange int) time.Duration {
+	if base <= 0 {
+		base = 5 * time.Second
+	}
+	if noChange > 0 && noChange%backoffStep == 0 {
+		max := backoffMaxFactor * base
+		if dbl := 2 * current; dbl <= max {
+			return dbl
+		}
+		return max
+	}
+	return current
+}
+
+// pollLoop replaces the fixed ticker: syncBoard, then wait the current
+// cadence. The backend cannot see the office's pending queue, so battery
+// savings come from exponential backoff instead of activity indicators —
+// an uneventful board drifts from the base cadence to 4x base; any observed
+// change snaps back. Timing: Stop closes fl.done, which wakes the select.
+func (b *liveBackend) pollLoop(base time.Duration) {
+	interval := base
+	noChange := 0
+	for {
+		// Wait FIRST: Start already ran one warming sync before this goroutine
+		// began, mirroring the old fixed-ticker cadence exactly.
+		select {
+		case <-b.fl.done:
+			return
+		case <-time.After(interval):
+		}
+		if b.fl.isStopped() {
+			return
+		}
+		changed := b.syncBoard()
+		if changed {
+			if noChange > 0 && interval != base {
+				b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
+					"[grafeio] board poll: change observed — cadence back to %s", shortDur(base))})
+			}
+			noChange = 0
+			interval = base
+		} else {
+			noChange++
+			if next := BackoffInterval(base, interval, noChange); next != interval {
+				interval = next
+				b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
+					"[grafeio] board poll backoff: %s after %d unchanged syncs (cap %s)",
+					shortDur(interval), noChange, shortDur(backoffMaxFactor*base))})
+			}
+		}
+	}
+}
+
+// shortDur renders a Duration the way the status line likes it.
+func shortDur(d time.Duration) string {
+	return d.Round(time.Second).String()
+}
+
+// syncBoard polls agentmemory -> board/mail and reports whether anything
+// changed (backs the poll backoff; task rows dedupe on title|status|owner,
+// mail rows on first sight only).
+func (b *liveBackend) syncBoard() bool {
+	if b.fl.isStopped() || b.am == nil || b.am.kind != "actions" {
+		return false
+	}
+	changed := false
 	tasks := b.am.listActions()
 	mails := b.am.listMails()
 	for _, task := range tasks {
@@ -1212,6 +1381,7 @@ func (b *liveBackend) syncBoard() {
 		}
 		b.mu.Unlock()
 		if stale {
+			changed = true
 			b.fl.emit(state.Event{Kind: state.EvTask, Task: task})
 		}
 	}
@@ -1221,7 +1391,9 @@ func (b *liveBackend) syncBoard() {
 		b.amMails[mail.ID] = true
 		b.mu.Unlock()
 		if !seen {
+			changed = true
 			b.fl.emit(state.Event{Kind: state.EvMail, Mail: mail})
 		}
 	}
+	return changed
 }

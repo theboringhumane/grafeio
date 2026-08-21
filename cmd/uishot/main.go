@@ -57,6 +57,17 @@
 //	                                rejects the first batch Send — the app
 //	                                must ResetPrimary(true) and resend the
 //	                                SAME batch once; second send succeeds)
+//	                    [--power auto|saver|performance|all]
+//	                                power-governor proof: the model runs in a
+//	                                manual event loop (every update renders a
+//	                                frame — that is what the caches count) for
+//	                                a 6s scripted window per mode; prints tick
+//	                                counts (performance > auto > saver), the
+//	                                floor frame-cache hit %, the TickDelay
+//	                                decision table (busy/idle/drift + tickMs
+//	                                override), the /power + /model slash demo
+//	                                (chat frame + persisted brain.json), and a
+//	                                custom boss-name agents frame.
 package main
 
 import (
@@ -72,6 +83,8 @@ import (
 
 	"github.com/theboringhumane/grafeio/internal/app"
 	"github.com/theboringhumane/grafeio/internal/chrome"
+	"github.com/theboringhumane/grafeio/internal/config"
+	"github.com/theboringhumane/grafeio/internal/office"
 	"github.com/theboringhumane/grafeio/internal/state"
 )
 
@@ -179,6 +192,8 @@ type stubBackend struct {
 	batchFailedOnce bool     // the one-shot rejection sentinel
 	sendLog         []string // every Send call, verbatim (the proof)
 	teamLog         []string // QueueItemStart/Done + ResetPrimary calls (the proof)
+
+	powerDemo bool // --power: minimal quiet script for the slash/name legs
 }
 
 func mail(id, from, to, subject, body string, kind state.MailKind) state.MailItem {
@@ -216,6 +231,10 @@ func (b *stubBackend) script() {
 	}
 	if b.batchMode {
 		b.scriptBatch(at)
+		return
+	}
+	if b.powerDemo {
+		b.scriptPowerDemo(at)
 		return
 	}
 
@@ -708,7 +727,7 @@ func askQueueWorkload(p *tea.Program) {
 // = the deterministic before/after pair (--think's frames).
 func runThinkShot(tab string, dur time.Duration) (string, error) {
 	backend := &stubBackend{done: make(chan struct{}), thinkMode: true}
-	m := app.New(backend)
+	m := app.New(backend, config.Default())
 	if !m.SelectTab(tab) {
 		return "", fmt.Errorf("unknown tab %q", tab)
 	}
@@ -794,7 +813,7 @@ func (t *traceLog) add(line string) {
 func runStreamShot(dur time.Duration) (string, []string, error) {
 	tl := &traceLog{start: time.Now()}
 	backend := &stubBackend{done: make(chan struct{}), streamMode: true, trace: tl.add}
-	m := app.New(backend)
+	m := app.New(backend, config.Default())
 	if !m.SelectTab("chat") {
 		return "", nil, fmt.Errorf("unknown tab %q", "chat")
 	}
@@ -837,7 +856,7 @@ func runStreamShot(dur time.Duration) (string, []string, error) {
 func runAskShot(mode string, dur time.Duration) (string, []string, []string, error) {
 	tl := &traceLog{start: time.Now()}
 	backend := &stubBackend{done: make(chan struct{}), askMode: mode, trace: tl.add}
-	m := app.New(backend)
+	m := app.New(backend, config.Default())
 	if !m.SelectTab("chat") {
 		return "", nil, nil, fmt.Errorf("unknown tab %q", "chat")
 	}
@@ -888,7 +907,7 @@ func runBatchShot(respawn bool, dur time.Duration) (string, []string, []string, 
 	tl := &traceLog{start: time.Now()}
 	backend := &stubBackend{done: make(chan struct{}),
 		batchMode: true, respawnMode: respawn, trace: tl.add}
-	m := app.New(backend)
+	m := app.New(backend, config.Default())
 	if !m.SelectTab("chat") {
 		return "", nil, nil, nil, fmt.Errorf("unknown tab %q", "chat")
 	}
@@ -946,6 +965,259 @@ func printAskCapture(capture []string, want string) {
 	}
 }
 
+// --- power-governor proof ---------------------------------------------------
+// The standard shots run under tea.WithoutRenderer (no View calls until the
+// final Frame). The power proof needs the caches exercised per rendered
+// frame, so it drives the REAL model in a manual event loop: backend emit
+// → channel, every Update feeds a Frame() render pass (that is what the
+// floor/app caches count), tea.Tick re-arms land on their governor delay.
+
+// runManualLoop drives model+cmd execution by hand for `dur`, then returns
+// the final model. Every processed message renders one frame through the
+// real Frame() path (cache-exercising), exactly like the bubbletea runtime.
+func runManualLoop(cfg *config.Config, b *stubBackend, tab string, dur time.Duration,
+	workload func(send func(tea.Msg))) (app.Model, error) {
+	m := app.New(b, cfg)
+	var zero app.Model
+	if tab != "" && !m.SelectTab(tab) {
+		return zero, fmt.Errorf("unknown tab %q", tab)
+	}
+	msgCh := make(chan tea.Msg, 512)
+	exec := func(c tea.Cmd) {
+		if c == nil {
+			return
+		}
+		go func() {
+			if msg := c(); msg != nil {
+				msgCh <- msg
+			}
+		}()
+	}
+	var tm tea.Model = m
+	exec(tm.Init())
+	var cmd tea.Cmd
+	tm, cmd = tm.Update(tea.WindowSizeMsg{Width: shotCols, Height: shotRows})
+	exec(cmd)
+	if err := b.Start(func(ev state.Event) { msgCh <- ev }); err != nil {
+		return zero, err
+	}
+	if workload != nil {
+		workload(func(msg tea.Msg) { msgCh <- msg })
+	}
+	deadline := time.After(dur)
+	for {
+		select {
+		case <-deadline:
+			if fm, ok := tm.(app.Model); ok {
+				return fm, nil
+			}
+			return zero, fmt.Errorf("unexpected model type %T", tm)
+		case msg := <-msgCh:
+			if bmsg, ok := msg.(tea.BatchMsg); ok {
+				for _, sc := range bmsg {
+					exec(sc)
+				}
+				continue
+			}
+			tm, cmd = tm.Update(msg)
+			exec(cmd)
+			if fm, ok := tm.(app.Model); ok {
+				fm.Frame() // render pass — exercises digest + floor caches
+			}
+		}
+	}
+}
+
+// scriptPowerDemo (--power slash leg) — minimal quiet script: one user
+// message and a boss typing placeholder that NEVER completes inside the
+// window, so the busy placeholder ("jorge is typing…") and the slash
+// notices share the final frame.
+func (b *stubBackend) scriptPowerDemo(at func(ms int, ev state.Event)) {
+	at(50, state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — power-governor stub online"})
+	at(150, state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
+		"ship the power governor", false)})
+	at(200, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-1", "boss", "", true)})
+}
+
+// printTickTable — the deterministic TickDelay decision table: synthetic
+// busy/idle/drift states across every power mode, plus the tickMs override.
+func printTickTable() {
+	idleSt := state.OfficeState{Employees: []state.Employee{
+		{ID: "manager", Name: "boss", Role: state.RoleManager, Sprite: state.SpriteAtDesk},
+		{ID: "hr", Name: "hr", Role: state.RoleHR, Sprite: state.SpriteAtDesk},
+	}}
+	busySt := state.OfficeState{
+		Employees: idleSt.Employees,
+		Chat:      []state.ChatMsg{{ID: "boss-1", From: "boss", Pending: true}},
+	}
+	fmt.Println("--- TickDelay decision table (synthetic states) ---")
+	rows := []struct {
+		name string
+		cfg  *config.Config
+	}{
+		{"auto", config.Default()},
+		{"performance", config.Default()},
+		{"saver", config.Default()},
+		{"auto+tickMs=50", config.Default()},
+	}
+	rows[1].cfg.UI.Power = config.PowerPerformance
+	rows[2].cfg.UI.Power = config.PowerSaver
+	rows[3].cfg.UI.TickMs = 50
+	want := []struct{ busy, idle, drift time.Duration }{
+		{180 * time.Millisecond, 1 * time.Second, 3 * time.Second},
+		{150 * time.Millisecond, 150 * time.Millisecond, 150 * time.Millisecond},
+		{400 * time.Millisecond, 2 * time.Second, 2 * time.Second},
+		{50 * time.Millisecond, 1 * time.Second, 3 * time.Second},
+	}
+	fail := false
+	for idx, r := range rows {
+		b := app.TickDelay(busySt, r.cfg, false, false, 0)
+		idleDelay := app.TickDelay(idleSt, r.cfg, false, false, 0)
+		d := app.TickDelay(idleSt, r.cfg, false, false, 61*time.Second)
+		ok := b == want[idx].busy && idleDelay == want[idx].idle && d == want[idx].drift
+		mark := "PASS"
+		if !ok {
+			mark = "FAIL"
+			fail = true
+		}
+		fmt.Printf("  [%s] %-15s busy=%-6s idle=%-6s drift(61s)=%-6s\n", mark, r.name, b, idleDelay, d)
+	}
+	if fail {
+		fmt.Fprintln(os.Stderr, "uishot: TickDelay decision table mismatch")
+		os.Exit(1)
+	}
+	fmt.Println("asserts: OK — auto 180ms/1s/3s-drift, performance 150ms flat, saver 400ms/2s, tickMs overrides busy")
+}
+
+// powerWindow — one power mode's scripted-window tallies.
+type powerWindow struct {
+	ticks                int
+	floorHits, floorMiss uint64
+	appHits, appMiss     uint64
+}
+
+func runPowerProof(mode string) error {
+	// brain.json write-through lands in a scratch GRAFEIO_HOME — the user's
+	// real config is never touched by shots.
+	home, err := os.MkdirTemp("", "grafeio-power")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(home)
+	if err := os.Setenv("GRAFEIO_HOME", home); err != nil {
+		return err
+	}
+	fmt.Printf("--- scratch GRAFEIO_HOME: %s ---\n", home)
+
+	var modes []config.PowerMode
+	switch config.PowerMode(mode) {
+	case config.PowerAuto, config.PowerSaver, config.PowerPerformance:
+		modes = []config.PowerMode{config.PowerMode(mode)}
+	case "all":
+		modes = []config.PowerMode{config.PowerAuto, config.PowerSaver, config.PowerPerformance}
+	default:
+		return fmt.Errorf("unknown power mode %q (auto|saver|performance|all)", mode)
+	}
+
+	const window = 6 * time.Second
+	fmt.Printf("--- power windows (%s scripted quiet-after-burst window, same stub script per mode) ---\n", window)
+	byMode := map[config.PowerMode]powerWindow{}
+	for _, pm := range modes {
+		cfg := config.Default()
+		cfg.UI.Power = pm
+		b := &stubBackend{done: make(chan struct{}), flushQueue: true}
+		office.CacheReset()
+		fm, err := runManualLoop(cfg, b, "agents", window, nil)
+		if err != nil {
+			return err
+		}
+		fh, fMiss := office.CacheStats()
+		ah, aMiss := fm.FrameCacheStats()
+		w := powerWindow{ticks: fm.Ticks(), floorHits: fh, floorMiss: fMiss, appHits: ah, appMiss: aMiss}
+		byMode[pm] = w
+		hitPct := 0.0
+		if fh+fMiss > 0 {
+			hitPct = 100 * float64(fh) / float64(fh+fMiss)
+		}
+		avg := window / time.Duration(w.ticks)
+		fmt.Printf("  mode=%-11s ticks=%2d avg-delay=%7s  floor-cache: hits=%3d misses=%3d hit=%05.1f%%  app-frame: hits=%3d misses=%3d\n",
+			pm, w.ticks, avg.Round(time.Millisecond), fh, fMiss, hitPct, ah, aMiss)
+	}
+	if len(modes) == 3 {
+		a, s, p := byMode[config.PowerAuto], byMode[config.PowerSaver], byMode[config.PowerPerformance]
+		if !(p.ticks > a.ticks && a.ticks > s.ticks) {
+			return fmt.Errorf("tick ordering violated: want performance > auto > saver, got %d / %d / %d",
+				p.ticks, a.ticks, s.ticks)
+		}
+		fmt.Printf("asserts: OK — performance(%d) > auto(%d) > saver(%d) ticks in the identical window\n",
+			p.ticks, a.ticks, s.ticks)
+	}
+	if config.PowerMode(mode) != "all" {
+		return nil
+	}
+
+	printTickTable()
+
+	// slash /power + /model leg: busy typing placeholder carries the custom
+	// boss short name; slash notices + brain.json write-through in-frame.
+	cfg := config.Default()
+	cfg.Boss.Name = "jorge (El Jefe)"
+	sb := &stubBackend{done: make(chan struct{}), powerDemo: true}
+	fm, err := runManualLoop(cfg, sb, "chat", 2400*time.Millisecond, func(send func(tea.Msg)) {
+		typeLine := func(at time.Duration, s string) {
+			go func() {
+				time.Sleep(at)
+				for _, r := range s {
+					send(tea.KeyPressMsg(tea.Key{Code: r, Text: string(r)}))
+					time.Sleep(8 * time.Millisecond)
+				}
+				send(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+			}()
+		}
+		typeLine(450*time.Millisecond, "/power")
+		typeLine(800*time.Millisecond, "/power saver")
+		typeLine(1200*time.Millisecond, "/model")
+		typeLine(1600*time.Millisecond, "/model anthropic/claude-haiku-4-5")
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Println("===== UI SHOT · slash /power + /model (boss.name \"jorge (El Jefe)\", boss typing) =====")
+	fmt.Println(fm.Frame())
+	fmt.Println("===== UI SHOT =====")
+	fail := func(format string, args ...any) error { return fmt.Errorf(format, args...) }
+	if got := fm.Config(); got.UI.Power != config.PowerSaver {
+		return fail("expected in-memory power=saver after /power saver, got %q", got.UI.Power)
+	}
+	if got := fm.Config(); got.Boss.Model != "anthropic/claude-haiku-4-5" {
+		return fail("expected in-memory boss.model after /model, got %q", got.Boss.Model)
+	}
+	bts, rerr := os.ReadFile(config.Path())
+	if rerr != nil {
+		return fail("read persisted brain.json: %v", rerr)
+	}
+	if !strings.Contains(string(bts), `"power": "saver"`) || !strings.Contains(string(bts), `"model": "anthropic/claude-haiku-4-5"`) {
+		return fail("persisted brain.json missing the /power + /model writes:\n%s", bts)
+	}
+	fmt.Printf("--- persisted brain.json (%s) ---\n%s", config.Path(), bts)
+	fmt.Println("asserts: OK — /power saver honored + persisted, /model set + persisted, placeholder personalized")
+
+	// custom-boss-name leg: the agents roster pins cfg.Boss.Name.
+	nb := &stubBackend{done: make(chan struct{})}
+	nfm, err := runManualLoop(cfg, nb, "agents", 1600*time.Millisecond, nil)
+	if err != nil {
+		return err
+	}
+	frame := nfm.Frame()
+	if !strings.Contains(frame, "jorge (El Jefe)") {
+		return fail("agents frame missing custom boss name")
+	}
+	fmt.Println("===== UI SHOT · custom boss name on the agents roster =====")
+	fmt.Println(frame)
+	fmt.Println("===== UI SHOT =====")
+	return nil
+}
+
 func main() {
 	tab := flag.String("tab", defaultTab, "active tab: chat|agents|board|mail|activity")
 	theme := flag.String("theme", "", "force a ui theme: "+strings.Join(chrome.ThemeNames(), "|"))
@@ -961,7 +1233,16 @@ func main() {
 	askQueue := flag.Bool("ask-queue", false, "queue-hold proof: a message typed while the question hold is outstanding must ENQUEUE; AnswerQuestion → resolved → completed boss reply → flush, ordering trace printed")
 	batch := flag.Bool("batch", false, "intelligent-backlog proof: three messages enqueue while the boss is busy; the flush is ONE composed [BATCH DISPATCH] send (frame + batch text + stub logs + trace)")
 	batchRespawn := flag.Bool("batch-respawn", false, "failure-respawn proof: the first batch Send is rejected once — the app must ResetPrimary(true) and resend the SAME batch exactly once")
+	power := flag.String("power", "", "power-governor proof: 6s scripted window per mode (auto|saver|performance|all) — tick counts, floor frame-cache hit %, TickDelay table, /power + /model slash demo, custom boss-name frame")
 	flag.Parse()
+
+	if *power != "" {
+		if err := runPowerProof(*power); err != nil {
+			fmt.Fprintf(os.Stderr, "uishot: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	// keystroke workloads only reach the textarea / modal on the chat tab
 	if (*slash || *perm || *diffs || *debug || *think || *askAnswer || *askEsc || *askQueue) && *tab == defaultTab {
@@ -1154,7 +1435,7 @@ func main() {
 	}
 
 	backend := &stubBackend{done: make(chan struct{}), flushQueue: *debug}
-	m := app.New(backend)
+	m := app.New(backend, config.Default())
 	if !m.SelectTab(*tab) {
 		fmt.Fprintf(os.Stderr, "uishot: unknown tab %q\n", *tab)
 		os.Exit(2)

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/theboringhumane/grafeio/internal/config"
 	"github.com/theboringhumane/grafeio/internal/state"
 )
 
@@ -160,6 +161,14 @@ type ocSSEEvent struct {
 // normCtx is the mutable reducer-side context (TS: NormCtx). Not
 // goroutine-safe on its own — the owning backend holds a mutex.
 type normCtx struct {
+	// cfg is the backend's brain.json (never nil — the live backend
+	// substitutes config.Default()). It feeds roster naming only:
+	// cfg.Roles[<rolekey>].NamePrefix replaces the stock Greek base when
+	// set. RoleConfig.Model is intentionally NOT applied here:
+	// per-sub-agent model dispatch is decided by opencode (the agent that
+	// spawned the child session), grafeio cannot override it — it is
+	// documented as best-effort in internal/config.
+	cfg              *config.Config
 	employees        map[string]state.Employee // child session id -> employee
 	tasks            map[string]state.BoardTask
 	nameCounts       map[state.EmployeeRole]int // role -> last issued number
@@ -199,8 +208,12 @@ type permHold struct {
 	Summary      string
 }
 
-func newNormCtx() *normCtx {
+func newNormCtx(cfg *config.Config) *normCtx {
+	if cfg == nil {
+		cfg = config.Default()
+	}
 	return &normCtx{
+		cfg: cfg,
 		employees:        make(map[string]state.Employee),
 		tasks:            make(map[string]state.BoardTask),
 		nameCounts:       make(map[state.EmployeeRole]int),
@@ -220,7 +233,19 @@ func newNormCtx() *normCtx {
 	}
 }
 
-// Greek-desk naming per role (state canon).
+// Greek-desk naming per role (state canon). brain.json
+// (cfg.Roles[rolekey].NamePrefix) overrides the seed when set — role keys
+// are the role's string value ("developer", "scout", "reviewer", "runner",
+// "hr"). Stocks match the historic roster (tekton/skopos/dikastes/
+// hemerodromos/mnemosyne), so a default brain.json renames nothing.
+func (ctx *normCtx) nameBase(role state.EmployeeRole) string {
+	if rc, ok := ctx.cfg.Roles[string(role)]; ok && rc.NamePrefix != "" {
+		return rc.NamePrefix
+	}
+	return nameBase(role)
+}
+
+// nameBase is the built-in Greek base when no config override applies.
 func nameBase(role state.EmployeeRole) string {
 	switch role {
 	case state.RoleScout:
@@ -278,7 +303,7 @@ func (ctx *normCtx) issueEmployee(s ocSession) state.Employee {
 	ctx.nameCounts[role] = n
 	emp := state.Employee{
 		ID:     s.ID, // subagent session id IS the employee id
-		Name:   nameBase(role) + "-" + itoa(n),
+		Name:   ctx.nameBase(role) + "-" + itoa(n),
 		Role:   role,
 		Seat:   "desk-" + itoa(ctx.seatSeq+1),
 		Sprite: state.SpriteToManager, // dispatch walk starts immediately

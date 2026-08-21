@@ -7,18 +7,35 @@ import (
 	"sync"
 	"time"
 
+	"github.com/theboringhumane/grafeio/internal/config"
 	"github.com/theboringhumane/grafeio/internal/state"
 )
 
+// cfgOrDefault guards every factory: a nil config (tests, embedded use)
+// behaves exactly like a stock brain.json.
+func cfgOrDefault(cfg *config.Config) *config.Config {
+	if cfg == nil {
+		return config.Default()
+	}
+	return cfg
+}
+
 // NewLive creates the live backend (port of createLiveBackend).
-// baseURL empty -> env OPENCODE_SERVER -> spawn `opencode serve --port 0`.
-func NewLive(baseURL, directory string) state.Backend {
-	return newLiveBackend(baseURL, directory)
+// Server resolution precedence: cfg.Backend.Server (non-empty wins) ->
+// baseURL arg -> env OPENCODE_SERVER -> spawn `opencode serve --port 0`.
+// cfg may be nil (safety: config.Default()).
+func NewLive(baseURL, directory string, cfg *config.Config) state.Backend {
+	cfg = cfgOrDefault(cfg)
+	if cfg.Backend.Server != "" {
+		baseURL = cfg.Backend.Server // brain.json pins the server
+	}
+	return newLiveBackend(baseURL, directory, cfg)
 }
 
 // NewDemo creates the scripted demo backend (port of createDemoBackend).
-func NewDemo() state.Backend {
-	return newDemoBackend()
+// cfg may be nil (safety: config.Default()).
+func NewDemo(cfg *config.Config) state.Backend {
+	return newDemoBackend(cfgOrDefault(cfg))
 }
 
 // flow — shared lifecycle plumbing for both backends: the stopped flag, the
@@ -31,6 +48,11 @@ type flow struct {
 	timers  map[*time.Timer]struct{}
 	done    chan struct{}
 	emitRef func(state.Event)
+	// cb serializes timer/ticker callbacks so same-instant beats (two demo
+	// timers armed at 2400ms, poll vs pulse) replay in registration order
+	// instead of racing OS scheduling. NOT fl.mu: callbacks must be able to
+	// emit (emit takes fl.mu) and read backend state.
+	cb sync.Mutex
 }
 
 func newFlow() *flow {
@@ -65,6 +87,8 @@ func (f *flow) at(d time.Duration, fn func()) {
 	f.mu.Lock()
 	var t *time.Timer
 	t = time.AfterFunc(d, func() {
+		f.cb.Lock()
+		defer f.cb.Unlock()
 		f.mu.Lock()
 		delete(f.timers, t)
 		stopped := f.stopped
@@ -87,10 +111,13 @@ func (f *flow) every(d time.Duration, fn func()) {
 			case <-f.done:
 				return
 			case <-t.C:
+				f.cb.Lock()
 				if f.isStopped() {
+					f.cb.Unlock()
 					return
 				}
 				fn()
+				f.cb.Unlock()
 			}
 		}
 	}()

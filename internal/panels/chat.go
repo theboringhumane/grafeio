@@ -15,7 +15,8 @@
 //		            From "office" entries render as dim local notices (red when
 //		            Meta == "error").
 //		spinner   — shown only while a boss reply is pending WITH NO TEXT YET
-//		            (" boss is typing…"). A pending boss bubble WITH text renders
+//		            (" <boss> is typing…", named from brain.json boss.name).
+//		            A pending boss bubble WITH text renders
 //		            in the viewport itself as a streaming "boss ›" turn: glamour
 //		            markdown re-rendered per delta plus a blinking dim caret "▌"
 //		            at the tail (blink follows the office tick) — the spinner row
@@ -24,7 +25,7 @@
 //		textarea  — multiline input; Enter sends, Shift+Enter (or Ctrl+J) is a
 //		            newline, placeholder "talk to the boss…". NEVER locked: while
 //		            the boss is typing, Enter ENQUEUES (the app owns the queue)
-//	           and the placeholder reads "boss is typing… · N queued".
+//	           and the placeholder reads "<boss> is typing… · N queued".
 //		            While a permission prompt is open, the prompt MODAL replaces
 //		            this region: y/a/n answers, esc defers; every other key still
 //		            types into the (hidden) textarea.
@@ -66,8 +67,11 @@ const (
 	bossPrefix = "boss › "
 
 	placeholderIdle = "talk to the boss…"
-	placeholderBusy = "boss is typing…"
 	placeholderWait = "boss is waiting for your answer…"
+
+	// defaultBossShort — the busy placeholder's boss word when no config
+	// short name is set ("boss is typing…"; SetBossShortName personalizes).
+	defaultBossShort = "boss"
 
 	textareaH = 3 // rows of multiline input at the bottom of the tab
 )
@@ -138,6 +142,9 @@ type Chat struct {
 
 	chat    []state.ChatMsg // rendered snapshot
 	pending bool
+	// bossShort — the boss's display short name (first word of brain.json
+	// boss.name), used by the busy placeholder + typing spinner line.
+	bossShort string
 	// pendingSpin — the " boss is typing…" spinner row shows ONLY while a
 	// boss reply is outstanding with no streamed text yet (the typing
 	// placeholder). Once a streaming boss bubble has text, the bubble
@@ -291,10 +298,30 @@ func (c *Chat) SetQuestionWaiting(on bool) {
 }
 
 // SetQueueLen updates the queue count shown in the busy placeholder
-// ("boss is typing… · N queued"). The queue itself lives in the app model.
+// ("<boss> is typing… · N queued"). The queue itself lives in the app model.
 func (c *Chat) SetQueueLen(n int) {
 	c.queueLen = n
 	c.refreshPlaceholder()
+}
+
+// SetBossShortName personalizes the busy placeholder and the typing spinner
+// line from the config boss name's first word ("jorge is typing…"). Empty
+// restores "boss".
+func (c *Chat) SetBossShortName(name string) {
+	if c.bossShort == name {
+		return
+	}
+	c.bossShort = name
+	c.refreshPlaceholder()
+}
+
+// typingText — the busy-state wording: "<bossShort> is typing…".
+func (c *Chat) typingText() string {
+	name := c.bossShort
+	if name == "" {
+		name = defaultBossShort
+	}
+	return name + " is typing…"
 }
 
 // refreshPlaceholder recomputes the textarea placeholder from pending +
@@ -306,7 +333,7 @@ func (c *Chat) refreshPlaceholder() {
 	case c.questionWaiting:
 		base = placeholderWait
 	case c.pending:
-		base = placeholderBusy
+		base = c.typingText()
 	default:
 		c.ta.Placeholder = placeholderIdle
 		return
@@ -613,7 +640,7 @@ func (c *Chat) View() string {
 	if c.pendingSpin {
 		b.WriteString("\n")
 		b.WriteString(c.sp.View())
-		b.WriteString(chrome.AccentText.Render(" boss is typing…"))
+		b.WriteString(chrome.AccentText.Render(" " + c.typingText()))
 	}
 	b.WriteString("\n")
 	b.WriteString(chrome.DimText.Render(fitPlain(strings.Repeat("─", c.w), c.w)))

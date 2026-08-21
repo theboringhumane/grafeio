@@ -27,6 +27,17 @@
 //	grafeio-headless --answer   after the first permission event prints,
 //	                            call backend.AnswerPermission(pid, "once") and
 //	                            print the result (demo: clears tekton-1's block)
+//	grafeio-headless --cfg path/to/brain.json
+//	                            use an explicit brain.json for this run
+//	                            (defaults-filled, never written back); without
+//	                            it, config.Load() reads GRAFEIO_HOME just like
+//	                            the UI binaries. A [cfg] summary line prints
+//	                            the loaded Boss/Backend before anything else.
+//	grafeio-headless --efficiency
+//	                            simulate 11 board-poll cadence decisions (8
+//	                            unchanged syncs, then a change) using the same
+//	                            BackoffInterval helper the live backend runs,
+//	                            printing the interval growth. EFFICIENCY: OK.
 //	grafeio-headless --ask      question-loop regression probe (forces live):
 //	                            auto-sends the question-tool prompt, answers the
 //	                            FIRST pending EvQuestion via
@@ -47,6 +58,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -55,6 +67,7 @@ import (
 	"time"
 
 	"github.com/theboringhumane/grafeio/internal/backend"
+	"github.com/theboringhumane/grafeio/internal/config"
 	"github.com/theboringhumane/grafeio/internal/state"
 )
 
@@ -66,7 +79,24 @@ func main() {
 	answer := flag.Bool("answer", false, "auto-answer the first permission prompt with \"once\" and print the result")
 	ask := flag.Bool("ask", false, "live mode: question-loop probe — send the question-tool prompt, AnswerQuestion the first pending question after 2s, assert resolution (15s budget, QUESTION-LOOP: FIXED|STUCK)")
 	batchProbe := flag.Bool("batch-probe", false, "live mode: queue-flush batch probe — board-mirror 2 queue items, send one composed batch, assert the boss covers both (BATCH-PROBE: OK|FAIL)")
+	cfgPath := flag.String("cfg", "", "path to a brain.json for this run (else config.Load() honors GRAFEIO_HOME)")
+	efficiency := flag.Bool("efficiency", false, "simulate 11 board-poll cadence decisions (8 unchanged syncs, then a change) and print the exponential backoff, then exit")
 	flag.Parse()
+
+	if *efficiency {
+		runEfficiencySim()
+		return
+	}
+
+	// brain.json for this run. --cfg points at an explicit file; otherwise
+	// config.Load() reads (and first-boots) GRAFEIO_HOME/.grafeio/configs/
+	// brain.json — identical to how the UI binaries load it.
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		fail("config", err)
+	}
+	fmt.Printf("[cfg] boss=%q model=%q backend: server=%q agentmemoryUrl=%q agentmemoryPollS=%d\n",
+		cfg.Boss.Name, cfg.Boss.Model, cfg.Backend.Server, cfg.Backend.AgentmemoryURL, cfg.Backend.AgentmemoryPollS)
 
 	if *prompt2 != "" && *prompt == "" {
 		fmt.Fprintln(os.Stderr, "--prompt2 requires --prompt")
@@ -94,10 +124,10 @@ func main() {
 		if err != nil {
 			fail("getwd", err)
 		}
-		b = backend.NewLive("", dir)
+		b = backend.NewLive("", dir, cfg)
 		runFor = 3 * time.Second
 	} else if *demo {
-		b = backend.NewDemo()
+		b = backend.NewDemo(cfg)
 		runFor = 7200 * time.Millisecond
 	} else {
 		fmt.Fprintln(os.Stderr, "either --demo or --live is required")
@@ -497,6 +527,59 @@ func staleReproChecks(turn1, turn2 []string) int {
 type queueBoard interface {
 	QueueItemStart(index int, title string) string
 	QueueItemDone(boardID string)
+}
+
+// loadConfig resolves the run's brain.json: an explicit --cfg path wins
+// (defaults-filled, read-only — never written back), otherwise the standard
+// loader honors GRAFEIO_HOME like every other grafeio binary.
+func loadConfig(path string) (*config.Config, error) {
+	if path == "" {
+		return config.Load()
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	cfg := config.Default()
+	if err := json.Unmarshal(raw, cfg); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if cfg.Boss.Name == "" {
+		cfg.Boss.Name = "boss (oikonomos)"
+	}
+	if cfg.Backend.AgentmemoryURL == "" {
+		cfg.Backend.AgentmemoryURL = "http://localhost:3111"
+	}
+	return cfg, nil
+}
+
+// runEfficiencySim plays the agentmemory poll backoff with no server: 8
+// consecutive no-change syncs (interval doubles after every 5, capped at 4x
+// base), then a change (cadence snaps back to base). The printed lines are
+// byte-shaped exactly like the live backend's status messages so a live
+// probe can be grepped against the same wording later.
+func runEfficiencySim() {
+	base := 5 * time.Second
+	interval := base
+	noChange := 0
+	fmt.Printf("[efficiency] base poll %s; %d consecutive no-change syncs double the interval (cap %dx base)\n",
+		base.Round(time.Second), 5, 4)
+	for i := 1; i <= 11; i++ {
+		changed := i == 11
+		if changed {
+			fmt.Printf("[efficiency] #%d: change observed -> next poll in %s\n", i, base.Round(time.Second))
+			noChange, interval = 0, base
+			continue
+		}
+		noChange++
+		if next := backend.BackoffInterval(base, interval, noChange); next != interval {
+			interval = next
+			fmt.Printf("[efficiency] #%d no-change x%d -> next poll in %s (backoff)\n", i, noChange, interval.Round(time.Second))
+		} else {
+			fmt.Printf("[efficiency] #%d no-change x%d -> next poll in %s\n", i, noChange, interval.Round(time.Second))
+		}
+	}
+	fmt.Println("EFFICIENCY: OK")
 }
 
 func fail(stage string, err error) {

@@ -7,6 +7,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"github.com/theboringhumane/grafeio/internal/app"
 	"github.com/theboringhumane/grafeio/internal/backend"
 	"github.com/theboringhumane/grafeio/internal/chrome"
+	"github.com/theboringhumane/grafeio/internal/config"
 	"github.com/theboringhumane/grafeio/internal/office"
 	"github.com/theboringhumane/grafeio/internal/state"
 )
@@ -26,12 +28,30 @@ func main() {
 	server := flag.String("server", "", "opencode serve URL (attach, don't spawn)")
 	autokill := flag.Duration("autokill", 0, "exit after this duration (shots/CI)")
 	theme := flag.String("theme", "", "color theme: noir|paper|mono|dracula|solarized")
+	printCfg := flag.Bool("print-default-config", false, "print the default brain.json and exit")
 	flag.Parse()
+
+	if *printCfg {
+		b, _ := json.MarshalIndent(config.Default(), "", "  ")
+		fmt.Println(string(b))
+		fmt.Fprintln(os.Stderr, "(written to "+config.Path()+" on first run)")
+		return
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[grafeio] brain.json: %v (using defaults)\n", err)
+		cfg = config.Default()
+	}
 	if os.Getenv("GRAFEIO_SERVER") != "" && *server == "" {
 		*server = os.Getenv("GRAFEIO_SERVER")
 	}
+	// theme precedence: --theme flag > GRAFEIO_THEME > brain.json ui.theme > persisted > default
 	if os.Getenv("GRAFEIO_THEME") != "" && *theme == "" {
 		*theme = os.Getenv("GRAFEIO_THEME")
+	}
+	if *theme == "" {
+		*theme = cfg.UI.Theme
 	}
 	if *theme == "" {
 		*theme = chrome.LoadPersistedTheme()
@@ -44,12 +64,12 @@ func main() {
 
 	var b state.Backend
 	if *demo {
-		b = backend.NewDemo()
+		b = backend.NewDemo(cfg)
 	} else {
-		b = backend.NewLive(*server, mustGetwd())
+		b = backend.NewLive(*server, mustGetwd(), cfg)
 	}
 
-	p := tea.NewProgram(app.New(b))
+	p := tea.NewProgram(app.New(b, cfg))
 
 	// bridge backend goroutines -> tea loop
 	go func() {
