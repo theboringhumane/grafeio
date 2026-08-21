@@ -16,6 +16,8 @@ import (
 
 	"github.com/theboringhumane/grafeio/internal/app"
 	"github.com/theboringhumane/grafeio/internal/backend"
+	"github.com/theboringhumane/grafeio/internal/chrome"
+	"github.com/theboringhumane/grafeio/internal/office"
 	"github.com/theboringhumane/grafeio/internal/state"
 )
 
@@ -23,9 +25,21 @@ func main() {
 	demo := flag.Bool("demo", os.Getenv("GRAFEIO_DEMO") == "1", "run with simulated events")
 	server := flag.String("server", "", "opencode serve URL (attach, don't spawn)")
 	autokill := flag.Duration("autokill", 0, "exit after this duration (shots/CI)")
+	theme := flag.String("theme", "", "color theme: noir|paper|mono|dracula|solarized")
 	flag.Parse()
 	if os.Getenv("GRAFEIO_SERVER") != "" && *server == "" {
 		*server = os.Getenv("GRAFEIO_SERVER")
+	}
+	if os.Getenv("GRAFEIO_THEME") != "" && *theme == "" {
+		*theme = os.Getenv("GRAFEIO_THEME")
+	}
+	if *theme == "" {
+		*theme = chrome.LoadPersistedTheme()
+	}
+	if *theme != "" {
+		if chrome.SetTheme(*theme) {
+			office.SetTheme(*theme)
+		}
 	}
 
 	var b state.Backend

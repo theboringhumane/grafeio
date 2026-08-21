@@ -41,8 +41,11 @@ grafeio --server http://127.0.0.1:4096   # attach to an existing server
 - Scrolling everywhere (viewport), mouse wheel, multi-line input, typing
   spinner while the boss works.
 - New **activity** tab: rolling event log (dispatches, returns, blocks).
-- Native single binary. The Ink/Node v0.1 app is preserved under
-  [`node-legacy/`](node-legacy/) (tagged `node-v0.1.0`).
+- Native single binary. Themes: `--theme noir|paper|mono|dracula|solarized`
+  (also `/theme` in-app, persisted to `~/.config/grafeio/theme`).
+- Slash commands in chat: `/help /themes /theme <n> /thinking on|off
+  /tools on|off /status /clear /quit`.
+- The Ink/Node v0.1 app lived on as git tag `node-v0.1.0`.
 
 ## Behind the glass
 

@@ -26,9 +26,11 @@ import (
 const (
 	mailCap      = 30
 	chatCap      = 30
-	bubbleCap    = 3    // never more than 3 concurrent balloons (drop oldest)
-	sidebarW     = 44   // right tab sidebar, when the terminal is wide enough
-	degradeCols  = 100  // below this, the sidebar shrinks instead of the floor
+	thinkCap     = 20  // thinking blocks kept in chat
+	toolCap      = 20  // tool one-liners kept in chat
+	bubbleCap    = 3   // never more than 3 concurrent balloons (drop oldest)
+	sidebarW     = 44  // right tab sidebar, when the terminal is wide enough
+	degradeCols  = 100 // below this, the sidebar shrinks instead of the floor
 	minCols      = 40
 	minRows      = 12
 	tickInterval = 180 * time.Millisecond
@@ -52,14 +54,14 @@ type Model struct {
 	backend state.Backend
 	st      state.OfficeState
 
-	width, height       int
-	middleH             int
-	sidebar             int
-	floorW              int
-	tabs                *panels.Tabs
-	chat                *panels.Chat
-	activity            *panels.Activity
-	keys                KeyMap
+	width, height int
+	middleH       int
+	sidebar       int
+	floorW        int
+	tabs          *panels.Tabs
+	chat          *panels.Chat
+	activity      *panels.Activity
+	keys          KeyMap
 }
 
 // chatSentMsg fires after backend.Send succeeds — the local user bubble and
@@ -69,11 +71,20 @@ type chatSentMsg struct{ text string }
 // sendErrMsg fires when the backend rejects a prompt.
 type sendErrMsg struct{ err error }
 
+// slashMsg fires when the chat input starts with "/" — local command, never
+// sent to the backend.
+type slashMsg struct{ text string }
+
 // New builds the app around a backend. backend.Start is NOT called here —
 // main owns that (goroutine → tea.Program.Send).
 func New(b state.Backend) Model {
 	chat := panels.NewChat(func(text string) tea.Cmd {
 		return func() tea.Msg {
+			// Slash commands dispatch locally, never touch the backend, and
+			// never echo as chat-user.
+			if strings.HasPrefix(text, "/") {
+				return slashMsg{text: text}
+			}
 			if b != nil {
 				if err := b.Send(text); err != nil {
 					return sendErrMsg{err: err}
@@ -125,13 +136,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 	case chatSentMsg:
-		cmds = append(cmds, m.applyEvent(m.chatUserEvent(msg.text)))
-		cmds = append(cmds, m.applyEvent(m.chatBossPendingEvent()))
+		// nothing local: backend.Send owns the echo (chat-user + pending boss
+		// bubble) via the event stream — applying them here duplicated the bubbles.
 	case sendErrMsg:
 		cmds = append(cmds, m.applyEvent(state.Event{
 			Kind: state.EvStatus,
 			Text: fmt.Sprintf("[grafeio] send failed: %v", msg.err),
 		}))
+	case slashMsg:
+		if cmd := m.applySlash(msg.text); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	case state.Event:
 		cmds = append(cmds, m.applyEvent(msg))
 	default:
@@ -183,6 +198,11 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 	case "shift+tab":
 		m.tabs.Prev()
 		return nil
+	case "ctrl+t":
+		if chatActive {
+			m.chat.ToggleThink()
+			return nil
+		}
 	default:
 		if !chatActive {
 			if idx := m.keys.TabJump(msg.String()); idx >= 0 {
@@ -267,6 +287,45 @@ func capList[T any](list []T, maxN int) []T {
 	return list
 }
 
+// appendChat clones-and-appends one message (chat is never aliased with the
+// previous state).
+func appendChat(chat []state.ChatMsg, msg state.ChatMsg) []state.ChatMsg {
+	return append(append([]state.ChatMsg(nil), chat...), msg)
+}
+
+// capChat enforces the global chat cap AND the per-kind caps, so a stream of
+// thinking/tool entries can't drown out the conversation (each survives at
+// thinkCap/toolCap, oldest of the kind drops first).
+func capChat(chat []state.ChatMsg) []state.ChatMsg {
+	chat = capList(chat, chatCap)
+	chat = capKind(chat, "think", thinkCap)
+	chat = capKind(chat, "tool", toolCap)
+	return chat
+}
+
+// capKind keeps at most maxN entries of the given Kind, dropping the oldest.
+func capKind(chat []state.ChatMsg, kind string, maxN int) []state.ChatMsg {
+	n := 0
+	for _, m := range chat {
+		if m.Kind == kind {
+			n++
+		}
+	}
+	if n <= maxN {
+		return chat
+	}
+	drop := n - maxN
+	out := make([]state.ChatMsg, 0, len(chat)-drop)
+	for _, m := range chat {
+		if m.Kind == kind && drop > 0 {
+			drop--
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
 func upsertTask(tasks []state.BoardTask, task state.BoardTask) []state.BoardTask {
 	for i, t := range tasks {
 		if t.ID == task.ID {
@@ -298,52 +357,53 @@ func setEmployee(st state.OfficeState, id string, fn func(e *state.Employee)) st
 
 func reducer(st state.OfficeState, ev state.Event) state.OfficeState {
 	switch ev.Kind {
-	case state.EvTick: {
-		tick := st.Tick + 1
-		// drop expired balloons
-		var bubbles []state.SpeechBubble
-		for _, b := range st.Bubbles {
-			if b.UntilTick > tick {
-				bubbles = append(bubbles, b)
-			}
-		}
-		st.Tick = tick
-		st.Bubbles = bubbles
-		next := office.AdvanceSprites(st)
-
-		// ambient chatter: every ~140 ticks a random working non-manager speaks
-		if tick%ambientEvery == 0 {
-			var working []state.Employee
-			for _, e := range next.Employees {
-				if e.Role != state.RoleManager && e.Sprite == state.SpriteWorking {
-					working = append(working, e)
+	case state.EvTick:
+		{
+			tick := st.Tick + 1
+			// drop expired balloons
+			var bubbles []state.SpeechBubble
+			for _, b := range st.Bubbles {
+				if b.UntilTick > tick {
+					bubbles = append(bubbles, b)
 				}
 			}
-			if len(working) > 0 {
-				next = reducer(next, state.Event{
-					Kind:       state.EvBubble,
-					EmployeeID: working[rand.Intn(len(working))].ID,
-					Text:       ambientLines[rand.Intn(len(ambientLines))],
-				})
-			} else if tick%(ambientEvery*2) == 0 {
-				// nobody working: occasionally an idle one breaks the silence
-				var idle []state.Employee
+			st.Tick = tick
+			st.Bubbles = bubbles
+			next := office.AdvanceSprites(st)
+
+			// ambient chatter: every ~140 ticks a random working non-manager speaks
+			if tick%ambientEvery == 0 {
+				var working []state.Employee
 				for _, e := range next.Employees {
-					if e.Role != state.RoleManager && e.Sprite == state.SpriteAtDesk {
-						idle = append(idle, e)
+					if e.Role != state.RoleManager && e.Sprite == state.SpriteWorking {
+						working = append(working, e)
 					}
 				}
-				if len(idle) > 0 {
+				if len(working) > 0 {
 					next = reducer(next, state.Event{
 						Kind:       state.EvBubble,
-						EmployeeID: idle[rand.Intn(len(idle))].ID,
-						Text:       "quiet floor today.",
+						EmployeeID: working[rand.Intn(len(working))].ID,
+						Text:       ambientLines[rand.Intn(len(ambientLines))],
 					})
+				} else if tick%(ambientEvery*2) == 0 {
+					// nobody working: occasionally an idle one breaks the silence
+					var idle []state.Employee
+					for _, e := range next.Employees {
+						if e.Role != state.RoleManager && e.Sprite == state.SpriteAtDesk {
+							idle = append(idle, e)
+						}
+					}
+					if len(idle) > 0 {
+						next = reducer(next, state.Event{
+							Kind:       state.EvBubble,
+							EmployeeID: idle[rand.Intn(len(idle))].ID,
+							Text:       "quiet floor today.",
+						})
+					}
 				}
 			}
+			return next
 		}
-		return next
-	}
 
 	case state.EvHire:
 		for _, e := range st.Employees {
@@ -376,21 +436,22 @@ func reducer(st state.OfficeState, ev state.Event) state.OfficeState {
 		st.Bubbles = bubbles
 		return st
 
-	case state.EvDispatch: {
-		ownerName := ev.Task.Owner
-		if owner := findEmployee(st, ev.EmployeeID); owner != nil {
-			ownerName = owner.Name
+	case state.EvDispatch:
+		{
+			ownerName := ev.Task.Owner
+			if owner := findEmployee(st, ev.EmployeeID); owner != nil {
+				ownerName = owner.Name
+			}
+			task := ev.Task
+			task.Status = state.TaskInProgress
+			task.Owner = ownerName
+			st.Tasks = upsertTask(st.Tasks, task)
+			st = setEmployee(st, ev.EmployeeID, func(e *state.Employee) {
+				e.Sprite = state.SpriteToManager
+				e.Task = task.Title
+			})
+			return st
 		}
-		task := ev.Task
-		task.Status = state.TaskInProgress
-		task.Owner = ownerName
-		st.Tasks = upsertTask(st.Tasks, task)
-		st = setEmployee(st, ev.EmployeeID, func(e *state.Employee) {
-			e.Sprite = state.SpriteToManager
-			e.Task = task.Title
-		})
-		return st
-	}
 
 	case state.EvWorking:
 		ownerName := ""
@@ -446,7 +507,7 @@ func reducer(st state.OfficeState, ev state.Event) state.OfficeState {
 		return st
 
 	case state.EvChatUser:
-		st.Chat = capList(append(append([]state.ChatMsg(nil), st.Chat...), ev.Msg), chatCap)
+		st.Chat = capChat(appendChat(st.Chat, ev.Msg))
 		return st
 
 	case state.EvChatBoss:
@@ -457,8 +518,62 @@ func reducer(st state.OfficeState, ev state.Event) state.OfficeState {
 				rest = append(rest, mgr)
 			}
 		}
-		st.Chat = capList(append(rest, ev.Msg), chatCap)
+		st.BossThinking = false // a boss turn ends the thinking affordance
+		st.Chat = capChat(append(rest, ev.Msg))
 		return st
+
+	case state.EvThought:
+		{
+			// boss thoughts: thinking flag + a chat entry (Kind "think", cap 20).
+			// employee thoughts: activity line only, no chat.
+			if ev.EmployeeID != "boss" {
+				return st
+			}
+			st.BossThinking = !ev.Done
+			st.Chat = capChat(appendChat(st.Chat, state.ChatMsg{
+				ID:   "think-" + nextMsgID(),
+				From: "boss",
+				Kind: "think",
+				Text: ev.Text,
+				At:   time.Now().UnixMilli(),
+			}))
+			return st
+		}
+
+	case state.EvTool:
+		{
+			// tool one-liners merge by CallID: running → done replaces the line.
+			name := ev.EmployeeName
+			if name == "" {
+				name = "boss"
+			}
+			text := ev.ToolName
+			if ev.ToolSummary != "" {
+				text += " · " + ev.ToolSummary
+			}
+			line := state.ChatMsg{
+				ID:   "tool-" + ev.CallID,
+				From: name,
+				Kind: "tool",
+				Text: strings.ReplaceAll(text, "\n", " "), // chat rows are one-liners
+				Meta: ev.ToolState,
+				At:   time.Now().UnixMilli(),
+			}
+			merged := false
+			next := append([]state.ChatMsg(nil), st.Chat...)
+			for i, msg := range next {
+				if msg.Kind == "tool" && msg.ID == line.ID {
+					next[i] = line
+					merged = true
+					break
+				}
+			}
+			if !merged {
+				next = append(next, line)
+			}
+			st.Chat = capChat(next)
+			return st
+		}
 
 	case state.EvBubble:
 		ttl := ev.TTL
@@ -503,22 +618,117 @@ func nextMsgID() string {
 	return fmt.Sprintf("c%d", msgSeq.Add(1))
 }
 
-func (m *Model) chatUserEvent(text string) state.Event {
-	return state.Event{Kind: state.EvChatUser, Msg: state.ChatMsg{
-		ID:   nextMsgID(),
-		From: "user",
-		Text: text,
-		At:   time.Now().UnixMilli(),
-	}}
+// --- slash commands (local, never sent to the backend) ---------------------
+
+// slashHelp is the /help notice body (office-rendered, dim).
+const slashHelp = `commands:
+  /help              this list
+  /clear             empty the chat
+  /theme <name>      switch theme (persists)
+  /themes            list themes
+  /thinking on|off   show/hide thinking blocks
+  /tools on|off      show/hide tool one-liners
+  /status            office status
+  /quit              exit grafeio`
+
+// applySlash dispatches one slash command. Slash input never echoes as
+// chat-user; every outcome surfaces as a From "office" chat notice.
+func (m *Model) applySlash(input string) tea.Cmd {
+	fields := strings.Fields(strings.TrimSpace(input))
+	if len(fields) == 0 {
+		return nil
+	}
+	cmd := strings.ToLower(fields[0])
+	switch cmd {
+	case "/help":
+		m.notice(slashHelp)
+	case "/clear":
+		m.st.Chat = nil
+		m.tabs.SetState(m.st)
+	case "/theme":
+		if len(fields) < 2 {
+			m.noticeErr("/theme: usage /theme <name>  (" + strings.Join(chrome.ThemeNames(), ", ") + ")")
+			return nil
+		}
+		name := fields[1]
+		if !chrome.SetTheme(name) {
+			m.noticeErr(fmt.Sprintf("/theme: unknown theme %q (/themes)", name))
+			return nil
+		}
+		_ = chrome.PersistTheme() // best effort
+		office.SetTheme(name) // floor palette follows chrome
+		m.chat.RefreshTheme()
+		m.tabs.SetState(m.st)
+		m.notice("theme → " + chrome.CurrentTheme().Name)
+	case "/themes":
+		m.notice("themes: " + strings.Join(chrome.ThemeNames(), "  ") +
+			"  (current: " + chrome.CurrentTheme().Name + ")")
+	case "/thinking":
+		m.applyToggle("/thinking", fields, func(on bool) {
+			m.chat.SetShowThinking(on)
+		})
+	case "/tools":
+		m.applyToggle("/tools", fields, func(on bool) {
+			m.chat.SetShowTools(on)
+		})
+	case "/status":
+		var pend, doing, done int
+		for _, t := range m.st.Tasks {
+			switch t.Status {
+			case state.TaskPending:
+				pend++
+			case state.TaskInProgress:
+				doing++
+			case state.TaskDone:
+				done++
+			}
+		}
+		m.notice(fmt.Sprintf("mode %s · theme %s · agents %d · board %d/%d/%d\n%s",
+			m.st.Mode, chrome.CurrentTheme().Name, len(m.st.Employees),
+			pend, doing, done, m.st.StatusLine))
+	case "/quit":
+		return tea.Quit
+	default:
+		m.noticeErr(fmt.Sprintf("/ %s: no such command (/help)", strings.TrimPrefix(cmd, "/")))
+	}
+	return nil
 }
 
-func (m *Model) chatBossPendingEvent() state.Event {
-	return state.Event{Kind: state.EvChatBoss, Msg: state.ChatMsg{
-		ID:      nextMsgID(),
-		From:    "boss",
-		At:      time.Now().UnixMilli(),
-		Pending: true,
-	}}
+// applyToggle parses "on|off" for a two-state slash command.
+func (m *Model) applyToggle(name string, fields []string, set func(bool)) {
+	if len(fields) < 2 || (fields[1] != "on" && fields[1] != "off") {
+		m.noticeErr(name + ": usage " + name + " on|off")
+		return
+	}
+	on := fields[1] == "on"
+	set(on)
+	stateWord := "on"
+	if !on {
+		stateWord = "off (hidden)"
+	}
+	m.tabs.SetState(m.st)
+	m.notice(name + " → " + stateWord)
+}
+
+// notice appends a dim local notice (From "office") to the chat.
+func (m *Model) notice(text string) {
+	m.appendNotice(text, "")
+}
+
+// noticeErr appends a red local notice (From "office", Meta "error").
+func (m *Model) noticeErr(text string) {
+	m.appendNotice(text, "error")
+}
+
+func (m *Model) appendNotice(text, meta string) {
+	m.st.Chat = capChat(appendChat(m.st.Chat, state.ChatMsg{
+		ID:   nextMsgID(),
+		From: "office",
+		Text: text,
+		Meta: meta,
+		At:   time.Now().UnixMilli(),
+	}))
+	m.tabs.SetState(m.st)
 }
 
 // --- activity descriptions --------------------------------------------------
@@ -582,6 +792,26 @@ func (m *Model) describeEvent(ev state.Event) string {
 			name = e.Name
 		}
 		what = fmt.Sprintf("%s says %q", name, ev.Text)
+	case state.EvThought:
+		name := ev.EmployeeName
+		if name == "" {
+			name = ev.EmployeeID
+		}
+		what = "think — " + name + ": " + clipRunes(ev.Text, 60)
+	case state.EvTool:
+		name := ev.EmployeeName
+		if name == "" {
+			name = "boss"
+		}
+		toolState := ev.ToolState
+		if toolState == "" {
+			toolState = "running"
+		}
+		text := ev.ToolName
+		if ev.ToolSummary != "" {
+			text += " · " + ev.ToolSummary
+		}
+		what = fmt.Sprintf("tool — %s: %s (%s)", name, text, toolState)
 	case state.EvStatus:
 		what = "status — " + ev.Text
 	default:
@@ -590,4 +820,15 @@ func (m *Model) describeEvent(ev state.Event) string {
 	// keep each row single-line for the log
 	what = strings.ReplaceAll(what, "\n", " ")
 	return fmt.Sprintf("[%s] %s", stamp, what)
+}
+
+// clipRunes truncates machine text (activity descriptions) to n runes with
+// an ellipsis — display layout, not NL.
+func clipRunes(s string, n int) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-1]) + "…"
 }

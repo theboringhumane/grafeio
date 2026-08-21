@@ -37,12 +37,28 @@ type ocMessage struct {
 	} `json:"time"`
 }
 
+// ocPart covers the Part union fields the mapping reads (ReasoningPart /
+// ToolPart / TextPart — see @opencode-ai/sdk gen/types.gen.d.ts).
 type ocPart struct {
 	ID        string `json:"id"`
 	SessionID string `json:"sessionID"`
 	MessageID string `json:"messageID"`
 	Type      string `json:"type"`
 	Text      string `json:"text"`
+	// ToolPart
+	CallID string `json:"callID"`
+	Tool   string `json:"tool"`
+	State  struct {
+		Status string         `json:"status"` // pending | running | completed | error
+		Title  string         `json:"title"`
+		Input  map[string]any `json:"input"`
+		Error  string         `json:"error"`
+	} `json:"state"`
+	// ReasoningPart typing: start is always present; end set on completion.
+	Time struct {
+		Start int64 `json:"start"`
+		End   int64 `json:"end"`
+	} `json:"time"`
 }
 
 type ocPermission struct {
@@ -197,6 +213,105 @@ func (ctx *normCtx) throttledWorking(employeeID, taskID string, now int64, force
 	return []state.Event{{Kind: state.EvWorking, EmployeeID: employeeID, TaskID: taskID}}
 }
 
+// mapReasoningPart: a ReasoningPart from the PRIMARY session is the boss
+// thinking out loud; from a child session it is that employee thinking.
+// Done is set when the part's time.end lands (the SDK stamps it on the
+// completed update). Empty text with no completion stamp is noise — skip.
+// Text is trimmed and capped at 400 chars. CallID carries the part id so
+// the UI can replace streaming updates of the same thought.
+func mapReasoningPart(part ocPart, ctx *normCtx, primaryID string) []state.Event {
+	text := strings.TrimSpace(part.Text)
+	done := part.Time.End != 0
+	if text == "" && !done {
+		return nil
+	}
+	if len([]rune(text)) > 400 {
+		text = sliceMax(text, 397) + "..."
+	}
+	var empID, empName string
+	if part.SessionID == primaryID {
+		empID, empName = "boss", "boss"
+	} else if emp, ok := ctx.employees[part.SessionID]; ok {
+		empID, empName = emp.ID, emp.Name
+	} else {
+		return nil
+	}
+	return []state.Event{{
+		Kind:         state.EvThought,
+		EmployeeID:   empID,
+		EmployeeName: empName,
+		Text:         text,
+		CallID:       part.ID,
+		Done:         done,
+	}}
+}
+
+// mapToolPart surfaces a ToolPart (read/grep/glob/bash/write/edit/task/...)
+// as floor-visible work. ToolState maps the SDK union: pending/running ->
+// "running", completed -> "done", error -> "error". The part's callID is
+// the dedupe key — running and done updates share it.
+func mapToolPart(part ocPart, ctx *normCtx, primaryID string) (state.Event, bool) {
+	toolState := "running"
+	switch part.State.Status {
+	case "completed":
+		toolState = "done"
+	case "error":
+		toolState = "error"
+	}
+	var empID, empName string
+	if part.SessionID == primaryID {
+		empID, empName = "boss", "boss"
+	} else if emp, ok := ctx.employees[part.SessionID]; ok {
+		empID, empName = emp.ID, emp.Name
+	} else {
+		return state.Event{}, false
+	}
+	callID := part.CallID
+	if callID == "" {
+		callID = part.ID
+	}
+	return state.Event{
+		Kind:         state.EvTool,
+		EmployeeID:   empID,
+		EmployeeName: empName,
+		ToolName:     part.Tool,
+		ToolSummary:  toolSummary(part),
+		ToolState:    toolState,
+		CallID:       callID,
+	}, true
+}
+
+// toolSummary is the one-liner under a tool glyph: the opencode title when
+// the state carries one (completed grep reads "N matches" etc.), else the
+// most specific input field — filePath, pattern, command, path, then any
+// short string value. Capped at 60 chars; never the raw JSON.
+func toolSummary(part ocPart) string {
+	s := strings.TrimSpace(part.State.Title)
+	if s == "" {
+		for _, key := range []string{"filePath", "pattern", "command", "path", "query", "url"} {
+			if v, ok := part.State.Input[key].(string); ok && strings.TrimSpace(v) != "" {
+				s = strings.TrimSpace(v)
+				break
+			}
+		}
+	}
+	if s == "" {
+		for _, v := range part.State.Input {
+			if str, ok := v.(string); ok && strings.TrimSpace(str) != "" {
+				s = strings.TrimSpace(str)
+				break
+			}
+		}
+	}
+	if err := strings.TrimSpace(part.State.Error); err != "" && part.State.Status == "error" {
+		s = strings.Join(strings.Fields(err), " ")
+	}
+	if s == "" {
+		return "working"
+	}
+	return shortTitle(s, 60)
+}
+
 // mapOCEvent is the ONE pure mapping entry point. primaryID identifies the
 // boss session; everything with parentID == primaryID is an employee.
 //
@@ -204,7 +319,13 @@ func (ctx *normCtx) throttledWorking(employeeID, taskID string, now int64, force
 //
 //	session.created (parentID = primary)   -> hire + dispatch
 //	session.updated (known child, title)   -> task upsert (retitle)
-//	message.part.updated (child)           -> working (throttled 500ms/employee)
+//	message.part.updated (reasoning, primary) -> thought (boss mind)
+//	message.part.updated (reasoning, child)   -> thought (employee mind)
+//	message.part.updated (tool, any)       -> tool run/done/error (+ child working pulse)
+//	message.part.updated (child, other)    -> working (throttled 500ms/employee)
+//	message.updated (primary, ANY role)    -> [] — the primary's own user
+//		message must NEVER echo as chat-user (Send() owns the only
+//		chat-user echo; kids' briefs are not chat)
 //	message.updated (child, assistant)     -> working
 //	session.status idle (child)            -> [] here (backend fetches -> returned+mail)
 //	permission.updated (child)             -> blocked {note}
@@ -263,11 +384,28 @@ func mapOCEvent(raw ocSSEEvent, ctx *normCtx, primaryID string, now int64) []sta
 		if json.Unmarshal(raw.Properties, &p) != nil {
 			return nil
 		}
-		emp, ok := ctx.employees[p.Part.SessionID]
-		if !ok || ctx.returned[p.Part.SessionID] {
+		part := p.Part
+		// The boss mind, live: reasoning + tool parts stream into the office.
+		// Children get the same treatment, labelled with their desk name.
+		switch part.Type {
+		case "reasoning":
+			return mapReasoningPart(part, ctx, primaryID)
+		case "tool":
+			ev, ok := mapToolPart(part, ctx, primaryID)
+			if !ok {
+				return nil
+			}
+			// A child running a tool also drives the typing pulse it always did.
+			if emp, isEmp := ctx.employees[part.SessionID]; isEmp && !ctx.returned[part.SessionID] {
+				return append([]state.Event{ev}, ctx.throttledWorking(emp.ID, ctx.tasks[part.SessionID].ID, now, false)...)
+			}
+			return []state.Event{ev}
+		}
+		emp, ok := ctx.employees[part.SessionID]
+		if !ok || ctx.returned[part.SessionID] {
 			return nil
 		}
-		return ctx.throttledWorking(emp.ID, ctx.tasks[p.Part.SessionID].ID, now, false)
+		return ctx.throttledWorking(emp.ID, ctx.tasks[part.SessionID].ID, now, false)
 
 	case "message.updated":
 		var p struct {
@@ -278,7 +416,10 @@ func mapOCEvent(raw ocSSEEvent, ctx *normCtx, primaryID string, now int64) []sta
 		}
 		info := p.Info
 		if info.SessionID == primaryID {
-			return nil // boss completion needs a fetch — backend handles it
+			// Boss completion needs a fetch — the backend handles it.
+			// User-role messages on the primary are the member's own chat,
+			// already echoed exactly once by Send() — NEVER echoed here.
+			return nil
 		}
 		emp, ok := ctx.employees[info.SessionID]
 		if !ok || info.Role != "assistant" || ctx.returned[info.SessionID] {

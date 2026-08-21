@@ -42,6 +42,54 @@ var ansiColors = map[string]string{
 	"whiteBright": "15",
 }
 
+// floorThemes remap the canonical floor colors per UI theme. The floor paints
+// with chalk names; themes translate them. Values may be ANSI codes or hex —
+// lipgloss.Color accepts both.
+var floorThemes = map[string]map[string]string{
+	"noir": nil, // identity — the hand-tuned default
+	"paper": {
+		"gray": "240", "grey": "240", "white": "238", "whiteBright": "255",
+	},
+	"mono": {
+		"red": "7", "green": "7", "yellow": "15", "blue": "7", "magenta": "7",
+		"cyan": "7", "white": "15", "gray": "8", "grey": "8", "redBright": "15",
+		"greenBright": "7", "yellowBright": "15", "blueBright": "7",
+		"magentaBright": "7", "cyanBright": "7", "whiteBright": "15", "black": "8",
+	},
+	"dracula": {
+		"yellow": "#f1fa8c", "red": "#ff5555", "cyan": "#8be9fd",
+		"green": "#50fa7b", "blue": "#8be9fd", "magenta": "#bd93f9",
+		"magentaBright": "#bd93f9", "blueBright": "#8be9fd", "cyanBright": "#8be9fd",
+		"gray": "#6272a4", "grey": "#6272a4", "white": "#f8f8f2",
+		"whiteBright": "#f8f8f2",
+	},
+	"solarized": {
+		"yellow": "#b58900", "red": "#dc322f", "cyan": "#2aa198",
+		"green": "#859900", "blue": "#268bd2", "magenta": "#d33682",
+		"magentaBright": "#d33682", "blueBright": "#268bd2", "cyanBright": "#2aa198",
+		"gray": "#586e75", "grey": "#586e75", "white": "#93a1a1",
+		"whiteBright": "#eee8d5",
+	},
+}
+
+var ansiColorsBase = ansiColors // pristine default for theme resets
+
+// SetTheme re-points the floor's color map at the given theme. Unknown names
+// restore the default noir palette (never errors).
+func SetTheme(name string) {
+	m := ansiColorsBase
+	if alt, ok := floorThemes[name]; ok && alt != nil {
+		m = map[string]string{}
+		for k, v := range ansiColorsBase {
+			m[k] = v
+		}
+		for k, v := range alt {
+			m[k] = v
+		}
+	}
+	ansiColors = m
+}
+
 type Point struct {
 	X int
 	Y int

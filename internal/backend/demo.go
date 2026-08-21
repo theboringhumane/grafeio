@@ -29,8 +29,8 @@ type demoBackend struct {
 	mu          sync.Mutex // guards the demo board state below
 	roster      []state.Employee
 	taskByID    map[string]state.BoardTask
-	active      []string          // employees on a brief (receives pulses)
-	blockedIDs  map[string]bool   // waving at the mailbox, not typing
+	active      []string        // employees on a brief (receives pulses)
+	blockedIDs  map[string]bool // waving at the mailbox, not typing
 	pulseIdx    int
 	ambientBeat int
 	adHocSeq    int
@@ -54,9 +54,11 @@ func demoEmployee(id string, role state.EmployeeRole, seat string) state.Employe
 // ---------------------------------------------------------------- start
 
 // Start replays the office day: floor opens at t0, first briefs at 400ms,
-// a third hire at 1s, returns at 2.5s/4s/6.5s, a permission block at 5.5s,
-// ambient chatter bubbles at 3s/5s, coffee drift at 7s, then the ambient
-// loop forever. Working pulses fire round-robin every 700ms.
+// a third hire at 1s, a boss thought at 1.6s (done 2.2s), a boss grep at
+// 2.4s, returns at 2.5s/4s/6.5s, a permission block at 5.5s, tekton-1's
+// read at 5.8s (done 6.2s), ambient chatter bubbles at 3s/5s, coffee drift
+// at 7s, then the ambient loop forever. Working pulses fire round-robin
+// every 700ms.
 func (b *demoBackend) Start(emit func(state.Event)) error {
 	b.fl.setEmit(emit)
 
@@ -77,6 +79,32 @@ func (b *demoBackend) Start(emit func(state.Event)) error {
 	b.fl.at(1*time.Second, func() {
 		b.hire(demoEmployee("tekton-2", state.RoleDeveloper, "desk-3"))
 		b.dispatch("t3", "Draft the demo smoke script", "tekton-2")
+	})
+
+	// t+1.6s -> t+2.2s: the boss thinks out loud before tool work starts.
+	b.fl.at(1600*time.Millisecond, func() {
+		b.fl.emit(state.Event{Kind: state.EvThought, EmployeeID: "boss", EmployeeName: "boss",
+			Text: "planning the dispatch...", CallID: "demo-thought-1", Done: false})
+	})
+	b.fl.at(2200*time.Millisecond, func() {
+		b.fl.emit(state.Event{Kind: state.EvThought, EmployeeID: "boss", EmployeeName: "boss",
+			Text: "planning the dispatch...", CallID: "demo-thought-1", Done: true})
+	})
+
+	// t+2.4s: the boss's own grep lands, done in the same beat.
+	b.fl.at(2400*time.Millisecond, func() {
+		b.fl.emit(state.Event{Kind: state.EvTool, EmployeeID: "boss", EmployeeName: "boss",
+			ToolName: "grep", ToolSummary: "GRAFEIO_*, 12 hits", ToolState: "done", CallID: "demo-call-1"})
+	})
+
+	// t+5.8s -> t+6.2s: tekton-1 reads the file they were blocked on earlier.
+	b.fl.at(5800*time.Millisecond, func() {
+		b.fl.emit(state.Event{Kind: state.EvTool, EmployeeID: "tekton-1", EmployeeName: "tekton-1",
+			ToolName: "read", ToolSummary: "src/index.ts", ToolState: "running", CallID: "demo-call-2"})
+	})
+	b.fl.at(6200*time.Millisecond, func() {
+		b.fl.emit(state.Event{Kind: state.EvTool, EmployeeID: "tekton-1", EmployeeName: "tekton-1",
+			ToolName: "read", ToolSummary: "src/index.ts", ToolState: "done", CallID: "demo-call-2"})
 	})
 
 	// Working pulses: typing frames for whoever is on a brief, round-robin.

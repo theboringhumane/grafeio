@@ -3,6 +3,10 @@
 //	grafeio-headless            demo backend (default), ~7.2s of events, exit 0
 //	grafeio-headless --live     real `opencode serve` spawn + agentmemory probe,
 //	                            print startup events for 3s, stop, exit 0
+//	grafeio-headless --live --prompt "text"
+//	                            send the prompt once the primary session is
+//	                            ready, run 14s so thought/tool events + the
+//	                            boss reply stream through, stop, exit 0
 //
 // Every state.Event is printed as one line (kind + key fields) so a smoke
 // run can assert the floor contract without a renderer.
@@ -22,6 +26,7 @@ import (
 func main() {
 	demo := flag.Bool("demo", true, "run the scripted demo backend (default)")
 	live := flag.Bool("live", false, "spawn a real opencode serve and run live for 3s")
+	prompt := flag.String("prompt", "", "live mode: send this prompt after the primary session is ready and run 14s")
 	flag.Parse()
 
 	var b state.Backend
@@ -33,6 +38,9 @@ func main() {
 		}
 		b = backend.NewLive("", dir)
 		runFor = 3 * time.Second
+		if *prompt != "" {
+			runFor = 14 * time.Second
+		}
 	} else if *demo {
 		b = backend.NewDemo()
 		runFor = 7200 * time.Millisecond
@@ -59,6 +67,19 @@ func main() {
 	fmt.Printf("[mode] %s\n", b.Mode())
 	if err := b.Start(emit); err != nil {
 		fail("start", err)
+	}
+
+	// --prompt: Start only returns after the primary session exists, so the
+	// prompt is safe to send immediately.
+	if *prompt != "" {
+		if !*live {
+			fmt.Fprintln(os.Stderr, "--prompt requires --live")
+			os.Exit(2)
+		}
+		fmt.Printf("[prompt] %q\n", *prompt)
+		if err := b.Send(*prompt); err != nil {
+			fail("send", err)
+		}
 	}
 
 	time.Sleep(runFor)
@@ -110,6 +131,10 @@ func printEvent(e state.Event) {
 		fmt.Printf("[chat-boss] %s pending=%v %q\n", e.Msg.ID, e.Msg.Pending, trunc(e.Msg.Text, 120))
 	case state.EvBubble:
 		fmt.Printf("[bubble] %s %q\n", e.EmployeeID, e.Text)
+	case state.EvThought:
+		fmt.Printf("[thought] %s done=%v %q\n", e.EmployeeName, e.Done, trunc(e.Text, 120))
+	case state.EvTool:
+		fmt.Printf("[tool] %s %s %s %q\n", e.EmployeeName, e.ToolName, e.ToolState, trunc(e.ToolSummary, 80))
 	default:
 		fmt.Printf("[%s]\n", e.Kind)
 	}

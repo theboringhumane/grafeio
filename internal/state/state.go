@@ -47,11 +47,11 @@ const (
 )
 
 type BoardTask struct {
-	ID    string     `json:"id"`
-	Title string     `json:"title"`
+	ID     string     `json:"id"`
+	Title  string     `json:"title"`
 	Status TaskStatus `json:"status"`
-	Owner string     `json:"owner,omitempty"`
-	At    int64      `json:"at"`
+	Owner  string     `json:"owner,omitempty"`
+	At     int64      `json:"at"`
 }
 
 type MailKind string
@@ -79,6 +79,11 @@ type ChatMsg struct {
 	Text    string `json:"text"`
 	At      int64  `json:"at"`
 	Pending bool   `json:"pending,omitempty"`
+	// Kind — "user" | "boss" | "think" | "tool". Empty "" keeps existing
+	// literals valid (classic user/boss chat).
+	Kind string `json:"kind,omitempty"`
+	// Meta — short decoration, e.g. "read · src/main.go". Empty for plain chat.
+	Meta string `json:"meta,omitempty"`
 }
 
 // SpeechBubble — ambient office chatter balloon, expires after ttl ticks.
@@ -105,6 +110,9 @@ type OfficeState struct {
 	Mode       Mode           `json:"mode"`
 	StatusLine string         `json:"statusLine"`
 	Tick       int            `json:"tick"`
+	// BossThinking — the primary session is between a prompt and its reply,
+	// with a live EvThought open. UI dims the desk glyph / shows a spinner.
+	BossThinking bool `json:"bossThinking,omitempty"`
 }
 
 // EventKind — Go has no tagged unions; one Event struct with a Kind + optional fields.
@@ -122,6 +130,8 @@ const (
 	EvMail      EventKind = "mail"
 	EvChatUser  EventKind = "chat-user"
 	EvChatBoss  EventKind = "chat-boss"
+	EvThought   EventKind = "thought"
+	EvTool      EventKind = "tool"
 	EvBubble    EventKind = "bubble"
 	EvStatus    EventKind = "status"
 	EvTick      EventKind = "tick"
@@ -137,8 +147,18 @@ type Event struct {
 	TaskID     string    `json:"taskId,omitempty"`     // working/returned
 	Mail       MailItem  `json:"mail,omitempty"`       // returned/mail
 	Msg        ChatMsg   `json:"msg,omitempty"`        // chat-user/chat-boss
-	Text       string    `json:"text,omitempty"`       // status note / bubble text
+	Text       string    `json:"text,omitempty"`       // status note / bubble text / thought text
 	TTL        int       `json:"ttl,omitempty"`        // bubble
+	// EmployeeName — human label for the actor. The backend fills it from
+	// the employee registry ("boss" for the primary session, "tekton-1"
+	// etc. for children) so the UI never has to resolve an ID back to a name.
+	EmployeeName string `json:"employeeName,omitempty"` // thought/tool
+	// Tool fields (EvTool).
+	ToolName    string `json:"toolName,omitempty"`
+	ToolSummary string `json:"toolSummary,omitempty"` // e.g. "src/main.go" or "GRAFEIO_*, 12 hits"
+	ToolState   string `json:"toolState,omitempty"`   // "running" | "done" | "error"
+	CallID      string `json:"callId,omitempty"`      // part/call id for dedupe
+	Done        bool   `json:"done,omitempty"`        // thought completion
 }
 
 // Backend — one per run. Demo scripted, live via opencode serve + agentmemory.

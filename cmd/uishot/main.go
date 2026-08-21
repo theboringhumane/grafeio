@@ -1,11 +1,14 @@
 // uishot — deterministic UI shot harness for Grafeio v2.
 //
 // Runs the REAL app model against a scripted stub backend (fixed event
-// script: hires/dispatches/working/returned+mail/blocked/bubbles and two
-// chat rounds — one boss reply contains markdown). Fixed 130x32, ~4s, then
-// prints the final frame between ===== UI SHOT ===== markers.
+// script: hires/dispatches/working/returned+mail/blocked/bubbles, boss
+// EvThought + EvTool chains, and two chat rounds — one boss reply contains
+// markdown). Fixed 130x32, ~4s, then prints the final frame between
+// ===== UI SHOT ===== markers.
 //
 //	go run ./cmd/uishot [--tab chat|agents|board|mail|activity]
+//	                    [--theme noir|paper|mono|dracula|solarized]
+//	                    [--slash]   (also simulates typing /theme + /themes)
 package main
 
 import (
@@ -13,11 +16,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/theboringhumane/grafeio/internal/app"
+	"github.com/theboringhumane/grafeio/internal/chrome"
 	"github.com/theboringhumane/grafeio/internal/state"
 )
 
@@ -46,7 +51,8 @@ func mail(id, from, to, subject, body string, kind state.MailKind) state.MailIte
 }
 
 func chatMsg(id, from, text string, pending bool) state.ChatMsg {
-	return state.ChatMsg{ID: id, From: from, Text: text, At: time.Now().UnixMilli(), Pending: pending}
+	return state.ChatMsg{ID: id, From: from, Kind: from, Text: text,
+		At: time.Now().UnixMilli(), Pending: pending}
 }
 
 // script — fixed ABSOLUTE times (ms from start), fixed payloads;
@@ -68,20 +74,36 @@ func (b *stubBackend) script() {
 	at(400, state.Event{Kind: state.EvHire, Employee: state.Employee{
 		ID: "rev-1", Name: "dikastes", Role: state.RoleReviewer, Sprite: state.SpriteAtDesk}})
 
-	// round 1: user asks, boss thinks, boss answers with markdown
+	// round 1: user asks, boss THINKS (visible, collapsed by default), boss
+	// answers with markdown — with a boss tool chain merging running → done.
 	at(550, state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
 		"make hello.html — dark navy, white text", false)})
 	at(600, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("b0", "boss", "", true)})
-	at(700, state.Event{Kind: state.EvDispatch, EmployeeID: "dev-1",
+	at(650, state.Event{Kind: state.EvThought, EmployeeID: "boss", EmployeeName: "boss",
+		Text: "single file, no build step.\ndark navy bg, white text — keep it simple.", Done: false})
+	at(720, state.Event{Kind: state.EvThought, EmployeeID: "dev-1", EmployeeName: "tekton-1",
+		Text: "activity-line-only thought (employee — no chat entry)", Done: false})
+	at(780, state.Event{Kind: state.EvTool, EmployeeID: "boss", EmployeeName: "boss",
+		ToolName: "write", ToolSummary: "hello.html", ToolState: "running", CallID: "call-1"})
+	at(900, state.Event{Kind: state.EvTool, EmployeeID: "boss", EmployeeName: "boss",
+		ToolName: "write", ToolSummary: "hello.html", ToolState: "done", CallID: "call-1"})
+	at(1000, state.Event{Kind: state.EvThought, EmployeeID: "boss", EmployeeName: "boss",
+		Text: "deck the reply with a list and a code fence so markdown shows.", Done: true})
+	at(1080, state.Event{Kind: state.EvDispatch, EmployeeID: "dev-1",
 		Task: state.BoardTask{ID: "t1", Title: "build hello.html", At: time.Now().UnixMilli()}})
-	at(950, state.Event{Kind: state.EvWorking, EmployeeID: "dev-1", TaskID: "t1"})
+	at(1150, state.Event{Kind: state.EvWorking, EmployeeID: "dev-1", TaskID: "t1"})
 	at(1200, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("b1", "boss", bossReplyMD, false)})
 
 	at(1400, state.Event{Kind: state.EvDispatch, EmployeeID: "sco-1",
 		Task: state.BoardTask{ID: "t2", Title: "scan the repo", At: time.Now().UnixMilli()}})
+	// employee tool chain: running → done for a non-boss employee
+	at(1500, state.Event{Kind: state.EvTool, EmployeeID: "dev-1", EmployeeName: "tekton-1",
+		ToolName: "read", ToolSummary: "src/main.go", ToolState: "running", CallID: "call-2"})
 	at(1600, state.Event{Kind: state.EvBubble, EmployeeID: "dev-1",
 		Text: "this diff is a crime scene.", TTL: 40})
 	at(1800, state.Event{Kind: state.EvWorking, EmployeeID: "sco-1", TaskID: "t2"})
+	at(1900, state.Event{Kind: state.EvTool, EmployeeID: "dev-1", EmployeeName: "tekton-1",
+		ToolName: "read", ToolSummary: "src/main.go", ToolState: "done", CallID: "call-2"})
 
 	// a return: desk walk + done task + return mail
 	at(2100, state.Event{Kind: state.EvReturned, EmployeeID: "dev-1", TaskID: "t1",
@@ -123,9 +145,42 @@ func (b *stubBackend) Send(_ string) error {
 
 func (b *stubBackend) Stop() error { return nil }
 
+// slashWorkload simulates the user typing a slash command into the chat
+// textarea and hitting Enter — proving slash dispatch never hits the backend
+// and the office notice renders. It types /theme dracula (switch + persist),
+// then /themes (listing notice) — they land before the 3050ms pending lock.
+func slashWorkload(p *tea.Program) {
+	typeLine := func(s string) {
+		for _, r := range s {
+			p.Send(tea.KeyPressMsg(tea.Key{Code: r, Text: string(r)}))
+			time.Sleep(10 * time.Millisecond)
+		}
+		p.Send(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+		time.Sleep(80 * time.Millisecond)
+	}
+	time.Sleep(1950 * time.Millisecond)
+	typeLine("/theme dracula")
+	typeLine("/themes")
+}
+
 func main() {
 	tab := flag.String("tab", defaultTab, "active tab: chat|agents|board|mail|activity")
+	theme := flag.String("theme", "", "force a ui theme: "+strings.Join(chrome.ThemeNames(), "|"))
+	slash := flag.Bool("slash", false, "simulate typing /theme dracula + /themes (exercises slash dispatch + theme persist)")
 	flag.Parse()
+
+	// slash keystrokes only reach the textarea on the chat tab
+	if *slash && *tab == defaultTab {
+		*tab = "chat"
+	}
+
+	if *theme != "" {
+		if !chrome.SetTheme(*theme) {
+			fmt.Fprintf(os.Stderr, "uishot: unknown theme %q (%s)\n", *theme,
+				strings.Join(chrome.ThemeNames(), ", "))
+			os.Exit(2)
+		}
+	}
 
 	backend := &stubBackend{done: make(chan struct{})}
 	m := app.New(backend)
@@ -144,6 +199,9 @@ func main() {
 	// satisfies the empty tea.Msg/uv.Event interface).
 	emit := func(ev state.Event) { p.Send(ev) }
 	_ = backend.Start(emit)
+	if *slash {
+		go slashWorkload(p)
+	}
 	go func() {
 		time.Sleep(shotDur)
 		p.Quit()
@@ -163,4 +221,16 @@ func main() {
 	fmt.Println("===== UI SHOT =====")
 	fmt.Println(fm.Frame())
 	fmt.Println("===== UI SHOT =====")
+
+	if *slash {
+		// persist proof: the /theme slash run must have written the file
+		path := chrome.ThemeConfigPath()
+		content, rerr := os.ReadFile(path)
+		fmt.Printf("theme file: %s\n", path)
+		if rerr != nil {
+			fmt.Printf("theme file content: <error: %v>\n", rerr)
+			os.Exit(1)
+		}
+		fmt.Printf("theme file content: %q\n", strings.TrimSpace(string(content)))
+	}
 }

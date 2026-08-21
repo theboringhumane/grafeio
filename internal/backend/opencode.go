@@ -52,20 +52,22 @@ type liveBackend struct {
 
 	fl *flow
 
-	mu           sync.Mutex
-	baseURL      string // empty until resolved/start
-	primaryID    string
-	ctx          *normCtx
-	client       *http.Client // bounded, for control calls
-	sseClient    *http.Client // no timeout; SSE ctx drives lifetime
-	sseCancel    context.CancelFunc
-	proc         *exec.Cmd // spawned server, if we spawned it
-	chatSeq      int
-	pendingBoss  []string
+	mu            sync.Mutex
+	baseURL       string // empty until resolved/start
+	primaryID     string
+	ctx           *normCtx
+	client        *http.Client // bounded, for control calls
+	sseClient     *http.Client // no timeout; SSE ctx drives lifetime
+	sseCancel     context.CancelFunc
+	proc          *exec.Cmd // spawned server, if we spawned it
+	chatSeq       int
+	pendingBoss   []string
 	bossCompleted map[string]bool
-	am           *amHandle
-	amTasks      map[string]string // id -> dedupe key
-	amMails      map[string]bool
+	am            *amHandle
+	amTasks       map[string]string // id -> dedupe key
+	amMails       map[string]bool
+	lastUserText  string // belt-and-braces echo dedupe (see Send)
+	lastUserAt    int64
 }
 
 func newLiveBackend(baseURL, directory string) *liveBackend {
@@ -152,13 +154,26 @@ func (b *liveBackend) Send(text string) error {
 		return nil
 	}
 
+	// Belt-and-braces echo dedupe: the chat-user echo fires exactly once
+	// per prompt. This backend never maps SSE message.updated (user role)
+	// to chat again, but if the same text would fire twice within 2s
+	// (double Send, retry path, app-side echo raced back in), swallow the
+	// second echo — the prompt POST below still always runs.
 	b.mu.Lock()
+	now := nowMs()
+	duplicate := trimmed == b.lastUserText && b.lastUserText != "" && now-b.lastUserAt < 2000
+	if !duplicate {
+		b.lastUserText = trimmed
+		b.lastUserAt = now
+	}
 	b.chatSeq++
 	userID := "user-" + itoa(b.chatSeq)
 	b.mu.Unlock()
-	b.fl.emit(state.Event{Kind: state.EvChatUser, Msg: state.ChatMsg{
-		ID: userID, From: "user", Text: trimmed, At: nowMs(),
-	}})
+	if !duplicate {
+		b.fl.emit(state.Event{Kind: state.EvChatUser, Msg: state.ChatMsg{
+			ID: userID, From: "user", Text: trimmed, At: now, Kind: "user",
+		}})
+	}
 
 	b.mu.Lock()
 	ready := b.baseURL != "" && b.primaryID != "" && !b.fl.isStopped()

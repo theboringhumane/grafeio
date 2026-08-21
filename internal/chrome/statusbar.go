@@ -9,8 +9,8 @@
 package chrome
 
 import (
-	"image/color"
 	"fmt"
+	"image/color"
 	"strings"
 
 	"charm.land/lipgloss/v2"

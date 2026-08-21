@@ -7,6 +7,11 @@
 //	            boss turns are rendered THROUGH GLAMOUR as markdown
 //	            (**bold**, lists, fences format + wrap) with a yellow
 //	            "boss › " hanging indent.
+//	            Kind "think" entries render as dim-italic thinking blocks,
+//	            COLLAPSED to "thinking · N lines" until ctrl+t expands all;
+//	            Kind "tool" entries render as dim one-liners merged by CallID;
+//	            From "office" entries render as dim local notices (red when
+//	            Meta == "error").
 //	spinner   — shown only while a boss reply is pending (" boss is typing…")
 //	divider
 //	textarea  — multiline input; Enter sends, Shift+Enter (or Ctrl+J) is a
@@ -14,7 +19,8 @@
 //	            boss is typing (placeholder swaps to "boss is typing…").
 //
 // Scroll: mouse wheel + PgUp/PgDn always scroll the conversation; ↑/↓ move
-// inside a multi-line draft and scroll the conversation otherwise.
+// inside a multi-line draft and scroll the conversation otherwise. ctrl+t
+// expands/collapses ALL thinking blocks (handled by the app keymap).
 package panels
 
 import (
@@ -26,8 +32,6 @@ import (
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/glamour/v2"
-	glan "charm.land/glamour/v2/ansi"
-	glst "charm.land/glamour/v2/styles"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
@@ -45,18 +49,15 @@ const (
 	textareaH = 3 // rows of multiline input at the bottom of the tab
 )
 
-// markdownStyle is glamour's dark style minus the outer document margin so a
-// boss reply fills a 42-col sidebar instead of wasting 4 cells on margins.
-func markdownStyle() glan.StyleConfig {
-	s := glst.DarkStyleConfig
-	zero := uint(0)
-	sp := func(v string) *string { return &v }
-	s.Document = glan.StyleBlock{
-		StylePrimitive: glan.StylePrimitive{Color: sp("252")},
-		Margin:         &zero,
-	}
-	return s
-}
+// thinkKind / toolKind / officeFrom / errMeta — chat entry markers the app
+// reducer tags onto state.ChatMsg so this panel can style them without
+// touching the user/boss turn paths.
+const (
+	thinkKind  = "think"
+	toolKind   = "tool"
+	officeFrom = "office"
+	errMeta    = "error"
+)
 
 // Chat is the chat tab panel.
 type Chat struct {
@@ -68,6 +69,10 @@ type Chat struct {
 	chat    []state.ChatMsg // rendered snapshot
 	pending bool
 	follow  bool // stick to the bottom unless the user scrolled up
+
+	showThinking  bool // /thinking on|off — collected blocks visible (default true)
+	showTools     bool // /tools on|off    — tool one-liners visible (default true)
+	thinkExpanded bool // ctrl+t — thinking expanded; DEFAULT false (collapsed)
 
 	w, h      int
 	md        *glamour.TermRenderer
@@ -94,13 +99,7 @@ func NewChat(onSend func(text string) tea.Cmd) *Chat {
 		key.WithKeys("shift+enter", "ctrl+j"),
 		key.WithHelp("shift+enter", "newline"),
 	)
-	styles := textarea.DefaultDarkStyles()
-	styles.Focused.Prompt = lipgloss.NewStyle().Foreground(chrome.Accent)
-	styles.Focused.Placeholder = lipgloss.NewStyle().Foreground(chrome.Dim)
-	styles.Focused.CursorLine = lipgloss.NewStyle()
-	styles.Focused.Text = lipgloss.NewStyle()
-	styles.Blurred.Placeholder = lipgloss.NewStyle().Foreground(chrome.Accent).Faint(true)
-	ta.SetStyles(styles)
+	applyTextareaStyles(&ta)
 	ta.Focus()
 
 	sp := spinner.New(
@@ -108,9 +107,72 @@ func NewChat(onSend func(text string) tea.Cmd) *Chat {
 		spinner.WithStyle(chrome.AccentText),
 	)
 
-	c := &Chat{vp: vp, ta: ta, sp: sp, onSend: onSend, follow: true}
+	c := &Chat{vp: vp, ta: ta, sp: sp, onSend: onSend, follow: true,
+		showThinking: true, showTools: true}
 	c.SetSize(30, 10)
 	return c
+}
+
+// applyTextareaStyles points the textarea at the live chrome palette —
+// called at build time AND on every /theme switch (RefreshTheme).
+func applyTextareaStyles(ta *textarea.Model) {
+	styles := textarea.DefaultDarkStyles()
+	styles.Focused.Prompt = lipgloss.NewStyle().Foreground(chrome.Accent)
+	styles.Focused.Placeholder = lipgloss.NewStyle().Foreground(chrome.Dim)
+	styles.Focused.CursorLine = lipgloss.NewStyle()
+	styles.Focused.Text = lipgloss.NewStyle()
+	styles.Blurred.Placeholder = lipgloss.NewStyle().Foreground(chrome.Accent).Faint(true)
+	ta.SetStyles(styles)
+}
+
+// RefreshTheme re-points every cached style-derived surface at the active
+// theme: textarea styles, spinner color, and the glamour renderer (rebuilt
+// lazily at the next boss turn). Called by the app on /theme switches.
+func (c *Chat) RefreshTheme() {
+	applyTextareaStyles(&c.ta)
+	c.sp.Style = chrome.AccentText
+	c.md = nil
+	c.forceRender()
+}
+
+// ToggleThink expands/collapses ALL thinking blocks in the conversation
+// (ctrl+t, routed by the app keymap).
+func (c *Chat) ToggleThink() {
+	c.thinkExpanded = !c.thinkExpanded
+	c.forceRender()
+}
+
+// SetShowThinking shows/hides collected thinking blocks (/thinking on|off).
+func (c *Chat) SetShowThinking(on bool) {
+	if c.showThinking == on {
+		return
+	}
+	c.showThinking = on
+	c.forceRender()
+}
+
+// ShowThinking reports whether thinking blocks render.
+func (c *Chat) ShowThinking() bool { return c.showThinking }
+
+// SetShowTools shows/hides tool one-liners (/tools on|off).
+func (c *Chat) SetShowTools(on bool) {
+	if c.showTools == on {
+		return
+	}
+	c.showTools = on
+	c.forceRender()
+}
+
+// ShowTools reports whether tool one-liners render.
+func (c *Chat) ShowTools() bool { return c.showTools }
+
+// forceRender re-renders the conversation outside the SetState revision gate
+// (toggles change the pixels, not the state).
+func (c *Chat) forceRender() {
+	c.vp.SetContent(c.renderConversation())
+	if c.follow {
+		c.vp.GotoBottom()
+	}
 }
 
 // Title implements Tab.
@@ -258,35 +320,119 @@ func (c *Chat) View() string {
 
 // renderConversation rebuilds the full glamour-rendered transcript.
 func (c *Chat) renderConversation() string {
-	if len(c.chat) == 0 {
-		return chrome.DimText.Render("  no messages yet — ask the boss for something.")
-	}
-	var b strings.Builder
-	for i, m := range c.chat {
+	visible := make([]state.ChatMsg, 0, len(c.chat))
+	for _, m := range c.chat {
 		if m.From == "boss" && m.Pending {
 			continue // the spinner line speaks for the typing placeholder
 		}
+		if m.Kind == thinkKind && !c.showThinking {
+			continue
+		}
+		if m.Kind == toolKind && !c.showTools {
+			continue
+		}
+		visible = append(visible, m)
+	}
+	if len(visible) == 0 {
+		return chrome.DimText.Render("  no messages yet — ask the boss for something.")
+	}
+	var b strings.Builder
+	for i, m := range visible {
 		if i > 0 {
 			b.WriteString("\n")
 		}
-		if m.From == "user" {
+		switch {
+		case m.Kind == thinkKind:
+			c.renderThink(&b, m)
+		case m.Kind == toolKind:
+			b.WriteString(renderTool(m))
+		case m.From == officeFrom:
+			c.renderNotice(&b, m)
+		case m.From == "user":
 			prefix := chrome.Fg(chrome.Info, userPrefix)
 			lines := strings.Split(strings.TrimRight(wrapPlain(m.Text, c.mdWidth+1), "\n"), "\n")
 			writePrefixed(&b, prefix, strings.Repeat(" ", len(userPrefix)), lines)
-			continue
+		default:
+			prefix := chrome.Fg(chrome.Accent, bossPrefix)
+			writePrefixed(&b, prefix, strings.Repeat(" ", len(bossPrefix)),
+				cleanMarkdown(c.renderMarkdown(m.Text)))
 		}
-		prefix := chrome.Fg(chrome.Accent, bossPrefix)
-		writePrefixed(&b, prefix, strings.Repeat(" ", len(bossPrefix)),
-			cleanMarkdown(c.renderMarkdown(m.Text)))
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// renderMarkdown runs a boss turn through glamour with the sidebar wrap.
+// renderThink renders one Kind="think" entry: dim-italic "thinking" header +
+// greyed body when expanded; a single "thinking · N lines" line when
+// collapsed (the default).
+func (c *Chat) renderThink(b *strings.Builder, m state.ChatMsg) {
+	think := chrome.DimText.Italic(true)
+	body := chrome.DimText
+	lines := strings.Split(strings.TrimRight(wrapPlain(m.Text, c.mdWidth+1), "\n"), "\n")
+	if !c.thinkExpanded {
+		b.WriteString(think.Render("thinking · ") + body.Render(countLines(lines)+" lines"))
+		return
+	}
+	b.WriteString(think.Render("thinking"))
+	for _, ln := range lines {
+		b.WriteString("\n  ")
+		b.WriteString(body.Render(ln))
+	}
+}
+
+// countLines is the display count for a collapsed thinking block.
+func countLines(lines []string) string {
+	n := len(lines)
+	if n > 1 {
+		return itoa(n)
+	}
+	if len(lines) == 1 && strings.TrimSpace(lines[0]) == "" {
+		return "0"
+	}
+	return "1"
+}
+
+// itoa avoids fmt for a digit-only render.
+func itoa(n int) string {
+	if n >= 10 {
+		return itoa(n/10) + string(rune('0'+n%10))
+	}
+	return string(rune('0' + n%10))
+}
+
+// renderTool renders one Kind="tool" one-liner, merged by CallID upstream:
+// "[tool] read · src/main.go ✓" (done) / "… running" / red "✗" (error).
+func renderTool(m state.ChatMsg) string {
+	line := "[tool] " + m.Text
+	switch m.Meta {
+	case "done":
+		return chrome.ToolStyle.Render(line + " ✓")
+	case "error":
+		return chrome.ErrText.Faint(true).Render(line + " ✗")
+	default: // running (or anything unexpected)
+		return chrome.ToolStyle.Render(line + " … running")
+	}
+}
+
+// renderNotice renders a local From="office" notice (slash-command output):
+// dim by default, red when Meta == "error".
+func (c *Chat) renderNotice(b *strings.Builder, m state.ChatMsg) {
+	style := chrome.DimText
+	if m.Meta == errMeta {
+		style = chrome.ErrText
+	}
+	lines := strings.Split(strings.TrimRight(wrapPlain(m.Text, c.mdWidth+1), "\n"), "\n")
+	for i := range lines {
+		lines[i] = style.Render(lines[i])
+	}
+	writePrefixed(b, style.Render("office › "), strings.Repeat(" ", len("office › ")), lines)
+}
+
+// renderMarkdown runs a boss turn through glamour with the sidebar wrap and
+// the active theme's glamour style (chrome.MarkdownStyle).
 func (c *Chat) renderMarkdown(text string) string {
 	if c.md == nil {
 		r, err := glamour.NewTermRenderer(
-			glamour.WithStyles(markdownStyle()),
+			glamour.WithStyles(chrome.MarkdownStyle()),
 			glamour.WithWordWrap(c.mdWidth),
 		)
 		if err != nil {
@@ -361,19 +507,33 @@ func wrapPlain(s string, w int) string {
 	return strings.Join(out, "\n")
 }
 
-// revision is a cheap change tick for the chat slice: length + last message
-// identity + pending flag. chat-boss replaces pending placeholders, and the
-// replacement changes the last-id/flag, so this catches every real change.
+// revision is a cheap FNV-1a over every rendered field of the chat slice —
+// tool merges replace entries IN PLACE (same ID, changed Meta), and think
+// entries append with their own Kind, so a last-message shortcut would miss
+// real changes.
 func revision(chat []state.ChatMsg) uint64 {
 	if len(chat) == 0 {
 		return 0
 	}
-	last := chat[len(chat)-1]
-	var flag uint64
-	if last.Pending {
-		flag = 1
+	h := uint64(14695981039346656037)
+	mix := func(s string) {
+		for i := 0; i < len(s); i++ {
+			h ^= uint64(s[i])
+			h *= 1099511628211
+		}
 	}
-	return uint64(len(chat))<<33 | uint64(len(last.ID))<<17 | uint64(len(last.Text))<<1 | flag
+	for _, m := range chat {
+		mix(m.ID)
+		mix(m.From)
+		mix(m.Kind)
+		mix(m.Meta)
+		mix(m.Text)
+		if m.Pending {
+			h ^= 1
+			h *= 1099511628211
+		}
+	}
+	return h
 }
 
 func cloneChat(in []state.ChatMsg) []state.ChatMsg {

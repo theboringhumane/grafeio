@@ -77,23 +77,28 @@ type boardCol struct {
 	color  color.Color
 }
 
-var boardCols = []boardCol{
-	{"PENDING", state.TaskPending, chrome.Accent},
-	{"DOING", state.TaskInProgress, chrome.Info},
-	{"DONE", state.TaskDone, chrome.OK},
+// boardCols reads the live chrome palette every call, so a mid-run /theme
+// switch recolors the columns on the next render.
+func boardCols() []boardCol {
+	return []boardCol{
+		{"PENDING", state.TaskPending, chrome.Accent},
+		{"DOING", state.TaskInProgress, chrome.Info},
+		{"DONE", state.TaskDone, chrome.OK},
+	}
 }
 
 // render — three tight columns, rows clipped to the column width.
 func (b *Board) render() string {
 	width := b.w
+	cols := boardCols()
 	gap := 1
-	colW := (width - gap*(len(boardCols)-1)) / len(boardCols)
+	colW := (width - gap*(len(cols)-1)) / len(cols)
 	if colW < 6 {
 		colW = width // hopeless narrow: stack single column
 	}
 
-	rendered := make([]string, 0, len(boardCols))
-	for _, col := range boardCols {
+	rendered := make([]string, 0, len(cols))
+	for _, col := range cols {
 		var rows []state.BoardTask
 		for _, t := range b.st.Tasks {
 			if t.Status == col.status {
