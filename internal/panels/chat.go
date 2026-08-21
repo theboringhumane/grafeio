@@ -16,13 +16,16 @@
 //		            Kind "tool" entries (BOSS/primary) render as dim one-liners
 //		            merged by CallID (wrapped with a hanging indent, never
 //		            clipped); Kind "wtool" entries (EMPLOYEE tools)
-//		            never touch the flow — they group into the workers-thread
-//		            region at the END of the conversation: one group per
-//		            agent (newest at the bottom), header "┌ <agent> · <task>"
-//		            over indented "│ [tool] …" rows while the agent is active
-//		            (long rows WRAP with "│ " continuations, never truncate),
-//		            auto-collapsing to "<agent> · <task> (· N tool calls ✓
-//		            done)" on EvReturned or 120 ticks of quiet, with ctrl+g
+//		            group into one thread per agent, and the thread joins
+//		            the SAME timeline as every other entry —
+//		            mergeChatTimeline places it at its birth timestamp
+//		            (creation time), so threads scroll with the
+//		            conversation instead of docking after it: header
+//		            "┌ <agent> · <task>" over indented "│ [tool] …" rows
+//		            while the agent is active (long rows WRAP with "│ "
+//		            continuations, never truncate), auto-collapsing to
+//		            "<agent> · <task> (· N tool calls ✓ done)" on
+//		            EvReturned or 120 ticks of quiet, with ctrl+g
 //		            expanding/collapsing all completed threads;
 //		            Kind "office" entries (the concierge's EvChatOffice seam)
 //		            render as INFO-cyan "office ›" markdown bubbles — a real
@@ -106,8 +109,9 @@ const (
 // thinkKind / toolKind / wtoolKind / questionKind / diffKind / officeFrom /
 // errMeta — chat entry markers the app reducer tags onto state.ChatMsg so
 // this panel can style them without touching the user/boss turn paths.
-// wtoolKind is the EMPLOYEE tool line: never rendered inline; grouped into
-// the workers-thread region at the end of the conversation. wthinkKind is
+// wtoolKind is the EMPLOYEE tool line: grouped into a per-agent thread that
+// renders INLINE in the conversation timeline (see mergeChatTimeline).
+// wthinkKind is
 // the EMPLOYEE EvThought line (the app reducer merges one per agent+CallID,
 // same stream mechanics as the boss's thinkKind): it joins the SAME worker
 // thread — a dim-italic "thinking · N lines" row while the thread is
@@ -381,13 +385,13 @@ func (c *Chat) ExpandThread(agent string, expanded bool) {
 }
 
 // ToggleThread flips ONE agent's thread from its CURRENT effective state
-// (what renderWorkers shows for it right now).
+// (what renderWorkerGroup shows for it right now).
 func (c *Chat) ToggleThread(agent string) {
 	c.ExpandThread(agent, !c.threadExpandedNow(agent))
 }
 
 // threadExpandedNow — the thread's effective expansion under the same
-// rule renderWorkers applies: per-agent override wins, else live (busy
+// rule renderWorkerGroup applies: per-agent override wins, else live (busy
 // sprite + activity inside the staleness horizon), else ctrl+g.
 func (c *Chat) threadExpandedNow(name string) bool {
 	if v, ok := c.threadExpand[name]; ok {
@@ -1267,11 +1271,12 @@ func (c *Chat) renderPermission() string {
 	return strings.Join(lines[:], "\n")
 }
 
-// renderConversation rebuilds the full glamour-rendered transcript.
-// Employee tool entries (wtoolKind) never join the flow — they collect
-// into per-agent worker groups rendered as the workers-thread region at
-// the END of the conversation, so a sub-agent tool storm can't drown the
-// boss turns.
+// renderConversation rebuilds the full glamour-rendered transcript as ONE
+// timeline. Employee tool entries (wtoolKind) collect into per-agent
+// worker threads, but the threads are NOT a docked bottom region any
+// more — mergeChatTimeline interleaves them with the visible entries by
+// timestamp (a thread anchors at its creation time), so every entry —
+// chat message or subagent thread — scrolls in chronological order.
 func (c *Chat) renderConversation() string {
 	visible := make([]state.ChatMsg, 0, len(c.chat))
 	var workers []workerGroup
@@ -1315,10 +1320,21 @@ func (c *Chat) renderConversation() string {
 		return chrome.DimText.Render("  no messages yet — ask the boss for something.")
 	}
 	var b strings.Builder
-	for i, m := range visible {
-		if i > 0 {
+	first := true
+	for _, item := range mergeChatTimeline(visible, workers) {
+		if item.Group >= 0 {
+			// a subagent thread joins the flow HERE, at its timeline
+			// slot — its rows carry their own leading "\n", the same
+			// glue the old end-of-chat dock used
+			c.renderWorkerGroup(&b, workers[item.Group])
+			first = false
+			continue
+		}
+		if !first {
 			b.WriteString("\n")
 		}
+		first = false
+		m := item.Msg
 		switch {
 		case m.Kind == thinkKind:
 			c.renderThink(&b, m)
@@ -1364,8 +1380,9 @@ func (c *Chat) renderConversation() string {
 			writePrefixed(&b, prefix, strings.Repeat(" ", cellWidth(bossPrefix)), lines)
 		}
 	}
-	c.renderWorkers(&b, workers)
-	return strings.TrimRight(b.String(), "\n")
+	// a thread as the very first entry would otherwise leave its leading
+	// "\n" behind as a blank top row
+	return strings.TrimRight(strings.TrimLeft(b.String(), "\n"), "\n")
 }
 
 // agentView — a roster rollup entry for the workers-thread decoration:
@@ -1420,117 +1437,117 @@ func workerToolLine(m state.ChatMsg) string {
 	}
 }
 
-// renderWorkers draws the workers-thread region after the conversation:
-// one group per agent, newest at the bottom. An ACTIVE agent (busy sprite
-// + activity within wtoolStaleTicks) renders its header and merged tool
-// lines — employee thoughts join the SAME thread as dim-italic
-// "thinking · N lines" rows (one per merged CallID), in natural chat
-// order among the tool rows. On EvReturned/the quiet horizon the thread
-// auto-collapses to one dim summary line that KEEPS the think count
-// ("· 9 tools · 3 think ✓ done"). ctrl+g re-expands every completed
-// thread at once — and a full expand (ctrl+g or a per-agent mouse
-// override) covers both tools AND thoughts, the thoughts with their
-// body text. Expanded "┌" header rows are recorded in threadRows for
-// the mouse hit-map (click toggles that agent's thread).
-func (c *Chat) renderWorkers(b *strings.Builder, groups []workerGroup) {
-	for _, g := range groups {
-		task := c.workerTasks[g.name] // sticky: a returned agent keeps its task
-		active := false
-		if av, ok := c.agents[g.name]; ok {
-			active = av.active
-			if av.task != "" {
-				task = av.task
-			}
+// renderWorkerGroup draws ONE agent's thread INLINE at its timeline slot
+// (mergeChatTimeline interleaves threads with the conversation — there is
+// no docked region any more). An ACTIVE agent (busy sprite + activity
+// within wtoolStaleTicks) renders its header and merged tool lines —
+// employee thoughts join the SAME thread as dim-italic "thinking · N
+// lines" rows (one per merged CallID), in natural chat order among the
+// tool rows. On EvReturned/the quiet horizon the thread auto-collapses to
+// one dim summary line that KEEPS the think count ("· 9 tools · 3 think
+// ✓ done") — a completed thread is one concise chat row. ctrl+g
+// re-expands every completed thread at once — and a full expand (ctrl+g
+// or a per-agent mouse override) covers both tools AND thoughts, the
+// thoughts with their body text. Expanded "┌" header rows are recorded
+// in threadRows for the mouse hit-map (click toggles that agent's
+// thread).
+func (c *Chat) renderWorkerGroup(b *strings.Builder, g workerGroup) {
+	task := c.workerTasks[g.name] // sticky: a returned agent keeps its task
+	active := false
+	if av, ok := c.agents[g.name]; ok {
+		active = av.active
+		if av.task != "" {
+			task = av.task
 		}
-		// expanded = whether the thread renders its rows at all; full =
-		// whether think entries show their BODIES (ctrl+g / a full mouse
-		// expand). A set per-agent override wins OUTRIGHT over the
-		// live/ctrl+g default (a mouse-collapsed live thread stays
-		// collapsed until re-clicked). A /stop stopped thread
-		// force-collapses — only an explicit per-agent gesture re-opens it.
-		stopped := c.threadStop[g.name]
-		expanded := (active && c.tick-g.lastTick <= wtoolStaleTicks) || c.threadsExpanded
-		full := c.threadsExpanded
-		if v, ok := c.threadExpand[g.name]; ok {
-			expanded = v
-			full = v
+	}
+	// expanded = whether the thread renders its rows at all; full =
+	// whether think entries show their BODIES (ctrl+g / a full mouse
+	// expand). A set per-agent override wins OUTRIGHT over the
+	// live/ctrl+g default (a mouse-collapsed live thread stays
+	// collapsed until re-clicked). A /stop stopped thread
+	// force-collapses — only an explicit per-agent gesture re-opens it.
+	stopped := c.threadStop[g.name]
+	expanded := (active && c.tick-g.lastTick <= wtoolStaleTicks) || c.threadsExpanded
+	full := c.threadsExpanded
+	if v, ok := c.threadExpand[g.name]; ok {
+		expanded = v
+		full = v
+	}
+	if stopped {
+		if _, ok := c.threadExpand[g.name]; !ok {
+			expanded = false
 		}
-		if stopped {
-			if _, ok := c.threadExpand[g.name]; !ok {
-				expanded = false
-			}
-		}
-		head := g.name
-		if task != "" {
-			head += " · " + task
-		}
-		if expanded {
-			if c.threadRows != nil {
-				// the header row under construction is the NEXT line of b
-				c.threadRows[strings.Count(b.String(), "\n")+1] = g.name
-			}
-			// long threads WRAP with aligned continuations — never
-			// truncate a path the user might need to read
-			for j, ln := range foldStyledRows("┌ "+head, c.w, c.w-2) {
-				if j == 0 {
-					b.WriteString("\n" + chrome.DimText.Render(ln))
-				} else {
-					b.WriteString("\n" + chrome.DimText.Render("  "+ln))
-				}
-			}
-			for _, m := range g.lines {
-				if m.Kind == wthinkKind {
-					c.renderWThink(b, m, full)
-					continue
-				}
-				for j, ln := range foldStyledRows("│ "+workerToolLine(m), c.w, c.w-2) {
-					if j == 0 {
-						b.WriteString("\n" + chrome.ToolStyle.Render(ln))
-					} else {
-						b.WriteString("\n" + chrome.ToolStyle.Render("│ "+ln))
-					}
-				}
-			}
-			continue
-		}
-		tools, thinks := 0, 0
-		for _, m := range g.lines {
-			if m.Kind == wthinkKind {
-				thinks++
-			} else {
-				tools++
-			}
-		}
-		unit := "tool calls"
-		if tools == 1 {
-			unit = "tool call"
-		}
-		summary := head + " (· " + itoa(tools) + " " + unit
-		if thinks > 0 {
-			// the collapsed summary KEEPS the think count ("· 3 think");
-			// a summary without thoughts renders byte-identical to before
-			summary += " · " + itoa(thinks) + " think"
-		}
-		summaryStyle := chrome.DimText
-		if stopped {
-			// /stop unwind: the thread collapsed because the sessions were
-			// aborted, not because the work returned
-			summary += " ✗ stopped)"
-			summaryStyle = chrome.ErrText.Faint(true)
-		} else {
-			summary += " ✓ done)"
-		}
+	}
+	head := g.name
+	if task != "" {
+		head += " · " + task
+	}
+	if expanded {
 		if c.threadRows != nil {
-			// the collapsed summary IS the thread's header — clickable too
-			// (click a collapsed thread to re-expand it)
+			// the header row under construction is the NEXT line of b
 			c.threadRows[strings.Count(b.String(), "\n")+1] = g.name
 		}
-		for j, ln := range foldStyledRows(summary, c.w, c.w-2) {
+		// long threads WRAP with aligned continuations — never
+		// truncate a path the user might need to read
+		for j, ln := range foldStyledRows("┌ "+head, c.w, c.w-2) {
 			if j == 0 {
-				b.WriteString("\n" + summaryStyle.Render(ln))
+				b.WriteString("\n" + chrome.DimText.Render(ln))
 			} else {
-				b.WriteString("\n" + summaryStyle.Render("  "+ln))
+				b.WriteString("\n" + chrome.DimText.Render("  "+ln))
 			}
+		}
+		for _, m := range g.lines {
+			if m.Kind == wthinkKind {
+				c.renderWThink(b, m, full)
+				continue
+			}
+			for j, ln := range foldStyledRows("│ "+workerToolLine(m), c.w, c.w-2) {
+				if j == 0 {
+					b.WriteString("\n" + chrome.ToolStyle.Render(ln))
+				} else {
+					b.WriteString("\n" + chrome.ToolStyle.Render("│ "+ln))
+				}
+			}
+		}
+		return
+	}
+	tools, thinks := 0, 0
+	for _, m := range g.lines {
+		if m.Kind == wthinkKind {
+			thinks++
+		} else {
+			tools++
+		}
+	}
+	unit := "tool calls"
+	if tools == 1 {
+		unit = "tool call"
+	}
+	summary := head + " (· " + itoa(tools) + " " + unit
+	if thinks > 0 {
+		// the collapsed summary KEEPS the think count ("· 3 think");
+		// a summary without thoughts renders byte-identical to before
+		summary += " · " + itoa(thinks) + " think"
+	}
+	summaryStyle := chrome.DimText
+	if stopped {
+		// /stop unwind: the thread collapsed because the sessions were
+		// aborted, not because the work returned
+		summary += " ✗ stopped)"
+		summaryStyle = chrome.ErrText.Faint(true)
+	} else {
+		summary += " ✓ done)"
+	}
+	if c.threadRows != nil {
+		// the collapsed summary IS the thread's header — clickable too
+		// (click a collapsed thread to re-expand it)
+		c.threadRows[strings.Count(b.String(), "\n")+1] = g.name
+	}
+	for j, ln := range foldStyledRows(summary, c.w, c.w-2) {
+		if j == 0 {
+			b.WriteString("\n" + summaryStyle.Render(ln))
+		} else {
+			b.WriteString("\n" + summaryStyle.Render("  "+ln))
 		}
 	}
 }
