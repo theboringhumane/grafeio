@@ -68,6 +68,14 @@ func TestUsageTag(t *testing.T) {
 	if got := usageTag(state.OfficeState{TokensIn: 10_000, TokensOut: 2_400, CostUSD: 0.0042}); got != "$0.0042 · 12.4k tok" {
 		t.Fatalf("full tag = %q, want %q", got, "$0.0042 · 12.4k tok")
 	}
+	// Prompt-cache: zero read hides the segment entirely (sessions without
+	// caching stay byte-identical); a read hit appends read+write volume.
+	if got := usageTag(state.OfficeState{TokensIn: 10_000, TokensOut: 2_400, CostUSD: 0.0042, TokensCacheWrite: 900}); got != "$0.0042 · 12.4k tok" {
+		t.Fatalf("cache-write-only tag = %q, want %q (read 0 hides the segment)", got, "$0.0042 · 12.4k tok")
+	}
+	if got := usageTag(state.OfficeState{TokensIn: 180_000, TokensOut: 7_900, CostUSD: 0.5921, TokensCacheRead: 45_000, TokensCacheWrite: 200}); got != "$0.5921 · 187.9k tok · cache 45.2k" {
+		t.Fatalf("cache tag = %q, want %q", got, "$0.5921 · 187.9k tok · cache 45.2k")
+	}
 }
 
 func TestStatusBarHidesUsageTagWhenZero(t *testing.T) {
@@ -100,6 +108,52 @@ func TestStatusBarRendersUsageTagBeforeMode(t *testing.T) {
 	}
 	if !strings.Contains(out, "board 0/0/0") {
 		t.Fatalf("board segment must survive the insertion, got:\n%s", out)
+	}
+}
+
+func TestStatusBarHidesCacheSegmentWhenNoCacheRead(t *testing.T) {
+	st := state.OfficeState{
+		Mode:       state.ModeLive,
+		StatusLine: "scroll",
+		TokensIn:   180_000,
+		TokensOut:  7_900,
+		CostUSD:    0.5921,
+		// Write-only so far (cache.written but never read back): read 0
+		// keeps the segment hidden.
+		TokensCacheWrite: 45_200,
+	}
+	out := ansi.Strip(StatusBar(st, "enter:send", 0, 120))
+	if strings.Contains(out, "cache") {
+		t.Fatalf("zero cache READ must hide the cache segment, got:\n%s", out)
+	}
+	if !strings.Contains(out, "$0.5921 · 187.9k tok") {
+		t.Fatalf("headline tag must render untouched, got:\n%s", out)
+	}
+}
+
+func TestStatusBarRendersCacheSegmentBeforeMode(t *testing.T) {
+	st := state.OfficeState{
+		Mode:             state.ModeLive,
+		StatusLine:       "scroll",
+		TokensIn:         180_000,
+		TokensOut:        7_900,
+		CostUSD:          0.5921,
+		TokensCacheRead:  45_000,
+		TokensCacheWrite: 200,
+	}
+	out := ansi.Strip(StatusBar(st, "enter:send", 0, 120))
+	tag := "$0.5921 · 187.9k tok · cache 45.2k"
+	if !strings.Contains(out, tag) {
+		t.Fatalf("cache segment missing from the bar, got:\n%s", out)
+	}
+	ci, li := strings.Index(out, "cache 45.2k"), strings.Index(out, "live")
+	if li < 0 || ci < 0 || ci > li {
+		t.Fatalf("cache segment must sit before the mode segment (cache@%d, live@%d):\n%s", ci, li, out)
+	}
+	// The composed line the member sees, verbatim:
+	t.Logf("statusbar composed: %s", out)
+	if idx := strings.Index(out, "| $"); idx >= 0 {
+		t.Logf("usage segment: %s", out[idx:])
 	}
 }
 

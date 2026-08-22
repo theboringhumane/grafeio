@@ -245,6 +245,13 @@ type OfficeState struct {
 	TokensIn  int64   `json:"tokensIn,omitempty"`
 	TokensOut int64   `json:"tokensOut,omitempty"`
 	CostUSD   float64 `json:"costUsd,omitempty"`
+	// TokensCacheRead/TokensCacheWrite — cumulative provider prompt-cache
+	// counters (Anthropic/OpenAI), accumulated the same += way. These are
+	// INFORMATIONAL ONLY: CostUSD above already prices every cache token
+	// (writes at 1.25x, reads at 0.1x) — the fields exist so the member
+	// can SEE that prompt caching is actually happening, never to bill.
+	TokensCacheRead  int64 `json:"tokensCacheRead,omitempty"`
+	TokensCacheWrite int64 `json:"tokensCacheWrite,omitempty"`
 }
 
 // EventKind — Go has no tagged unions; one Event struct with a Kind + optional fields.
@@ -338,6 +345,12 @@ type Event struct {
 	TokensIn  int64   `json:"tokensIn,omitempty"`  // wire tokens.input growth
 	TokensOut int64   `json:"tokensOut,omitempty"` // wire tokens.output+reasoning growth
 	CostUSD   float64 `json:"costUsd,omitempty"`   // wire cost growth (USD, opencode-computed)
+	// Cache read/write growth, copied verbatim off tokens.cache.{read,write}.
+	// Kept OUT of the headline token totals (provider-billing overlap) and
+	// informational only: CostUSD above already prices cache. The app
+	// surfaces these so the operator can verify prompt caching is live.
+	TokensCacheRead  int64 `json:"tokensCacheRead,omitempty"`  // wire tokens.cache.read growth
+	TokensCacheWrite int64 `json:"tokensCacheWrite,omitempty"` // wire tokens.cache.write growth
 }
 
 // MCPServer is one configured MCP server with its live status as the
@@ -401,6 +414,23 @@ type Backend interface {
 // the app never echoes twice).
 type ConciergeCapable interface {
 	SendConcierge(text string) error
+}
+
+// SessionRow — one opencode session as the /session picker lists it
+// (the live backend's ListSessions seam — ADDITIVE, like
+// ConciergeCapable/SessionAborter below: never folded into Backend, the
+// app type-asserts it). ParentID carries the wire's parent linkage (a
+// row with a non-empty ParentID is a CHILD session — the picker keeps
+// roots only); Created/Updated are unix millis off the wire; Messages is
+// the GET /session/{id}/message row count, -1 when that count's fetch
+// failed (a count gap must never hide the session itself).
+type SessionRow struct {
+	ID       string `json:"id"`
+	ParentID string `json:"parentID"`
+	Title    string `json:"title"`
+	Created  int64  `json:"created"` // unix millis
+	Updated  int64  `json:"updated"` // unix millis
+	Messages int    `json:"messages"`
 }
 
 // SessionAborter — the /stop seam (ADDITIVE; deliberately NOT folded into

@@ -63,6 +63,30 @@ func TestMessageUpdatedEmitsUsageDeltas(t *testing.T) {
 			100, 60, 0.375, u)
 	}
 
+	// Prompt-cache counters ride ALONGSIDE the headline: the write-off
+	// frame lands verbatim, and a later frame whose ONLY growth is a cache
+	// read still emits (cache.read growing means the provider hit cache).
+	evs = mapOCEvent(msgUpdated(t,
+		`{"info":{"id":"msg-c","sessionID":"ses-primary","role":"assistant","time":{"created":1},"cost":0.01,"tokens":{"input":500,"output":10,"reasoning":0,"cache":{"read":0,"write":4096}}}}`),
+		ctx, primary, 100)
+	if len(evs) != 1 || evs[0].Kind != state.EvUsage {
+		t.Fatalf("cache-write frame must emit ONE EvUsage, got %v", evs)
+	}
+	if u := evs[0]; u.CallID != "msg-c" || u.TokensIn != 500 || u.TokensOut != 10 || u.CostUSD != 0.01 ||
+		u.TokensCacheRead != 0 || u.TokensCacheWrite != 4096 {
+		t.Fatalf("cache-write delta mismatch: %+v", u)
+	}
+	evs = mapOCEvent(msgUpdated(t,
+		`{"info":{"id":"msg-c","sessionID":"ses-primary","role":"assistant","time":{"created":1},"cost":0.01,"tokens":{"input":500,"output":10,"reasoning":0,"cache":{"read":50000,"write":4096}}}}`),
+		ctx, primary, 100)
+	if len(evs) != 1 || evs[0].Kind != state.EvUsage {
+		t.Fatalf("cache-read-only growth must still emit ONE EvUsage, got %v", evs)
+	}
+	if u := evs[0]; u.TokensIn != 0 || u.TokensOut != 0 || u.CostUSD != 0 ||
+		u.TokensCacheRead != 50000 || u.TokensCacheWrite != 0 {
+		t.Fatalf("cache-read-only delta: headline tokens must stay 0, got %+v", u)
+	}
+
 	// User messages never carry usage.
 	if evs := mapOCEvent(msgUpdated(t,
 		`{"info":{"id":"msg-u","sessionID":"ses-primary","role":"user","time":{"created":1}}}`),

@@ -2675,6 +2675,10 @@ func reducer(st state.OfficeState, ev state.Event) state.OfficeState {
 		st.TokensIn += ev.TokensIn
 		st.TokensOut += ev.TokensOut
 		st.CostUSD += ev.CostUSD
+		// Prompt-cache counters ride the same += path (informational only;
+		// CostUSD above already prices them).
+		st.TokensCacheRead += ev.TokensCacheRead
+		st.TokensCacheWrite += ev.TokensCacheWrite
 		return st
 	}
 	return st

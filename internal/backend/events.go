@@ -1069,8 +1069,9 @@ func diffEvent(sessionID, empID, empName string, d ocSnapshotFileDiff, ctx *norm
 // ocUsageLast remembers the counters already emitted for one assistant
 // message so repeated message.updated frames ship only the growth.
 type ocUsageLast struct {
-	in, out int64
-	cost    float64
+	in, out        int64
+	cacheR, cacheW int64
+	cost           float64
 }
 
 // mapUsage lifts the REAL usage counters off one assistant message.updated
@@ -1085,8 +1086,9 @@ type ocUsageLast struct {
 //     serve's foreign sessions never leak into the member's tally;
 //   - TokensIn = wire input; TokensOut = wire output + reasoning. Cache
 //     read/write stay OUT of the headline counts (provider-billing
-//     overlap); the $ figure is authoritative anyway — opencode computed
-//     it, theboringoffice never prices anything;
+//     overlap) and ride ALONGSIDE as TokensCacheRead/TokensCacheWrite —
+//     informational only (the $ figure already prices cache; the member
+//     just gets to verify prompt caching is actually happening);
 //   - an all-zero delta (the typical first frame, counters still 0)
 //     emits nothing.
 func mapUsage(info ocMessage, ctx *normCtx, primaryID string) []state.Event {
@@ -1099,22 +1101,32 @@ func mapUsage(info ocMessage, ctx *normCtx, primaryID string) []state.Event {
 		}
 	}
 	cur := ocUsageLast{
-		in:   int64(info.Tokens.Input),
-		out:  int64(info.Tokens.Output) + int64(info.Tokens.Reasoning),
-		cost: info.Cost,
+		in:     int64(info.Tokens.Input),
+		out:    int64(info.Tokens.Output) + int64(info.Tokens.Reasoning),
+		cacheR: int64(info.Tokens.Cache.Read),
+		cacheW: int64(info.Tokens.Cache.Write),
+		cost:   info.Cost,
 	}
 	prev := ctx.usageSeen[info.ID]
-	d := ocUsageLast{in: cur.in - prev.in, out: cur.out - prev.out, cost: cur.cost - prev.cost}
-	if d.in == 0 && d.out == 0 && d.cost == 0 {
+	d := ocUsageLast{
+		in:     cur.in - prev.in,
+		out:    cur.out - prev.out,
+		cacheR: cur.cacheR - prev.cacheR,
+		cacheW: cur.cacheW - prev.cacheW,
+		cost:   cur.cost - prev.cost,
+	}
+	if d.in == 0 && d.out == 0 && d.cacheR == 0 && d.cacheW == 0 && d.cost == 0 {
 		return nil
 	}
 	ctx.usageSeen[info.ID] = cur
 	return []state.Event{{
-		Kind:      state.EvUsage,
-		CallID:    info.ID,
-		TokensIn:  d.in,
-		TokensOut: d.out,
-		CostUSD:   d.cost,
+		Kind:             state.EvUsage,
+		CallID:           info.ID,
+		TokensIn:         d.in,
+		TokensOut:        d.out,
+		CostUSD:          d.cost,
+		TokensCacheRead:  d.cacheR,
+		TokensCacheWrite: d.cacheW,
 	}}
 }
 

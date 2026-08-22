@@ -157,6 +157,14 @@ func usageTag(st state.OfficeState) string {
 	if toks > 0 {
 		parts = append(parts, humanTokens(toks)+" tok")
 	}
+	// Prompt-cache segment ("cache NNk", read+write volume). INFORMATIONAL
+	// ONLY: the $ figure above already prices every cache token (writes at
+	// 1.25x, reads at 0.1x) — this exists purely so the member can SEE
+	// provider prompt caching happening. Hidden while no cache READ has
+	// been reported, so OpenAI/Gemini sessions without caching stay clean.
+	if st.TokensCacheRead > 0 {
+		parts = append(parts, "cache "+humanTokens(st.TokensCacheRead+st.TokensCacheWrite))
+	}
 	return strings.Join(parts, " · ")
 }
 
