@@ -16,7 +16,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 // statusLineColor — neutral/attention color for the free-text status line.
@@ -147,7 +147,7 @@ func StatusBar(st state.OfficeState, hint string, queueN, width int) string {
 // both counters are zero — the segment hides itself entirely rather than
 // show an estimated or fabricated number. The $ figure leads and is
 // dropped on its own when only tokens are known (real cost data absent);
-// grafeio NEVER prices tokens itself.
+// theboringoffice NEVER prices tokens itself.
 func usageTag(st state.OfficeState) string {
 	toks := st.TokensIn + st.TokensOut
 	var parts []string

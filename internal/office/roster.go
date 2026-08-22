@@ -2,7 +2,8 @@
 // (Go port of node-legacy/src/office/roster.ts; geometry lives in
 // floorplan.go — seats are no longer fixed pixels).
 //
-// Seat ids: manager | hr (cabin-1) | cabin-2 | cabin-3 | dev-1..N |
+// Seat ids: manager | hr (cabin-1) | cabin-2 | cabin-3 | cto (exec suite,
+// inside the boss office — widescreen plans only) | dev-1..N |
 // scout-1..2 | treadmill-1 | floor-<n> (overflow standing near the break area).
 package office
 
@@ -11,7 +12,7 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 // devSeatRE — machine-format seat ids, not natural language.
@@ -44,6 +45,8 @@ func RoleSeats(role state.EmployeeRole, plan Plan) []string {
 		return []string{"hr"} // cabin-1, the HR cabin
 	case state.RoleReviewer:
 		return []string{"cabin-2"} // dikastes
+	case state.RoleCTO:
+		return []string{"cto"} // theboringcto, exec suite in the boss office
 	case state.RoleRunner:
 		return []string{"treadmill-1"} // hemerodromos, in the server room
 	case state.RoleScout:
@@ -107,6 +110,8 @@ func NameColor(name string) string {
 		return "yellow"
 	case has("hr"):
 		return "red"
+	case has("theboringcto", "cto"):
+		return "white"
 	case has("tekton", "dev"):
 		return "cyan"
 	case has("skopos", "scout"):

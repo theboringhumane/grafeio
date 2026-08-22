@@ -17,8 +17,8 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/theboringhumane/grafeio/internal/chrome"
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/chrome"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 // Tab is one sidebar panel. SetSize hands the panel its content area

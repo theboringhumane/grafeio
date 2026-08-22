@@ -16,7 +16,15 @@
 //     going compact below W=88 so all three still fit at 84 cols)
 //   - conference drops next (need W>=72 && H>=18)
 //   - pods row minimum: 2 rows, collapsing to 2x3 pods when cabins are gone
-//   - W<60 || H<16: "small terminal" badge (drawn once, centered, by floor.go)
+//   - MICRO band (W<60 || H<16, but not tiny): a flat zoneless strip —
+//     boss corner + one pod row + a right-end break strip; this is the
+//     mobile stack's floor band (8..14 rows), where walled rooms are
+//     unreadable. All content lives in grid rows 1..6 so an 8-row band
+//     keeps every seat visible (plans clamp to >=12 rows — anything
+//     deeper is clipped off-screen by the grid).
+//   - truly unusable (<40 cols || <6 rows, judged on the RAW dims before
+//     the min-size clamp): "small terminal" badge (drawn once, centered,
+//     by floor.go — the pre-micro degrade path, unchanged)
 //
 // Props and zones may carry a foreground color (and bold on props);
 // floor.go stamps them onto its styled cell grid. Default paint:
@@ -102,21 +110,21 @@ type Door struct {
 }
 
 type Zone struct {
-	ID     string
-	X      int
-	Y      int
-	W      int
-	H      int
-	Wall   string // "-" for drywall rooms; cabins use ":", ";", "."
-	Color  ColorName // wall paint; default gray (applied by floor.go)
-	Doors  []Door
+	ID    string
+	X     int
+	Y     int
+	W     int
+	H     int
+	Wall  string    // "-" for drywall rooms; cabins use ":", ";", "."
+	Color ColorName // wall paint; default gray (applied by floor.go)
+	Doors []Door
 }
 
 type PlanProp struct {
 	X     int
 	Y     int
 	Glyph string
-	Color  ColorName // furniture paint; "" = uncolored
+	Color ColorName // furniture paint; "" = uncolored
 	Bold  bool
 	Over  bool // stamp AFTER zone walls (wall-mounted items: windows)
 }
@@ -182,7 +190,11 @@ func ComputePlan(width, height int) Plan {
 	if h < 12 {
 		h = 12
 	}
-	p := buildPlan(w, h)
+	// The badge-only degrade is judged on the RAW dims, before the
+	// min-size clamp above hides them: <40 cols or <6 rows can't hold even
+	// the micro strip (the app's own minimum is 40x12 anyway).
+	tiny := width < 40 || height < 6
+	p := buildPlan(w, h, tiny)
 	if len(planCache) > 8 {
 		planCache = map[string]Plan{}
 	}
@@ -200,14 +212,19 @@ func CurrentPlan() Plan {
 	return *planCurrent
 }
 
-func buildPlan(W, H int) Plan {
+func buildPlan(W, H int, tiny bool) Plan {
 	planGen++
-	p := Plan{Width: W, Height: H, Gen: planGen, Anchor: map[string]Point{}}
+	p := Plan{Width: W, Height: H, Gen: planGen, Anchor: map[string]Point{}, Tiny: tiny}
+	if !tiny && (W < 60 || H < 16) {
+		// micro band — the mobile degrade: full rooms don't fit the
+		// band, so it builds its own flat strip instead.
+		buildMicro(&p, W, H)
+		return p
+	}
 	zones := &p.Zones
 	props := &p.Props
 	anchors := p.Anchor
 
-	tiny := W < 60 || H < 16
 	// glass cabins survive down to W=72; below W=88 they go compact (~11 wide)
 	// so all three still fit the middle band at the real 84-col shell size
 	cabinsOn := W >= 72 && H >= 24
@@ -231,18 +248,32 @@ func buildPlan(W, H int) Plan {
 		// nameplate: layout placeholder; floor.go re-stamps it with the
 		// boss's live status ("[awaiting]" / "[typing]" / "[meetin]")
 		PlanProp{X: nameplate.X, Y: nameplate.Y, Glyph: "[awaiting]", Color: "yellow", Bold: true},
-		PlanProp{X: 3, Y: 3, Glyph: "[=BOSS=]"},            // boss desk
-		PlanProp{X: 14, Y: 3, Glyph: "(~)", Color: "white"}, // desk-side mug
+		PlanProp{X: 3, Y: 3, Glyph: "[=BOSS=]"},                              // boss desk
+		PlanProp{X: 14, Y: 3, Glyph: "(~)", Color: "white"},                  // desk-side mug
 		PlanProp{X: winX, Y: 1, Glyph: "[==o==]", Color: "cyan", Over: true}, // window
-		PlanProp{X: 3, Y: 5, Glyph: "o", Color: "green"},   // guest chair
-		PlanProp{X: 8, Y: 5, Glyph: "o", Color: "green"},   // guest chair
-		PlanProp{X: 10, Y: 1, Glyph: "[###]", Color: "gray"}, // wall calendar
+		PlanProp{X: 3, Y: 5, Glyph: "o", Color: "green"},                     // guest chair
+		PlanProp{X: 8, Y: 5, Glyph: "o", Color: "green"},                     // guest chair
+		PlanProp{X: 10, Y: 1, Glyph: "[###]", Color: "gray"},                 // wall calendar
 	)
 	if bw >= 20 {
 		*props = append(*props,
 			PlanProp{X: 13, Y: 2, Glyph: "[#]", Color: "yellow"}, // bookshelf, beside the nameplate
 			PlanProp{X: 16, Y: 2, Glyph: "[=]", Color: "yellow"}, // books, second shelf cell
 		)
+	}
+	// CTO exec suite (the boss office's second desk): name plate, desk,
+	// chair. Wide plans only — at 120+ cols the office's right half (right
+	// of the mug, beside the bookshelf) is free; below that the CTO stands
+	// at an overflow spot like any unseated hire. The plate follows the
+	// boss-plate width convention (padEnd(plate,10) in floor.go):
+	// "theboringcto" clipped to its 10 cols reads "theboringc".
+	if bw >= 28 && topH >= 7 {
+		*props = append(*props,
+			PlanProp{X: 17, Y: 3, Glyph: "theboringc", Color: "yellow", Bold: true}, // name plate, 10 cols
+			PlanProp{X: 17, Y: 4, Glyph: "[=CTO==]"},                                // CTO desk (mirrors [=BOSS=])
+			PlanProp{X: 19, Y: 5, Glyph: "(_)", Color: "green"},                     // his chair
+		)
+		anchors["cto"] = Point{X: 19, Y: 5}
 	}
 	anchors["manager"] = Point{X: 11, Y: 3}
 	meet := Point{X: 5, Y: 4}
@@ -255,8 +286,8 @@ func buildPlan(W, H int) Plan {
 		Doors: []Door{{Side: "s", At: 3, Size: 2}},
 	})
 	*props = append(*props,
-		PlanProp{X: sx + 2, Y: 2, Glyph: "[=]", Color: "gray"}, // pod 1 monitor (screen off)
-		PlanProp{X: sx + 1, Y: 3, Glyph: "[______]"},           // pod 1 desk
+		PlanProp{X: sx + 2, Y: 2, Glyph: "[=]", Color: "gray"},          // pod 1 monitor (screen off)
+		PlanProp{X: sx + 1, Y: 3, Glyph: "[______]"},                    // pod 1 desk
 		PlanProp{X: sx + 1, Y: topH - 1, Glyph: "[cpr]", Color: "gray"}, // copier
 		PlanProp{X: sx + 1, Y: topH - 2, Glyph: "[o==o]"},               // treadmill (runner seat desk)
 	)
@@ -305,9 +336,9 @@ func buildPlan(W, H int) Plan {
 			*props = append(*props, PlanProp{X: fx + 4 + i*3, Y: ty + 1, Glyph: "o", Color: "green"})
 		}
 		*props = append(*props,
-			PlanProp{X: fx + 1, Y: topH - 1, Glyph: "(Y)", Color: "green"},        // corner plant
-			PlanProp{X: fx + fw - 8, Y: 2, Glyph: "[|> ]", Color: "cyan"},          // easel / whiteboard (2-col clearance from the right wall)
-			PlanProp{X: fx + fw - 7, Y: 3, Glyph: sslash()},                        // tiny chart marks
+			PlanProp{X: fx + 1, Y: topH - 1, Glyph: "(Y)", Color: "green"}, // corner plant
+			PlanProp{X: fx + fw - 8, Y: 2, Glyph: "[|> ]", Color: "cyan"},  // easel / whiteboard (2-col clearance from the right wall)
+			PlanProp{X: fx + fw - 7, Y: 3, Glyph: sslash()},                // tiny chart marks
 		)
 	}
 
@@ -435,11 +466,11 @@ func buildPlan(W, H int) Plan {
 
 	// ---- SCATTER: plants, bins, water cooler ----
 	*props = append(*props,
-		PlanProp{X: 2, Y: H - 3, Glyph: "[h2o]", Color: "blue"},           // water cooler
-		PlanProp{X: 2, Y: H - 2, Glyph: "(Y)", Color: "green"},            // plant, bottom-left corner
-		PlanProp{X: 1, Y: podRows[0] + 1, Glyph: "(.)", Color: "gray"},    // trash near pod row 1
-		PlanProp{X: 1, Y: podRows[1] + 1, Glyph: "(.)", Color: "gray"},    // trash near pod row 2
-		PlanProp{X: bx0 - 2, Y: H - 2, Glyph: "(Y)", Color: "green"},      // plant by the break door
+		PlanProp{X: 2, Y: H - 3, Glyph: "[h2o]", Color: "blue"},        // water cooler
+		PlanProp{X: 2, Y: H - 2, Glyph: "(Y)", Color: "green"},         // plant, bottom-left corner
+		PlanProp{X: 1, Y: podRows[0] + 1, Glyph: "(.)", Color: "gray"}, // trash near pod row 1
+		PlanProp{X: 1, Y: podRows[1] + 1, Glyph: "(.)", Color: "gray"}, // trash near pod row 2
+		PlanProp{X: bx0 - 2, Y: H - 2, Glyph: "(Y)", Color: "green"},   // plant by the break door
 	)
 
 	p.Hot.Meet = meet
@@ -448,7 +479,6 @@ func buildPlan(W, H int) Plan {
 	p.Hot.Clock = clock
 	p.Hot.Overflow = overflow
 	p.Nameplate = nameplate
-	p.Tiny = tiny
 	return p
 }
 
@@ -456,6 +486,106 @@ func buildPlan(W, H int) Plan {
 // quoting stays obvious).
 func sslash() string {
 	return "|/_"
+}
+
+// buildMicro — the MICRO degrade plan (W<60 || H<16, but not truly
+// unusable): the mobile stack's floor band. FLAT and zoneless — walled
+// rooms need a height the 8..14-row band never has. Boss corner top-left
+// (desk + nameplate + guest chairs), ONE pod row under it (same
+// "[=]"/"[______]"/"(_)" pyramid as the dev field, the right-end pods
+// carrying hr / cabin-2 / the scouts like the cabins-collapsed full
+// plan), and a break/mail strip at the right end when >=60 cols pay for
+// it. Everything lives in grid rows 1..6: plans clamp to >=12 rows but
+// the mobile grid can be 8, and the grid clips whatever sinks deeper —
+// anchors and hotspots must stay above the cut. Guards follow the full
+// plan's feature-gated pattern; sub-60-col widths simply lose the strip.
+func buildMicro(p *Plan, W, H int) {
+	props := &p.Props
+	anchors := p.Anchor
+
+	// top status row: wall clock + boss nameplate; the calendar where
+	// there is room for it (same guarded-decor pattern as the bookshelf).
+	p.Hot.Clock = Point{X: 2, Y: 1}
+	p.Nameplate = Point{X: 12, Y: 1}
+	if W >= 32 {
+		*props = append(*props, PlanProp{X: 24, Y: 1, Glyph: "[###]", Color: "gray"})
+	}
+
+	// boss corner: desk, mug on the desk row; the boss stands on the
+	// corridor row just under them (his idle blink-z floats one row up
+	// onto blank cells — anchored on the desk row it would stomp the
+	// nameplate). Guest chairs flank the dispatch-briefing spot beside
+	// him, mirroring the full plan's desk/anchor/mug column stack.
+	*props = append(*props,
+		PlanProp{X: 2, Y: 2, Glyph: "[=BOSS=]"},
+		PlanProp{X: 15, Y: 2, Glyph: "(~)", Color: "white"},
+		PlanProp{X: 2, Y: 3, Glyph: "o", Color: "green"},
+		PlanProp{X: 9, Y: 3, Glyph: "o", Color: "green"},
+	)
+	anchors["manager"] = Point{X: 11, Y: 3}
+	p.Hot.Meet = Point{X: 5, Y: 3}
+
+	// ---- ONE POD ROW (monitor row 4 / desk row 5 / chair row 6) ----
+	// 8-wide pods on an 11-col step, like the dev field. With the break
+	// strip (W>=60) the row stops 18 cols early to leave it room.
+	nb := max(1, (W-29)/11+1)
+	if W < 60 {
+		nb = max(1, (W-12)/11+1) // no strip: pods own the whole row
+	}
+	// right-end pods carry the non-dev seats (guarded, like cabins:
+	// first seats fill from the left as dev pods)
+	far := []string{}
+	if nb >= 2 {
+		far = append(far, "hr")
+	}
+	if nb >= 3 {
+		far = append(far, "cabin-2")
+	}
+	if nb >= 8 {
+		far = append(far, "scout-2")
+	}
+	if nb >= 4 {
+		far = append(far, "scout-1")
+	}
+	devs := nb - len(far)
+	devN := 0
+	for i := 0; i < nb; i++ {
+		px := 3 + i*11
+		*props = append(*props,
+			PlanProp{X: px + 3, Y: 4, Glyph: "[=]", Color: "gray"}, // monitor (lit cyan bold by floor.go when worked)
+			PlanProp{X: px, Y: 5, Glyph: "[______]"},
+			PlanProp{X: px + 2, Y: 6, Glyph: "(_)", Color: "green"},
+		)
+		seat := ""
+		if i < devs {
+			devN++
+			seat = fmt.Sprintf("dev-%d", devN)
+		} else {
+			seat = far[i-devs]
+		}
+		anchors[seat] = Point{X: px + 2, Y: 6}
+	}
+
+	// ---- RIGHT-END BREAK STRIP (guarded: needs >=60 cols) ----
+	if W >= 60 {
+		*props = append(*props,
+			PlanProp{X: W - 15, Y: 4, Glyph: "[#####]", Color: "yellow"}, // kitchen counter
+			PlanProp{X: W - 8, Y: 4, Glyph: "[cof]", Color: "yellow"},    // coffee machine on the counter
+			PlanProp{X: W - 15, Y: 5, Glyph: "("},                        // stool
+			PlanProp{X: W - 14, Y: 5, Glyph: "(__)"},                     // small table
+			PlanProp{X: W - 10, Y: 5, Glyph: ")"},                        // stool
+			PlanProp{X: W - 15, Y: 6, Glyph: "(Y)", Color: "green"},      // corner plant
+			PlanProp{X: W - 8, Y: 6, Glyph: "[mail]"},                    // mail tray
+		)
+		p.Hot.Mail = Point{X: W - 12, Y: 6} // standing left of the tray
+	} else {
+		// no strip: tea/mail targets merge onto the corridor row
+		p.Hot.Mail = Point{X: W - 16, Y: 3}
+	}
+	// walk targets: sipping beside the machine, overflow drifting along the
+	// corridor (the shared roster formula spreads "floor-<n>" from here).
+	p.Hot.Tea = Point{X: W - 8, Y: 3}
+	p.Hot.Overflow = Point{X: W - 24, Y: 3}
 }
 
 // floorDiv — Math.floor division (Go's / truncates toward zero, which

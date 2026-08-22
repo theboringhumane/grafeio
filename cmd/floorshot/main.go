@@ -14,8 +14,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/theboringhumane/grafeio/internal/office"
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/office"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 func parseSize(s string) (int, int, error) {
@@ -74,8 +74,8 @@ func main() {
 		name  string
 		state state.OfficeState
 	}{
-		{"A", seed(2)},   // steady frame: typing arms mid-beat, lit monitors
-		{"B", seed(16)},  // blink frame: sleep-z's float above the idle sprites
+		{"A", seed(2)},  // steady frame: typing arms mid-beat, lit monitors
+		{"B", seed(16)}, // blink frame: sleep-z's float above the idle sprites
 		{"C", func() state.OfficeState { // reviewer at the boss desk: [meetin]
 			st := seed(4)
 			for i := range st.Employees {

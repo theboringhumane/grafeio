@@ -5,13 +5,13 @@ package backend
 import (
 	"testing"
 
-	"github.com/theboringhumane/grafeio/internal/config"
+	"github.com/theboringhumane/theboringoffice/internal/config"
 )
 
 // TestBossSessionTitles: fresh-create title is cfg.Boss.Name exactly;
 // the respawn title strips a trailing "(…)" descriptor ("boss · respawn"
 // reads like a title; "boss (oikonomos) · respawn" does not). A blank
-// Name keeps the historic "grafeio office" so hand-rolled configs cannot
+// Name keeps the historic "theboringoffice office" so hand-rolled configs cannot
 // break the floor.
 func TestBossSessionTitles(t *testing.T) {
 	b := newLiveBackend("", "/tmp", config.Default())
@@ -35,14 +35,16 @@ func TestBossSessionTitles(t *testing.T) {
 	cfg = config.Default()
 	cfg.Boss.Name = ""
 	b = newLiveBackend("", "/tmp", cfg)
-	if got := b.bossName(); got != "grafeio office" {
-		t.Fatalf("blank-name fallback: want %q, got %q", "grafeio office", got)
+	if got := b.bossName(); got != "theboringoffice office" {
+		t.Fatalf("blank-name fallback: want %q, got %q", "theboringoffice office", got)
 	}
 }
 
 // TestRosterNamingOverride: cfg.Roles[role].NamePrefix seeds the numbered
 // roster names; config.Default() reproduces the historic tekton/skopos/
-// dikastes/hemerodromos roster exactly.
+// dikastes/hemerodromos roster — and routes architecture briefs
+// ("architect"/"design"/"review" in the title) to the CTO's desk
+// (state.IsArchitectureBrief is the ONE matcher).
 func TestRosterNamingOverride(t *testing.T) {
 	stock := newNormCtx(config.Default())
 	cases := []struct {
@@ -51,7 +53,8 @@ func TestRosterNamingOverride(t *testing.T) {
 	}{
 		{"write the reducer", "tekton-1"},
 		{"explore the repo", "skopos-1"},
-		{"review the diff", "dikastes-1"},
+		{"review the diff", "theboringcto-1"},  // architecture briefs route to the CTO
+		{"dikastes on the gate", "dikastes-1"}, // explicit reviewer title keeps the cabin
 		{"runner: ship it", "hemerodromos-1"},
 	}
 	for _, c := range cases {

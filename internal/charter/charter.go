@@ -1,5 +1,5 @@
 // Package charter bundles the "oikonomos" office-manager protocol inside
-// grafeio: the charter markdown ships as an embedded asset so a spawned
+// theboringoffice: the charter markdown ships as an embedded asset so a spawned
 // opencode serve can be wired to the manager-orchestration intelligence
 // without the user installing anything else.
 package charter

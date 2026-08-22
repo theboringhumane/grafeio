@@ -17,7 +17,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 // payloadParts builds the parts array for prompt_async: the text part

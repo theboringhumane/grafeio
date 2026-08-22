@@ -55,8 +55,8 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
-	"github.com/theboringhumane/grafeio/internal/chrome"
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/chrome"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 // Attachment limits — machine constants, not user preferences.
@@ -71,7 +71,7 @@ const (
 
 // chatAttachment — one staged chip: the display name + wire MIME plus the
 // file the backend base64s at send time. temp, when non-empty, marks the
-// panel-created temp dir (os.MkdirTemp "grafeio-paste-*") the app cleans
+// panel-created temp dir (os.MkdirTemp "theboringoffice-paste-*") the app cleans
 // up once the send resolves — the panel only removes it for DROPPED
 // attachments (a queued send must still find the file at flush time).
 type chatAttachment struct {
@@ -166,7 +166,7 @@ func probeClipboardImage(orig string, reprobe bool) tea.Cmd {
 		if runtime.GOOS != "darwin" {
 			return clipPasteMsg{unsupported: true, reprobe: reprobe, reinsert: orig}
 		}
-		dir, err := os.MkdirTemp("", "grafeio-paste-*")
+		dir, err := os.MkdirTemp("", "theboringoffice-paste-*")
 		if err != nil {
 			return clipPasteMsg{err: err, reprobe: reprobe, reinsert: orig}
 		}

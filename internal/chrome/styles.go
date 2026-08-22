@@ -1,15 +1,17 @@
-// Package chrome — the central lipgloss style registry for the Grafeio v2
+// Package chrome — the central lipgloss style registry for the theboringoffice v2
 // UI: theme colors, bar/border/tab styles, and the per-role color/glyph maps.
 //
 // Ports nameColor + ROLE_GLYPH from node-legacy/src/office/{roster,sprites}.ts
-// (dup of the office package maps is deliberate here: chrome must not import
-// internal/office, which is owned elsewhere and feeds only the floor).
+// (dup of the office package maps is deliberate here: chrome keeps its role
+// identity data local instead of coupling to the floor's internals. The one
+// sanctioned office seam is SetThemeAuto → office.SetTheme, mirroring main's
+// pinned path so the floor follows device light/dark flips).
 //
 // THEME REGISTRY: every color the UI uses lives in a Theme. SetTheme(name)
 // swaps the active theme and re-points ALL exported style vars (Bar, PanelBox,
 // TabActive, DimText, …) — chrome/panels/topbar/statusbar read those vars at
 // render time, so a switch is live within a frame. Theme names persist to
-// $XDG_CONFIG_HOME/grafeio/theme (best effort); LoadPersistedTheme is read by
+// $XDG_CONFIG_HOME/theboringoffice/theme (best effort); LoadPersistedTheme is read by
 // main at startup.
 package chrome
 
@@ -23,12 +25,19 @@ import (
 	glst "charm.land/glamour/v2/styles"
 	"charm.land/lipgloss/v2"
 
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/office"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 // Theme — every color slot the UI reads from.
 type Theme struct {
 	Name string
+
+	// Dark classifies the palette by its background (BarBg) luminance:
+	// dark palettes sit on dark terminal backgrounds, light ones on light.
+	// SetThemeAuto picks the default of the matching class when the user
+	// pinned nothing.
+	Dark bool
 
 	Accent  color.Color // active tab, boss, pending, count-pending
 	Err     color.Color // blocked/failed/offline
@@ -76,8 +85,9 @@ type Theme struct {
 
 // themeList keeps the /themes order stable (map iteration is random).
 var themeList = []Theme{
-	{ // noir — the original dark look (ANSI palette)
+	{ // noir — the original dark look (ANSI palette); BarBg "8" is dark gray
 		Name:   "noir",
+		Dark:   true,
 		Accent: lipgloss.Color("3"), Err: lipgloss.Color("1"),
 		OK: lipgloss.Color("2"), Info: lipgloss.Color("6"),
 		Magenta: lipgloss.Color("5"), Blue: lipgloss.Color("4"),
@@ -104,6 +114,7 @@ var themeList = []Theme{
 	},
 	{ // paper — light bg, dark fg, the same accents re-darkened
 		Name:   "paper",
+		Dark:   false, // BarBg #d8dce1 — the registry's only light background
 		Accent: lipgloss.Color("#9a6700"), Err: lipgloss.Color("#d1242f"),
 		OK: lipgloss.Color("#1a7f37"), Info: lipgloss.Color("#0891b2"),
 		Magenta: lipgloss.Color("#a626a4"), Blue: lipgloss.Color("#0969da"),
@@ -130,6 +141,7 @@ var themeList = []Theme{
 	},
 	{ // mono — grayscale; emphasis comes from bold/dim, not hue
 		Name:   "mono",
+		Dark:   true, // BarBg #3a3a3a
 		Accent: lipgloss.Color("#e4e4e4"), Err: lipgloss.Color("#d0d0d0"),
 		OK: lipgloss.Color("#c6c6c6"), Info: lipgloss.Color("#bcbcbc"),
 		Magenta: lipgloss.Color("#a8a8a8"), Blue: lipgloss.Color("#949494"),
@@ -158,6 +170,7 @@ var themeList = []Theme{
 	},
 	{ // dracula — canonical palette (draculatheme.com)
 		Name:   "dracula",
+		Dark:   true, // BarBg #44475a over bg #282a36
 		Accent: lipgloss.Color("#f1fa8c"), Err: lipgloss.Color("#ff5555"),
 		OK: lipgloss.Color("#50fa7b"), Info: lipgloss.Color("#8be9fd"),
 		Magenta: lipgloss.Color("#bd93f9"), Blue: lipgloss.Color("#ffb86c"),
@@ -184,6 +197,7 @@ var themeList = []Theme{
 	},
 	{ // solarized — canonical Solarized Dark palette (ethanschoonover.com/solarized)
 		Name:   "solarized",
+		Dark:   true, // BarBg #073642 (base02) over bg #002b36 (base03)
 		Accent: lipgloss.Color("#b58900"), Err: lipgloss.Color("#dc322f"),
 		OK: lipgloss.Color("#859900"), Info: lipgloss.Color("#2aa198"),
 		Magenta: lipgloss.Color("#6c71c4"), Blue: lipgloss.Color("#268bd2"),
@@ -233,8 +247,29 @@ var current Theme
 // CurrentTheme returns the active theme.
 func CurrentTheme() Theme { return current }
 
+// DefaultDarkTheme / DefaultLightTheme are the palettes SetThemeAuto picks
+// for a dark / light terminal background when the user pinned nothing.
+// noir is the long-standing default dark look (and the boot-time fallback);
+// paper is the only light-background palette in the registry — every other
+// entry's BarBg measures dark (see styles_test.go's luminance check).
+const (
+	DefaultDarkTheme  = "noir"
+	DefaultLightTheme = "paper"
+)
+
+// pinned latches once SetTheme applies an explicit user choice (--theme
+// flag, THEBORINGOFFICE_THEME (GRAFEIO_THEME fallback), brain.json ui.theme,
+// the persisted theme file, or a /themes pick). While pinned, device
+// light/dark auto switching
+// (SetThemeAuto) stays out of the way — the user's word wins.
+var pinned bool
+
+// ThemePinned reports whether an explicit theme pin is in effect.
+func ThemePinned() bool { return pinned }
+
 // SetTheme makes `name` the active theme, re-pointing every exported style
-// var. Returns false (and changes nothing) for an unknown name.
+// var, and pins the theme: an explicit choice always beats background
+// auto-detection. Returns false (and changes nothing) for an unknown name.
 func SetTheme(name string) bool {
 	t, ok := themes[name]
 	if !ok {
@@ -242,12 +277,48 @@ func SetTheme(name string) bool {
 	}
 	current = t
 	applyTheme(t)
+	pinned = true
 	return true
 }
 
+// SetThemeAuto follows the terminal's device light/dark background: a dark
+// background gets DefaultDarkTheme, a light one DefaultLightTheme, and the
+// office floor re-points too — the same chrome-then-office pairing main's
+// pinned path does. No-op (returns "") while a theme is pinned.
+//
+// Auto picks are NEVER persisted: the device can flip dark↔light at any
+// time, and the next boot must be free to re-detect. Returns the applied
+// theme name, or "" when a pin suppressed the switch.
+func SetThemeAuto(dark bool) string {
+	if pinned {
+		return ""
+	}
+	name := DefaultLightTheme
+	if dark {
+		name = DefaultDarkTheme
+	}
+	t := themes[name]
+	current = t
+	applyTheme(t)
+	office.SetTheme(name)
+	return name
+}
+
 // ThemeConfigPath is the persisted theme file
-// ($XDG_CONFIG_HOME/grafeio/theme, falling back to ~/.config/grafeio/theme).
+// ($XDG_CONFIG_HOME/theboringoffice/theme, falling back to ~/.config/theboringoffice/theme).
 func ThemeConfigPath() string {
+	return filepath.Join(themeConfigDir(), "theboringoffice", "theme")
+}
+
+// legacyThemeConfigPath is the pre-rename ("grafeio") persisted theme file.
+// Read fallback only (see LoadPersistedTheme): a user's pinned theme
+// survives the rename; PersistTheme writes the NEW path only.
+func legacyThemeConfigPath() string {
+	return filepath.Join(themeConfigDir(), "grafeio", "theme")
+}
+
+// themeConfigDir — the XDG config root both theme paths live under.
+func themeConfigDir() string {
 	dir := os.Getenv("XDG_CONFIG_HOME")
 	if dir == "" {
 		if home, err := os.UserHomeDir(); err == nil {
@@ -256,15 +327,20 @@ func ThemeConfigPath() string {
 			dir = "."
 		}
 	}
-	return filepath.Join(dir, "grafeio", "theme")
+	return dir
 }
 
 // LoadPersistedTheme returns the persisted theme name, or "" when absent
-// or unreadable. Callers (main) decide to SetTheme on it.
+// or unreadable. Callers (main) decide to SetTheme on it. Rename-era
+// fallback: when the new file is absent the pre-rename
+// ~/.config/grafeio/theme is read (never written).
 func LoadPersistedTheme() string {
 	b, err := os.ReadFile(ThemeConfigPath())
 	if err != nil {
-		return ""
+		b, err = os.ReadFile(legacyThemeConfigPath())
+		if err != nil {
+			return ""
+		}
 	}
 	return strings.TrimSpace(string(b))
 }
@@ -468,5 +544,9 @@ func ModeColor(mode state.Mode) color.Color {
 }
 
 func init() {
-	SetTheme("noir")
+	// boot-time fallback only: noir until main routes the terminal's
+	// background reply to SetThemeAuto or an explicit SetTheme pins.
+	// Deliberately NOT a pin — the latch belongs to user choices.
+	current = themes[DefaultDarkTheme]
+	applyTheme(current)
 }

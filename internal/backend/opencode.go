@@ -1,4 +1,4 @@
-// opencode.go — the LIVE backend for grafeio. Port of
+// opencode.go — the LIVE backend for theboringoffice. Port of
 // node-legacy/src/backend/opencode.ts.
 //
 // Responsibilities:
@@ -40,10 +40,10 @@
 // gate. The message.updated completion pin emits the pinned full text on
 // the SAME ID with Pending:false (it stops the stream first). Stop() and
 // session.error flush any still-open stream as Pending:false with a
-// "[grafeio] stream interrupted" note.
+// "[theboringoffice] stream interrupted" note.
 //
 // Office concierge: cfg.Boss.Concierge (default on) adds a second,
-// lightweight root session ("grafeio concierge") so the member never talks
+// lightweight root session ("theboringoffice concierge") so the member never talks
 // to a dark boss while the primary turn is busy. It is created lazily on
 // the FIRST SendConcierge, registered in normCtx as the pseudo-desk
 // "concierge" (its own session's text stream rides EvChatOffice
@@ -72,8 +72,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/theboringhumane/grafeio/internal/config"
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/config"
+	"github.com/theboringhumane/theboringoffice/internal/netwatch"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 type liveBackend struct {
@@ -122,12 +123,33 @@ type liveBackend struct {
 	// class reported by pump, "" when the stream is healthy/recovered. See
 	// sseNote/sseRecovered.
 	sseNoteSig string
+	// Network watch (OFFLINE mode): net probes the internet touchstones on
+	// a fixed cadence and flips the gate after two straight misses (flap
+	// guard — one stray loss must not park the office). netOnline is a chan
+	// that stays CLOSED while online (gate open: pump/pollLoop pass freely)
+	// and is replaced with an open chan on offline (gate shut: both loops
+	// park in waitOnline instead of churning reconnects) — netShut records
+	// which side the gate currently is so a flip never closes twice.
+	// netGen bumps per flip so the pump fresh-starts its SSE ladder on
+	// recovery; netCancel kills the watcher goroutine (Stop).
+	net       *netwatch.Watcher
+	netCancel context.CancelFunc
+	netOnline chan struct{}
+	netShut   bool
+	netGen    int
 	// lastAbortAt stamps the most recent AbortSessions round (ms): an
 	// empty completion landing inside the quiet window after it is the
 	// aborted turn's own death rattle and is swallowed instead of surfacing
 	// as a "could not read reply" line (see maybeBossCompleted).
 	lastAbortAt int64
-	// Office concierge ("grafeio concierge" side session; see SendConcierge).
+	// review — the CTO's once-per-drained-board latch over the CHILD-
+	// SESSION brief board (ctx.tasks): any child EvDispatch re-arms it, and
+	// the return that drains the board makes the CTO post his ONE review
+	// beat (EvStatus + EvMail notice — see cto.go). The agentmemory mirror
+	// (syncBoard/amTasks) deliberately never arms it: the CTO reviews the
+	// office's own dispatched work, not a foreign board.
+	review reviewLatch
+	// Office concierge ("theboringoffice concierge" side session; see SendConcierge).
 	// conciergeID is "" until the first SendConcierge creates the session
 	// lazily (a quiet boss NEVER spins one up); conciergeBooted latches
 	// once the preamble has ridden the first prompt (subsequent prompts go
@@ -141,7 +163,7 @@ type liveBackend struct {
 }
 
 func newLiveBackend(baseURL, directory string, cfg *config.Config) *liveBackend {
-	return &liveBackend{
+	b := &liveBackend{
 		directory:       directory,
 		optURL:          baseURL,
 		cfg:             cfg,
@@ -155,7 +177,14 @@ func newLiveBackend(baseURL, directory string, cfg *config.Config) *liveBackend 
 		amMails:         make(map[string]bool),
 		client:          &http.Client{Timeout: 15 * time.Second},
 		sseClient:       &http.Client{},
+		net:             netwatch.New(nil, 0),
+		netOnline:       make(chan struct{}),
 	}
+	// The gate bootstraps OPEN (closed chan): the office assumes
+	// connectivity until the watcher's first confirmed round refutes it —
+	// degrade open, same as every other probe in this file.
+	close(b.netOnline)
+	return b
 }
 
 func (b *liveBackend) Mode() state.Mode { return state.ModeLive }
@@ -166,7 +195,7 @@ func (b *liveBackend) Start(emit func(state.Event)) error {
 	b.fl.setEmit(emit)
 
 	// Manager charter (oikonomos) runs FIRST, before server resolution:
-	// any directory grafeio serves gets .opencode/oikonomos.md + the
+	// any directory theboringoffice serves gets .opencode/oikonomos.md + the
 	// opencode.json instructions entry wired ahead of a spawned serve
 	// reading its project config. A degradation never blocks the boot —
 	// failures surface on the status line only.
@@ -187,7 +216,7 @@ func (b *liveBackend) Start(emit func(state.Event)) error {
 			// with the merge already on disk. Behind an explicit URL (cfg/OPENCODE_SERVER)
 			// the server is not ours to restart — the note stands and the
 			// charter applies from the server's next boot.
-			b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] manager charter: restarting serve so it picks up the config"})
+			b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] manager charter: restarting serve so it picks up the config"})
 			_ = proc.Process.Kill()
 			_ = proc.Wait()
 			spawnedURL, proc, err = spawnServe(b.directory)
@@ -212,6 +241,17 @@ func (b *liveBackend) Start(emit func(state.Event)) error {
 	b.primaryID = primary.ID
 	b.mu.Unlock()
 
+	// Connectivity watcher (OFFLINE mode): once the server stands, start
+	// probing the internet. Offline parks pump/pollLoop at the gate (one
+	// EvOffline pair), online reopens it with a fresh SSE ladder (one
+	// EvOnline pair) — see onNetTransition. The goroutine dies via ctx in
+	// Stop; a boot stranded before this point never spawns it (no leak).
+	netCtx, netCancel := context.WithCancel(context.Background())
+	b.mu.Lock()
+	b.netCancel = netCancel
+	b.mu.Unlock()
+	go b.net.Start(netCtx, b.onNetTransition)
+
 	// Fixed seats: the boss and Mnemosyne (hr) are always on the floor.
 	b.fl.emit(state.Event{Kind: state.EvHire, Employee: state.Employee{
 		ID: primary.ID, Name: "manager", Role: state.RoleManager, Seat: "manager", Sprite: state.SpriteAtDesk,
@@ -231,14 +271,17 @@ func (b *liveBackend) Start(emit func(state.Event)) error {
 	if b.am.kind == "actions" {
 		board = "agentmemory (" + b.am.winner + ")"
 	}
-	b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] live - " + u + " | board: " + board})
+	b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] live - " + u + " | board: " + board})
 
-	if b.cfg.Boss.Model != "" {
-		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] boss model override: " + string(b.cfg.Boss.Model)})
+	if m := b.bossModelRef(); m != "" {
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] boss model override: " + m})
+	}
+	if b.cfg.Backend.CTOModel != "" {
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] cto model override: " + b.cfg.Backend.CTOModel})
 	}
 
 	if !b.cfg.Boss.Concierge {
-		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] office concierge: off (boss.concierge=false) — busy-boss chat routes to the boss queue"})
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] office concierge: off (boss.concierge=false) — busy-boss chat routes to the boss queue"})
 	}
 
 	if b.am.kind == "actions" {
@@ -318,7 +361,7 @@ func (b *liveBackend) SendWith(text string, atts []state.Attachment) error {
 	b.mu.Unlock()
 
 	// Respawn path (ResetPrimary cleared the hold): establish a primary
-	// session on demand — forced-fresh ("grafeio office · respawn") when
+	// session on demand — forced-fresh ("theboringoffice office · respawn") when
 	// ResetPrimary(true) latched it, otherwise the normal reuse pass.
 	oldID := b.respawnOldID
 	if ready && primaryID == "" {
@@ -329,13 +372,13 @@ func (b *liveBackend) SendWith(text string, atts []state.Attachment) error {
 		if forceFresh {
 			primary, perr = b.createPrimary(b.bossNameShort() + " · respawn")
 			if perr == nil {
-				b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] primary session respawned fresh (" + primary.ID + ")"})
+				b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] primary session respawned fresh (" + primary.ID + ")"})
 			}
 		} else {
 			primary, perr = b.ensurePrimary()
 		}
 		if perr != nil {
-			b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] primary respawn failed: " + shortTitle(perr.Error(), 100)})
+			b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] primary respawn failed: " + shortTitle(perr.Error(), 100)})
 		} else {
 			b.mu.Lock()
 			b.primaryID = primary.ID
@@ -359,7 +402,7 @@ func (b *liveBackend) SendWith(text string, atts []state.Attachment) error {
 		deadID := "boss-" + itoa(b.chatSeq)
 		b.mu.Unlock()
 		b.fl.emit(state.Event{Kind: state.EvChatBoss, Msg: state.ChatMsg{
-			ID: deadID, From: "boss", Text: "[grafeio] backend not started", At: nowMs(), Pending: false,
+			ID: deadID, From: "boss", Text: "[theboringoffice] backend not started", At: nowMs(), Pending: false,
 		}})
 		return nil
 	}
@@ -386,7 +429,7 @@ func (b *liveBackend) SendWith(text string, atts []state.Attachment) error {
 		b.fl.emit(state.Event{Kind: state.EvChatBoss, Msg: state.ChatMsg{
 			ID:      pendingID,
 			From:    "boss",
-			Text:    "[grafeio] prompt failed: " + shortTitle(err.Error(), 120),
+			Text:    "[theboringoffice] prompt failed: " + shortTitle(err.Error(), 120),
 			At:      nowMs(),
 			Pending: false,
 		}})
@@ -412,7 +455,7 @@ const conciergePreamble = "You are the office concierge. The boss is busy right 
 // the app type-asserts it when the boss's turn is occupied; deliberately NOT
 // on state.Backend, mirrors SessionAborter/SendWith).
 //
-// Lifecycle: the concierge session ("grafeio concierge", same serve, same
+// Lifecycle: the concierge session ("theboringoffice concierge", same serve, same
 // cwd) is created LAZILY on this first call — a quiet boss never pays for
 // one (CONCIERGE-proof: ConciergeID() stays "" until first use). Once made,
 // it registers inside normCtx as the pseudo-desk "concierge"
@@ -463,21 +506,21 @@ func (b *liveBackend) SendConcierge(text string) error {
 		deadID := "office-pend-" + itoa(b.chatSeq)
 		b.mu.Unlock()
 		b.fl.emit(state.Event{Kind: state.EvChatOffice, Msg: state.ChatMsg{
-			ID: deadID, From: "office", Kind: "office", Text: "[grafeio] backend not started", At: nowMs(), Pending: false,
+			ID: deadID, From: "office", Kind: "office", Text: "[theboringoffice] backend not started", At: nowMs(), Pending: false,
 		}})
 		return nil
 	}
 	if conciergeID == "" {
-		sesh, err := b.createPrimary("grafeio concierge")
+		sesh, err := b.createPrimary("theboringoffice concierge")
 		if err != nil {
-			b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] concierge session create failed: " + shortTitle(err.Error(), 100)})
+			b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] concierge session create failed: " + shortTitle(err.Error(), 100)})
 			b.mu.Lock()
 			b.chatSeq++
 			deadID := "office-pend-" + itoa(b.chatSeq)
 			b.mu.Unlock()
 			b.fl.emit(state.Event{Kind: state.EvChatOffice, Msg: state.ChatMsg{
 				ID: deadID, From: "office", Kind: "office",
-				Text: "[grafeio] office concierge unavailable: " + shortTitle(err.Error(), 100), At: nowMs(), Pending: false,
+				Text: "[theboringoffice] office concierge unavailable: " + shortTitle(err.Error(), 100), At: nowMs(), Pending: false,
 			}})
 			return nil // degrade: do not hard-fail the message
 		}
@@ -486,7 +529,7 @@ func (b *liveBackend) SendConcierge(text string) error {
 		b.ctx.registerConcierge(sesh.ID)
 		conciergeID = sesh.ID
 		b.mu.Unlock()
-		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] office concierge session ready (" + sesh.ID + ")"})
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] office concierge session ready (" + sesh.ID + ")"})
 	}
 	b.mu.Lock()
 	b.chatSeq++
@@ -520,7 +563,7 @@ func (b *liveBackend) SendConcierge(text string) error {
 			ID:      pendingID,
 			From:    "office",
 			Kind:    "office",
-			Text:    "[grafeio] concierge prompt failed: " + shortTitle(err.Error(), 120),
+			Text:    "[theboringoffice] concierge prompt failed: " + shortTitle(err.Error(), 120),
 			At:      nowMs(),
 			Pending: false,
 		}})
@@ -564,7 +607,7 @@ func (b *liveBackend) Stop() error {
 	// bubble (update-in-place on the same ID) with an interruption note.
 	// Must run BEFORE fl.stop() seals the emit callback.
 	b.mu.Lock()
-	streamEvs := interruptedStreamEvents(b.ctx, "[grafeio] stream interrupted")
+	streamEvs := interruptedStreamEvents(b.ctx, "[theboringoffice] stream interrupted")
 	for id := range b.chatSlots {
 		delete(b.chatSlots, id)
 	}
@@ -578,10 +621,15 @@ func (b *liveBackend) Stop() error {
 	b.mu.Lock()
 	cancel := b.sseCancel
 	b.sseCancel = nil
+	netCancel := b.netCancel
+	b.netCancel = nil
 	proc := b.proc
 	b.proc = nil
 	b.mu.Unlock()
 
+	if netCancel != nil {
+		netCancel() // kills the connectivity watcher goroutine (no leak)
+	}
 	if cancel != nil {
 		cancel()
 	}
@@ -597,8 +645,9 @@ func (b *liveBackend) Stop() error {
 var urlRe = regexp.MustCompile(`https?://\S+`)
 var urlTrimRe = regexp.MustCompile(`[.,;)\]]+$`)
 
-// debugSSE toggles the raw SSE trace in streamOnce (GRAFEIO_DEBUG_SSE=1).
-var debugSSE = os.Getenv("GRAFEIO_DEBUG_SSE") != ""
+// debugSSE toggles the raw SSE trace in streamOnce
+// (THEBORINGOFFICE_DEBUG_SSE=1; pre-rename GRAFEIO_DEBUG_SSE=1 works too).
+var debugSSE = envOrLegacy("THEBORINGOFFICE_DEBUG_SSE", "GRAFEIO_DEBUG_SSE") != ""
 
 // spawnServe runs `opencode serve --port 0 --hostname 127.0.0.1` and
 // resolves with the listening URL scanned from stdout, or dies after 10s.
@@ -749,11 +798,11 @@ func httpErrorText(status int, body []byte) string {
 
 // STALE_SESSION_MSG_LIMIT: a reused root session carrying more history
 // than this is treated as a stale giant context (the class that timed out
-// turns earlier) and a fresh "grafeio office" session is created anyway.
+// turns earlier) and a fresh "theboringoffice office" session is created anyway.
 const STALE_SESSION_MSG_LIMIT = 50
 
 // ensurePrimary reuses the newest root session for this directory, else
-// creates one titled "grafeio office". Reuse passes the stale check first:
+// creates one titled "theboringoffice office". Reuse passes the stale check first:
 // > STALE_SESSION_MSG_LIMIT messages -> create fresh anyway. The choice is
 // logged on the status line.
 func (b *liveBackend) ensurePrimary() (ocSession, error) {
@@ -773,11 +822,11 @@ func (b *liveBackend) ensurePrimary() (ocSession, error) {
 			count := b.sessionMessageCount(newest.ID)
 			if count > STALE_SESSION_MSG_LIMIT {
 				b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
-					"[grafeio] primary session %s has %d msgs (> %d, stale) — creating fresh", newest.ID, count, STALE_SESSION_MSG_LIMIT)})
+					"[theboringoffice] primary session %s has %d msgs (> %d, stale) — creating fresh", newest.ID, count, STALE_SESSION_MSG_LIMIT)})
 				return b.createPrimary(b.bossName())
 			}
 			b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
-				"[grafeio] primary session: reuse %s (%d msgs)", newest.ID, count)})
+				"[theboringoffice] primary session: reuse %s (%d msgs)", newest.ID, count)})
 			return *newest, nil
 		}
 	}
@@ -798,10 +847,10 @@ func (b *liveBackend) resolvePrimary() (ocSession, error) {
 		var s ocSession
 		if err := b.doJSON(http.MethodGet, "/session/"+override, nil, &s); err == nil && s.ID != "" {
 			b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
-				"[grafeio] primary session: restored %s (office session on disk)", s.ID)})
+				"[theboringoffice] primary session: restored %s (office session on disk)", s.ID)})
 			return s, nil
 		}
-		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] saved office session's primary " + override + " is gone server-side — normal find-or-create instead"})
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] saved office session's primary " + override + " is gone server-side — normal find-or-create instead"})
 	}
 	return b.ensurePrimary()
 }
@@ -840,7 +889,7 @@ func (b *liveBackend) QueueItemStart(index int, title string) string {
 	}
 	boardID, err := b.am.CreateAction(fmt.Sprintf("QUE-%d: %s", index, title), fmt.Sprintf("que-%d", index))
 	if err != nil {
-		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] board action create failed: " + shortTitle(err.Error(), 100)})
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] board action create failed: " + shortTitle(err.Error(), 100)})
 		return ""
 	}
 	return boardID
@@ -853,14 +902,14 @@ func (b *liveBackend) QueueItemDone(boardID string) {
 		return
 	}
 	if err := b.am.MarkAction(boardID, "done"); err != nil {
-		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] board action mark done failed: " + shortTitle(err.Error(), 100)})
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] board action mark done failed: " + shortTitle(err.Error(), 100)})
 	}
 }
 
 // ResetPrimary clears the hold on the primary session so the NEXT Send
 // lazily establishes a replacement (nothing is archived/deleted — the old
 // session simply stops being the boss). With forceNew=true the
-// replacement is a BRAND-NEW session titled "grafeio office · respawn",
+// replacement is a BRAND-NEW session titled "theboringoffice office · respawn",
 // consumed one-shot; false runs the normal reuse pass (which still creates
 // fresh when the newest root session is stale). Live backend only; the
 // demo twin is a no-op. Used by the queue-flush resilience path: a failed
@@ -874,10 +923,10 @@ func (b *liveBackend) ResetPrimary(forceNew bool) error {
 	concID := b.forgetConciergeLocked() // respawn semantics: concierge goes with the office
 	b.mu.Unlock()
 	if concID != "" {
-		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] office concierge dismissed with the respawn (" + concID + ") — next busy-boss message recreates it lazily"})
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] office concierge dismissed with the respawn (" + concID + ") — next busy-boss message recreates it lazily"})
 	}
 	b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
-		"[grafeio] primary session reset (forceNew=%v) — next send respawns", forceNew)})
+		"[theboringoffice] primary session reset (forceNew=%v) — next send respawns", forceNew)})
 	return nil
 }
 
@@ -910,7 +959,7 @@ func (b *liveBackend) PrimaryID() string {
 // NewOffice — the /new command's backend leg: ResetPrimary(true) semantics
 // (the old primary is un-seated, seconds-old respawn latch consumed, the
 // server-side session itself NEVER deleted), then create a BRAND-NEW
-// primary titled "grafeio office" (bossName()) NOW — not lazily on the
+// primary titled "theboringoffice office" (bossName()) NOW — not lazily on the
 // next send — and re-seat the floor boss on it (fire the old hire row,
 // hire the new one). Returns the new session id so the persist loop
 // threads it into the next snapshot. Requires a started backend.
@@ -930,7 +979,7 @@ func (b *liveBackend) NewOffice() (string, error) {
 	concID := b.forgetConciergeLocked() // a fresh office starts fresh-concierge too
 	b.mu.Unlock()
 	if concID != "" {
-		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] office concierge dismissed with the new office (" + concID + ") — next busy-boss message recreates it lazily"})
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] office concierge dismissed with the new office (" + concID + ") — next busy-boss message recreates it lazily"})
 	}
 	if old != "" && old != primary.ID {
 		b.fl.emit(state.Event{Kind: state.EvFire, EmployeeID: old})
@@ -938,7 +987,7 @@ func (b *liveBackend) NewOffice() (string, error) {
 	b.fl.emit(state.Event{Kind: state.EvHire, Employee: state.Employee{
 		ID: primary.ID, Name: "manager", Role: state.RoleManager, Seat: "manager", Sprite: state.SpriteAtDesk,
 	}})
-	b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] new office session fresh (" + primary.ID + ")"})
+	b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] new office session fresh (" + primary.ID + ")"})
 	return primary.ID, nil
 }
 
@@ -952,22 +1001,26 @@ func (b *liveBackend) NewOffice() (string, error) {
 // accepted (HTTP 204). Attachments that fail to read are skipped with a
 // status note rather than sinking the prompt (parts.go).
 //
-// cfg.Boss.Model rides as {"model":{"providerID","modelID"}} — the exact
-// shape serve 1.18.19 documents in GET /doc for prompt_async (verified
-// 2026-08-21 against the spawned server). A ModelRef without a
-// "provider/model" slash is ignored with a status note. If a serve ever
-// rejects the model field with 400 (an older/foreign server), the override
-// latches off and the prompt retries bare — degrade open, never fake it.
+// The configured model override rides as {"model":{"providerID","modelID"}}
+// — the exact shape serve 1.18.19 documents in GET /doc for prompt_async
+// (verified 2026-08-21 against the spawned server). The attached model is
+// routed by target session (see promptModelOverride): boss/concierge
+// prompts take the boss override (cfg.Backend.BossModel, falling back to
+// the legacy cfg.Boss.Model), a CTO-seated session takes
+// cfg.Backend.CTOModel. A ModelRef without a "provider/model" slash is
+// ignored with a status note. If a serve ever rejects the model field with
+// 400 (an older/foreign server), the override latches off and the prompt
+// retries bare — degrade open, never fake it.
 func (b *liveBackend) postPrompt(sessionID, text string, atts []state.Attachment) error {
 	parts, skipped := payloadParts(text, atts)
 	if len(skipped) > 0 {
 		// The prompt still goes out with whatever parts survived — the
 		// member sees exactly which attachment didn't make it.
-		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] could not attach " +
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] could not attach " +
 			strings.Join(skipped, ", ") + " (file unreadable) — sent without it"})
 	}
 	payload := map[string]any{"parts": parts}
-	provider, model := splitModelRef(string(b.cfg.Boss.Model))
+	provider, model := splitModelRef(b.promptModelOverride(sessionID))
 	b.mu.Lock()
 	rejected := b.promptModelRejected
 	b.mu.Unlock()
@@ -981,8 +1034,8 @@ func (b *liveBackend) postPrompt(sessionID, text string, atts []state.Attachment
 		b.mu.Lock()
 		b.promptModelRejected = true
 		b.mu.Unlock()
-		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] boss model override unavailable on this serve (400 rejected the model field) — continuing without it"})
-		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] boss model override unavailable in serve (see /doc session.prompt_async): retrying bare prompt"})
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] boss model override unavailable on this serve (400 rejected the model field) — continuing without it"})
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] boss model override unavailable in serve (see /doc session.prompt_async): retrying bare prompt"})
 		// Retry bare exactly once: the member-visible cost of the failed
 		// POST was zero (rejected before the turn started).
 		payload = map[string]any{"parts": parts}
@@ -990,6 +1043,39 @@ func (b *liveBackend) postPrompt(sessionID, text string, atts []state.Attachment
 		err = b.doJSON(http.MethodPost, "/session/"+sessionID+"/prompt_async", body, nil)
 	}
 	return err
+}
+
+// bossModelRef is the effective boss (primary-session) model override:
+// cfg.Backend.BossModel wins when set; the legacy cfg.Boss.Model stands
+// otherwise (an existing brain.json keeps working). "" = server default.
+func (b *liveBackend) bossModelRef() string {
+	if s := strings.TrimSpace(b.cfg.Backend.BossModel); s != "" {
+		return s
+	}
+	return string(b.cfg.Boss.Model)
+}
+
+// promptModelOverride routes the model override for the prompt's target
+// session: a session the floor hired as the CTO (events.go
+// roleFromSession — state.IsArchitectureBrief is the ONE matcher) takes
+// cfg.Backend.CTOModel; everything else (the primary, the concierge, and
+// any unhired id) takes the boss override. "" = no override, the payload
+// ships without a "model" key at all (additive only).
+//
+// Note on reachability: CTO children are created by the serve itself on
+// the boss's task-tool calls — theboringoffice never POSTs their sessions or
+// prompts (see normCtx: per-sub-agent model dispatch is opencode's, not
+// ours) — so today a CTO-seated override surfaces only where theboringoffice
+// itself prompts one. The routing rule lives here EXACTLY ONCE so any
+// future per-child prompt path carries it without re-learning the rule.
+func (b *liveBackend) promptModelOverride(sessionID string) string {
+	b.mu.Lock()
+	emp, ok := b.ctx.employees[sessionID]
+	b.mu.Unlock()
+	if ok && emp.Role == state.RoleCTO {
+		return b.cfg.Backend.CTOModel
+	}
+	return b.bossModelRef()
 }
 
 // splitModelRef parses "provider/model" (ModelRef). Both halves must be
@@ -1011,7 +1097,7 @@ func (b *liveBackend) bossName() string {
 	if b.cfg.Boss.Name != "" {
 		return b.cfg.Boss.Name
 	}
-	return "grafeio office"
+	return "theboringoffice office"
 }
 
 // bossNameShort strips a trailing "(…)" parenthetical for the respawn
@@ -1064,21 +1150,20 @@ func (b *liveBackend) AnswerPermission(permissionID, response string) error {
 //
 // Primary route is the modern global one (POST /question/{requestID}/reply,
 // opencode 1.18.19 /doc: body {"answers": [["label"], ...]} — one
-// string-array per asked question; -> 200 boolean). Fallback is the
+// string-array per asked question; -> 200 boolean). answers arrives already
+// in THAT wire shape (string[][]): a multiple-select (checkbox) page puts
+// every picked label in its own slot, radio/free-text pages carry one — the
+// body ships verbatim, no per-question single-wrap. Fallback is the
 // session-scoped v2 route
 // (POST /api/session/{sessionID}/question/{requestID}/reply, same body
 // shape) keyed by the session the request was seen on via the normCtx hold.
 // NOTE: /doc 1.18.19 exposes NO /session/{id}/questions/... legacy shim for
 // questions the way permissions had — the v2 route is the only fallback.
-func (b *liveBackend) AnswerQuestion(requestID string, answers []string) error {
+func (b *liveBackend) AnswerQuestion(requestID string, answers [][]string) error {
 	if b.fl.isStopped() {
 		return errors.New("backend stopped")
 	}
-	wrapped := make([][]string, len(answers))
-	for i, a := range answers {
-		wrapped[i] = []string{a}
-	}
-	body, _ := json.Marshal(map[string]any{"answers": wrapped})
+	body, _ := json.Marshal(map[string]any{"answers": answers})
 	if err := b.doJSON(http.MethodPost, "/question/"+requestID+"/reply", body, nil); err == nil {
 		return nil
 	}
@@ -1126,9 +1211,9 @@ func (b *liveBackend) RejectQuestion(requestID string) error {
 // the collected errors.Join is the return value.
 //
 // Post-abort tidy: any boss text stream still mid-delta is flushed as a
-// final "[grafeio] stream interrupted" bubble (same shape as Stop's
+// final "[theboringoffice] stream interrupted" bubble (same shape as Stop's
 // graceful shutdown), and the OLDEST outstanding pending placeholder (the
-// FIFO head — the RUNNING turn's bubble) closes with a "[grafeio] stopped"
+// FIFO head — the RUNNING turn's bubble) closes with a "[theboringoffice] stopped"
 // note so the UI never shows a frozen typing bubble for a dead turn when
 // the serve drops the aborted turn without a completion pin. Placeholders
 // BEHIND the head belong to queued prompts the serve still owns and will
@@ -1172,20 +1257,20 @@ func (b *liveBackend) AbortSessions() error {
 	for _, id := range ids {
 		if err := b.abortSession(id); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", id, err))
-			b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] abort failed for session " + id + ": " + shortTitle(err.Error(), 100)})
+			b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] abort failed for session " + id + ": " + shortTitle(err.Error(), 100)})
 			continue
 		}
 		aborted++
 	}
 	b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
-		"[grafeio] turn aborted (%d/%d session(s))", aborted, len(ids))})
+		"[theboringoffice] turn aborted (%d/%d session(s))", aborted, len(ids))})
 
 	// Flush what the aborted turn leaves behind, then close the running
 	// turn's placeholder: text streams flush interrupted (boss lane and
 	// office lane alike — per-stream session routing), the FIFO heads get
 	// the stopped marker.
 	b.mu.Lock()
-	streamEvs := interruptedStreamEvents(b.ctx, "[grafeio] stream interrupted")
+	streamEvs := interruptedStreamEvents(b.ctx, "[theboringoffice] stream interrupted")
 	for id := range b.chatSlots {
 		delete(b.chatSlots, id)
 	}
@@ -1207,7 +1292,7 @@ func (b *liveBackend) AbortSessions() error {
 		b.fl.emit(state.Event{Kind: state.EvChatBoss, Msg: state.ChatMsg{
 			ID:      headID,
 			From:    "boss",
-			Text:    "[grafeio] stopped (turn aborted)",
+			Text:    "[theboringoffice] stopped (turn aborted)",
 			At:      nowMs(),
 			Pending: false,
 		}})
@@ -1217,7 +1302,7 @@ func (b *liveBackend) AbortSessions() error {
 			ID:      officeHeadID,
 			From:    "office",
 			Kind:    "office",
-			Text:    "[grafeio] stopped (turn aborted)",
+			Text:    "[theboringoffice] stopped (turn aborted)",
 			At:      nowMs(),
 			Pending: false,
 		}})
@@ -1351,6 +1436,73 @@ func (b *liveBackend) deleteChild(sessionID string) {
 
 // ---------------------------------------------------------------- SSE
 
+// waitOnline parks the caller while the office is OFFLINE: it returns
+// (gen, true) once the gate is open (netOnline closed) or (0, false) on
+// Stop. While online it returns immediately — callers pay one mutex + one
+// chan read per loop pass. gen is re-read at wake time, so a loop that
+// slept through an offline→online round sees the LATEST generation and can
+// fresh-start its backoff ladder.
+func (b *liveBackend) waitOnline() (int, bool) {
+	for {
+		if b.fl.isStopped() {
+			return 0, false
+		}
+		b.mu.Lock()
+		gate := b.netOnline
+		gen := b.netGen
+		b.mu.Unlock()
+		select {
+		case <-gate:
+			b.mu.Lock()
+			gen = b.netGen
+			b.mu.Unlock()
+			return gen, true
+		case <-b.fl.done:
+			return 0, false
+		}
+	}
+}
+
+// netGateFlip applies a connectivity flip to the gate plumbing — shut on
+// offline, reopen on online, generation bumped on every flip — and hands
+// back the in-flight SSE cancel (nil-safe for the caller). netShut guards
+// the close so the boot-confirm online flip (gate already open from the
+// constructor) never closes a closed channel.
+func (b *liveBackend) netGateFlip(online bool) context.CancelFunc {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if online && b.netShut {
+		close(b.netOnline)
+		b.netShut = false
+	} else if !online && !b.netShut {
+		b.netOnline = make(chan struct{})
+		b.netShut = true
+	}
+	b.netGen++
+	return b.sseCancel
+}
+
+// onNetTransition is the watcher's emit callback — ONE event pair per
+// connectivity flip, in the same anti-spam spirit as sseNote (the watcher
+// itself fires only on transitions). OFFLINE: shut the gate (pump/pollLoop
+// park) and announce the wait. ONLINE: reopen the gate, bump the
+// generation (the pump fresh-starts its ladder), announce the resume, and
+// soft-cancel the in-flight SSE attempt — a no-op on an already-dead
+// stream, an instant abort on a live one hung on a workless read.
+func (b *liveBackend) onNetTransition(online bool) {
+	cancel := b.netGateFlip(online)
+	if !online {
+		b.fl.emit(state.Event{Kind: state.EvOffline})
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] offline — office waiting for internet…"})
+		return
+	}
+	b.fl.emit(state.Event{Kind: state.EvOnline})
+	b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] back online — resumed"})
+	if cancel != nil {
+		cancel()
+	}
+}
+
 // sseBackoffSteps is the reconnect ladder after a stream pass ends without
 // delivering a single frame: 1s, then 2s, 5s, 10s, then 30s forever
 // (capped). The FIRST frame read off a stream resets the ladder to 1s —
@@ -1368,12 +1520,23 @@ var sseBackoffSteps = []time.Duration{
 // Status notes are deduped per failure class (sseNote): an outage reports
 // ONCE when it starts, once more only if the failure CLASS changes (e.g.
 // clean close -> HTTP 500), stays silent through every ladder retry, and
-// reports recovery with exactly one "[grafeio] event stream: reconnected"
+// reports recovery with exactly one "[theboringoffice] event stream: reconnected"
 // line (sseRecovered, fired by streamOnce's first frame). Never one status
 // line per second while the server is down.
 func (b *liveBackend) pump() {
-	fails := 0 // consecutive passes that delivered no frame
+	fails := 0   // consecutive passes that delivered no frame
+	lastGen := 0 // connectivity gate generation last seen (a flip fresh-starts the ladder)
 	for {
+		// Park while OFFLINE: the office is waiting for the internet, so
+		// nothing here reconnects, notes, or climbs the ladder.
+		gen, up := b.waitOnline()
+		if !up {
+			return
+		}
+		if gen != lastGen {
+			fails = 0 // back online: re-attach immediately on the fast step
+			lastGen = gen
+		}
 		if b.fl.isStopped() {
 			return
 		}
@@ -1395,9 +1558,9 @@ func (b *liveBackend) pump() {
 		}
 		wait := sseBackoffSteps[step]
 		if err == nil {
-			b.sseNote("closed", "[grafeio] event stream closed (board/mail continue; re-attaching in "+shortDur(wait)+")")
+			b.sseNote("closed", "[theboringoffice] event stream closed (board/mail continue; re-attaching in "+shortDur(wait)+")")
 		} else {
-			b.sseNote(sseErrClass(err), "[grafeio] event stream error: "+shortTitle(err.Error(), 100)+
+			b.sseNote(sseErrClass(err), "[theboringoffice] event stream error: "+shortTitle(err.Error(), 100)+
 				" (re-attaching in "+shortDur(wait)+")")
 		}
 		select {
@@ -1433,7 +1596,7 @@ func (b *liveBackend) sseRecovered() {
 	b.sseNoteSig = ""
 	b.mu.Unlock()
 	if had != "" {
-		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] event stream: reconnected"})
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] event stream: reconnected"})
 	}
 }
 
@@ -1505,7 +1668,7 @@ func (b *liveBackend) streamOnce() (bool, error) {
 			continue
 		}
 		if debugSSE {
-			// GRAFEIO_DEBUG_SSE=1: raw stream trace — event type plus, for
+			// THEBORINGOFFICE_DEBUG_SSE=1: raw stream trace — event type plus, for
 			// part traffic, the part id/type/text length so reasoning
 			// streaming behaviour can be verified without a proxy.
 			note := raw.Type
@@ -1530,7 +1693,7 @@ func (b *liveBackend) streamOnce() (bool, error) {
 			fmt.Fprintf(os.Stderr, "[sse-raw] %s | %s\n", note, trimTo(payload, 400))
 		}
 		if err := b.onEvent(raw); err != nil {
-			b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[grafeio] event handling failed (" + raw.Type + "): " + shortTitle(err.Error(), 100)})
+			b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] event handling failed (" + raw.Type + "): " + shortTitle(err.Error(), 100)})
 		}
 	}
 	return progressed, sc.Err()
@@ -1679,7 +1842,7 @@ func (b *liveBackend) onEvent(raw ocSSEEvent) error {
 	// Abort window: the serve reports a member-initiated /stop as
 	// session.error "Aborted" on the primary (and concierge — AbortSessions
 	// aborts the whole family) — protocol noise, since AbortSessions already
-	// emitted the intentional "[grafeio] stopped" marker. Swallow those
+	// emitted the intentional "[theboringoffice] stopped" marker. Swallow those
 	// while the quiet window is open; every other error (or any error
 	// outside the window) maps normally.
 	if raw.Type == "session.error" && b.lastAbortAt != 0 && nowMs()-b.lastAbortAt < abortQuietMs {
@@ -1699,6 +1862,13 @@ func (b *liveBackend) onEvent(raw ocSSEEvent) error {
 		}
 	}
 	events := mapOCEvent(raw, b.ctx, primaryID, nowMs())
+	// A fresh child dispatch re-arms the CTO review latch: the batch that
+	// just opened owes him exactly one review when it drains.
+	for _, e := range events {
+		if e.Kind == state.EvDispatch {
+			b.review.arm()
+		}
+	}
 	b.mu.Unlock()
 	for _, e := range events {
 		if e.Kind == state.EvThought {
@@ -1809,6 +1979,17 @@ func (b *liveBackend) maybeChildReturned(sessionID string) {
 	b.fl.emit(state.Event{Kind: state.EvTask, Task: done})
 	b.fl.emit(state.Event{Kind: state.EvReturned, EmployeeID: sessionID, TaskID: done.ID, Mail: mail})
 
+	// Board-drain review: when THIS return was the last open brief of the
+	// batch (zero child-session tasks left in non-done states), the CTO
+	// posts his ONE review beat — the latch spends it, only a fresh child
+	// dispatch re-arms (see onEvent). Locking mirrors the block above.
+	b.mu.Lock()
+	review := b.review.beat(countBoard(b.ctx.tasks))
+	b.mu.Unlock()
+	for _, e := range review {
+		b.fl.emit(e)
+	}
+
 	// Tidy the org chart: delete the child 10s later (best effort).
 	b.fl.at(10*time.Second, func() { b.deleteChild(sessionID) })
 }
@@ -1854,13 +2035,13 @@ func (b *liveBackend) maybeBossCompleted(info ocMessage) {
 
 	text, finish, err := b.messageText(primaryID, info.ID)
 	if err != nil {
-		text = "[grafeio] could not read reply (msg " + info.ID + ")"
+		text = "[theboringoffice] could not read reply (msg " + info.ID + ")"
 	} else if text == "" {
 		if finish == "tool-calls" {
 			return // mid-turn message; the text rides the continuation message
 		}
 		// Abort window: an EMPTY completion right after AbortSessions is the
-		// aborted turn's death rattle — the user already got the "[grafeio]
+		// aborted turn's death rattle — the user already got the "[theboringoffice]
 		// stopped" marker, so swallow it (one completion only; the aborted
 		// placeholder was already popped by AbortSessions, hence the extra
 		// pendingBoss pop below keeps the FIFO balanced). A completion
@@ -1876,7 +2057,7 @@ func (b *liveBackend) maybeBossCompleted(info ocMessage) {
 		if aborted {
 			return
 		}
-		text = "[grafeio] could not read reply (msg " + info.ID + ")"
+		text = "[theboringoffice] could not read reply (msg " + info.ID + ")"
 	}
 	// Boss edits surface as diff events on message completion.
 	b.fetchDiffAndEmit(primaryID)
@@ -1920,7 +2101,7 @@ func (b *liveBackend) maybeOfficeCompleted(info ocMessage) {
 
 	text, finish, err := b.messageText(conciergeID, info.ID)
 	if err != nil {
-		text = "[grafeio] could not read reply (msg " + info.ID + ")"
+		text = "[theboringoffice] could not read reply (msg " + info.ID + ")"
 	} else if text == "" {
 		if finish == "tool-calls" {
 			return // mid-turn message; the text rides the continuation message
@@ -1938,7 +2119,7 @@ func (b *liveBackend) maybeOfficeCompleted(info ocMessage) {
 		if aborted {
 			return
 		}
-		text = "[grafeio] could not read reply (msg " + info.ID + ")"
+		text = "[theboringoffice] could not read reply (msg " + info.ID + ")"
 	}
 	// Concierge edits (it can dispatch AND touch files directly) surface as
 	// diff events on completion, same as the boss lane.
@@ -2003,6 +2184,11 @@ func (b *liveBackend) pollLoop(base time.Duration) {
 	interval := base
 	noChange := 0
 	for {
+		// Park while OFFLINE: a dead board lane must not hammer agentmemory
+		// (or spam its backoff notes) while the office waits for internet.
+		if _, up := b.waitOnline(); !up {
+			return
+		}
 		// Wait FIRST: Start already ran one warming sync before this goroutine
 		// began, mirroring the old fixed-ticker cadence exactly.
 		select {
@@ -2017,7 +2203,7 @@ func (b *liveBackend) pollLoop(base time.Duration) {
 		if changed {
 			if noChange > 0 && interval != base {
 				b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
-					"[grafeio] board poll: change observed — cadence back to %s", shortDur(base))})
+					"[theboringoffice] board poll: change observed — cadence back to %s", shortDur(base))})
 			}
 			noChange = 0
 			interval = base
@@ -2026,7 +2212,7 @@ func (b *liveBackend) pollLoop(base time.Duration) {
 			if next := BackoffInterval(base, interval, noChange); next != interval {
 				interval = next
 				b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
-					"[grafeio] board poll backoff: %s after %d unchanged syncs (cap %s)",
+					"[theboringoffice] board poll backoff: %s after %d unchanged syncs (cap %s)",
 					shortDur(interval), noChange, shortDur(backoffMaxFactor*base))})
 			}
 		}

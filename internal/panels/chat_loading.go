@@ -1,17 +1,23 @@
 // chat_loading.go — the "team is working…" status row: a one-line,
 // COLORFUL, animated indicator for the chat tab, shown only while at
 // least one subagent thread is LIVE. Claude Code cycles spinner verbs
-// while the model chews; grafeio does the same for the whole team: a
+// while the model chews; theboringoffice does the same for the whole team: a
 // shimmering "✦" glyph, a dim "team is working", and a fun gerund that
 // rotates off the office tick (Brewing → Churning → Pondering → …), the
 // word's ink rotating with it.
 //
-// Liveness mirrors renderWorkerGroup's exact live rule (chat.go ~L1645,
-// the same rule threadExpandedNow evaluates at ~L425-443): a thread is
-// live when its roster sprite is busy (agentView.active, fed by
-// workerSpriteActive in SetState) AND the max wtool/wthink meta-tick of
-// its entries sits inside c.tick-wtoolStaleTicks. No extra state wiring:
-// c.agents + c.chat + c.tick already carry everything.
+// Liveness mirrors the thread renderer's live rule EXACTLY — c.threadLive
+// (threads_opencode.go): a thread is live when its roster sprite is busy
+// (agentView.active, fed by workerSpriteActive in SetState) AND the max
+// wtool/wthink meta-tick of its entries sits inside
+// c.tick-wtoolStaleTicks. The two predicates AGREE term-for-term by
+// construction: threadLive answers "is THIS thread live" over a
+// workerGroup's precomputed lastTick, anyThreadActive answers "is ANY
+// thread live" by walking c.chat for the same per-agent max tick (both
+// read active && c.tick-tk <= wtoolStaleTicks). The walk is duplicated
+// deliberately: the loading row renders outside renderConversation's
+// workerGroup bookkeeping, so there is no shared struct to read. No extra
+// state wiring: c.agents + c.chat + c.tick already carry everything.
 //
 // Width safety: the composed (already-styled) row is hard-folded to the
 // panel width with foldStyledRows — the ANSI-aware utility every other
@@ -24,7 +30,7 @@ import (
 
 	"charm.land/lipgloss/v2"
 
-	"github.com/theboringhumane/grafeio/internal/chrome"
+	"github.com/theboringhumane/theboringoffice/internal/chrome"
 )
 
 // loadingWordTicks — ticks per fun-word rotation. The office tick fires
@@ -57,11 +63,13 @@ func loadingColor(i int) color.Color {
 }
 
 // anyThreadActive reports whether at least one subagent thread is LIVE
-// right now — the exact live half of renderWorkerGroup's expand rule
-// (chat.go: active && c.tick-g.lastTick <= wtoolStaleTicks, see ~L1645;
-// the same predicate threadExpandedNow walks at ~L425-443): roster-sprite
-// busy + the agent's freshest wtool/wthink activity inside the staleness
-// horizon. Uses only the chat snapshot (c.chat) and tick (c.tick).
+// right now — the ANY-thread half of the thread renderer's live rule,
+// c.threadLive (threads_opencode.go): roster-sprite busy + the agent's
+// freshest wtool/wthink meta-tick inside the staleness horizon
+// (av.active && c.tick-tk <= wtoolStaleTicks). The predicate agrees with
+// threadLive exactly; it re-walks the chat snapshot (c.chat) because the
+// loading row renders outside renderConversation's workerGroup
+// bookkeeping. Uses only c.chat, c.agents and c.tick.
 func (c *Chat) anyThreadActive() bool {
 	lastTick := map[string]int{}
 	for _, m := range c.chat {

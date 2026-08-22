@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 // TestChatRetentionKeepsFullHistory drives 120 user+boss turn pairs (240

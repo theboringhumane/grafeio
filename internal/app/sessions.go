@@ -2,12 +2,12 @@
 // in the same folder and the previous transcript + roster + board come back;
 // /new starts a fresh office whenever the member wants one.
 //
-// Layout: <GRAFEIO_HOME|HOME>/.grafeio/sessions/<dirhash>/session.json,
+// Layout: <THEBORINGOFFICE_HOME|HOME>/.theboringoffice/sessions/<dirhash>/session.json,
 // dirhash = sha1 of the canonical working directory (symlinks resolved
 // best-effort). The file carries the primary ("boss") session id plus the
 // office surfaces (transcript, roster, board, mail) trimmed to the last 200
 // chat / 50 task / 50 mail entries. Writes are ATOMIC — a unique tmp file
-// per writer + rename: two grafeio instances in the same directory can race,
+// per writer + rename: two theboringoffice instances in the same directory can race,
 // can never corrupt; LAST WRITER WINS by design (comment per the workload
 // ruling — same-dir concurrent instances are the user's choice).
 //
@@ -21,7 +21,7 @@
 //	PrimaryOverride(id) — pre-Start resume pin (server-side 404 falls back
 //	                      to find-or-create; boot never hard-fails)
 //	PrimaryID()         — current primary, feeds the snapshot
-//	NewOffice()         — /new: mint a fresh "grafeio office" primary NOW
+//	NewOffice()         — /new: mint a fresh "theboringoffice office" primary NOW
 package app
 
 import (
@@ -33,7 +33,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/config"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 const (
@@ -62,10 +63,23 @@ type SessionFile struct {
 	SavedAt   int64             `json:"savedAt"` // unix millis
 }
 
-// sessionsBase — <GRAFEIO_HOME|HOME>/.grafeio/sessions (GRAFEIO_HOME is the
-// test/harness scratch root, consistent with config.Path()).
+// sessionsBase — <THEBORINGOFFICE_HOME|HOME>/.theboringoffice/sessions (the
+// home override is the test/harness scratch root, consistent with
+// config.Path(); it also honors the pre-rename GRAFEIO_HOME).
 func sessionsBase() string {
-	home := os.Getenv("GRAFEIO_HOME")
+	home := config.HomeOverride()
+	if home == "" {
+		home = os.Getenv("HOME")
+	}
+	return filepath.Join(home, ".theboringoffice", "sessions")
+}
+
+// legacySessionsBase — the pre-rename ("grafeio") sessions root. Read
+// fallback only: LoadSession consults it when the new file is absent, so an
+// upgrade restores the old office transcript instead of silently starting
+// over. Writes always go to sessionsBase().
+func legacySessionsBase() string {
+	home := config.HomeOverride()
 	if home == "" {
 		home = os.Getenv("HOME")
 	}
@@ -97,7 +111,12 @@ func SessionPath(dir string) string {
 func LoadSession(dir string) (*SessionFile, bool) {
 	b, err := os.ReadFile(SessionPath(dir))
 	if err != nil {
-		return nil, false
+		// rename-era read fallback: the session may live under the old
+		// ~/.grafeio root (see legacySessionsBase — never written to).
+		b, err = os.ReadFile(filepath.Join(legacySessionsBase(), SessionDirHash(dir), "session.json"))
+		if err != nil {
+			return nil, false
+		}
 	}
 	var sf SessionFile
 	if err := json.Unmarshal(b, &sf); err != nil {
@@ -142,7 +161,7 @@ func Snapshot(dir, primaryID string, st state.OfficeState) SessionFile {
 }
 
 // SaveSession writes the snapshot atomically: a UNIQUE tmp file per writer
-// (pid+nsec), then rename — concurrent grafeio instances in the same
+// (pid+nsec), then rename — concurrent theboringoffice instances in the same
 // directory cannot tear the file; last rename wins.
 func SaveSession(dir string, sf SessionFile) error {
 	path := SessionPath(dir)
@@ -185,7 +204,7 @@ type primarySeamBackend interface {
 	PrimaryID() string
 }
 
-// officeSpawnBackend — the /new seam: mint a fresh "grafeio office" primary
+// officeSpawnBackend — the /new seam: mint a fresh "theboringoffice office" primary
 // NOW (not lazily on the next send). The old session is un-seated, never
 // deleted server-side.
 type officeSpawnBackend interface {
@@ -233,7 +252,7 @@ func (m *Model) hydrateSession(sf *SessionFile) {
 
 // persistOfficeSession snapshots the office (LIVE mode ONLY — the demo
 // floor is a scripted tour; persisting it would fake a real transcript on
-// the next boot) and writes ~/.grafeio/sessions/<dirhash>/session.json.
+// the next boot) and writes ~/.theboringoffice/sessions/<dirhash>/session.json.
 //
 //   - force=false — the cheap-write loop (one EvTick check per render
 //     cycle, throttled to sessionWriteMinGap): the disk write itself runs
@@ -263,13 +282,13 @@ func (m *Model) persistOfficeSession(force bool) {
 }
 
 // PersistSession — the exported FINAL-write hook for the runtime shutdown
-// path (cmd/grafeio calls it after p.Run() alongside b.Stop; harnesses may
+// path (cmd/theboringoffice calls it after p.Run() alongside b.Stop; harnesses may
 // call it directly). No-op in demo mode.
 func (m *Model) PersistSession() { m.persistOfficeSession(true) }
 
 // newOffice — the /new slash handler: clear the local surfaces, reset the
 // primary hold (ResetPrimary(true) semantics), then mint a BRAND-NEW
-// "grafeio office" session NOW via the additive seam (the old server-side
+// "theboringoffice office" session NOW via the additive seam (the old server-side
 // session is only un-seated — never deleted; the on-disk transcript is NOT
 // deleted either, the new session's next cheap-write overwrites it:
 // always-latest-wins). In demo mode only the local clear happens (no

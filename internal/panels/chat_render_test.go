@@ -14,7 +14,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
 
-	state "github.com/theboringhumane/grafeio/internal/state"
+	state "github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 // chatDividerRow — the View row index of the divider (a run of cells that
@@ -132,7 +132,7 @@ func TestChatConvoWrapsAtWidth(t *testing.T) {
 	c.SetSize(28, 30)
 
 	codeToken := "export TOKEN=" + strings.Repeat("q", 27) // 40 cells, unbreakable tail
-	urlToken := "https://x.co/" + strings.Repeat("z", 22) // 35 cells, unbreakable
+	urlToken := "https://x.co/" + strings.Repeat("z", 22)  // 35 cells, unbreakable
 	deepPath := "internal/panels/some/really/deep/file.go"
 	wPath := "internal/components/very/deep/file.go"
 
@@ -201,28 +201,35 @@ func TestChatConvoWrapsAtWidth(t *testing.T) {
 		t.Fatalf("the tool continuation must hang 7 cells in:\n%s", view)
 	}
 
-	// (5) the workers thread WRAPS with a "│ " continuation instead of
-	// truncating the path — now INSIDE the thread's rounded border card,
-	// so every card row starts with the box's own left "│" frame
-	if !strings.Contains(view, "│ [tool] read ·") {
-		t.Fatalf("the workers-thread row lost its shape:\n%s", view)
+	// (5) the workers thread WRAPS with a hanging indent instead of
+	// truncating the path — opencode-style: 2-cell indented under the
+	// header, continuations 4 cells in, no card rails anywhere; the
+	// reducer's "read · <path>" text is display-SHAPED to "Read <path>"
+	if !strings.Contains(view, "  [tool] Read") {
+		t.Fatalf("the workers-thread row lost its shaped first-line shape:\n%s", view)
 	}
-	if !strings.Contains(view, "\n││ internal/components/very") {
-		t.Fatalf("a long workers-thread row must continue with a \"│ \" row inside the card:\n%s", view)
+	if !strings.Contains(view, "\n    internal/components/very") {
+		t.Fatalf("a long workers-thread row must continue with a 4-cell hanging indent:\n%s", view)
 	}
 }
 
-// TestThreadCardsCollapsedByDefaultWithCaretsAndBox pins the thread-card
-// redesign at 40 columns: (1) EVERY thread is collapsed by DEFAULT —
-// proven on a LIVE thread (busy sprite + fresh activity, NO explicit
-// expand gesture anywhere); (2) every card carries a caret — "▾" on the
-// collapsed summary row, "▴ ┌" on the expanded header; (3) every card
-// (collapsed one-liner AND expanded block) is framed by the dim rounded
-// border box (╭…╮ cap/sill, │ side rails) with every row inside the
-// width budget; (4) the threadRows click map still toggles the thread
-// from the card's NEW coordinates (border cap row + header row), and it
-// rebuilds across renders. No clocks: every timestamp is a literal.
-func TestThreadCardsCollapsedByDefaultWithCaretsAndBox(t *testing.T) {
+// TestThreadsCollapsedByDefaultSpinnerAndSneak pins the opencode-style
+// thread renderer (threads_opencode.go) at 40 columns: (1) EVERY thread
+// is collapsed by DEFAULT — proven on a LIVE thread (busy sprite + fresh
+// activity, NO explicit expand gesture anywhere); (2) the header is the
+// SINGLE row: 2-cell glyph field (office-tick braille frame — tick 6 →
+// threadLiveFrames[6] "⠾") + "<Kind> Task — <task>", a LIVE head
+// carrying NOTHING else; the DONE head dim-✓'s and keeps the old
+// summary card's rollup, CLIPPED at the width budget (no wrap) — Kind
+// from the roster role (developer = "Developer"); (3) each collapsed
+// thread's second line is the SINGLE-row dim "  ↳ <Verb> <rest>" sneak
+// peek at its NEWEST TOOL entry — BARE (no state mark) and display-
+// SHAPED ("edit · lex.go" → "Edit lex.go"), a trailing thought never
+// stealing the peek; (4) the threadRows click map still toggles the
+// thread from its NEW coordinates (the one header row + the one sneak
+// row), it rebuilds across renders, and expanded internal rows NEVER
+// toggle. No clocks: every timestamp is a literal.
+func TestThreadsCollapsedByDefaultSpinnerAndSneak(t *testing.T) {
 	c := NewChat(nil)
 	c.SetSize(40, 30)
 	c.SetState(state.OfficeState{
@@ -237,11 +244,13 @@ func TestThreadCardsCollapsedByDefaultWithCaretsAndBox(t *testing.T) {
 			{ID: "u1", From: "user", Kind: "user", Text: "one", At: 100},
 			{ID: "b1", From: "boss", Kind: "boss", Text: "on it", At: 200},
 			// tekton-1 — LIVE: busy sprite + activity 0-1 ticks old,
-			// with a thought riding the thread beside the tools
+			// with a thought riding the thread between the tools
 			{ID: "x1", From: "tekton-1", Kind: wtoolKind, Text: "read · lex.go", Meta: "done\x1f5", At: 300},
-			{ID: "x2", From: "tekton-1", Kind: wtoolKind, Text: "edit · lex.go", Meta: "done\x1f6", At: 400},
-			{ID: "x3", From: "tekton-1", Kind: wthinkKind, Text: "tiny thought", Meta: "c1\x1f6", At: 450},
-			// tekton-2 — completed, one tool + one thought
+			{ID: "x2", From: "tekton-1", Kind: wthinkKind, Text: "tiny thought", Meta: "c1\x1f6", At: 400},
+			{ID: "x3", From: "tekton-1", Kind: wtoolKind, Text: "edit · lex.go", Meta: "done\x1f6", At: 450},
+			// tekton-2 — completed, one tool + one thought (the thought
+			// is the newest entry, but the sneak still pins the last TOOL
+			// line — thoughts only fuel the "· 1 think" rollup count)
 			{ID: "y1", From: "tekton-2", Kind: wtoolKind, Text: "read · wire.go", Meta: "done\x1f2", At: 500},
 			{ID: "y2", From: "tekton-2", Kind: wthinkKind, Text: "tiny thought", Meta: "c1\x1f2", At: 550},
 		},
@@ -252,7 +261,7 @@ func TestThreadCardsCollapsedByDefaultWithCaretsAndBox(t *testing.T) {
 	tbAssertExpanded(t, c, "tekton-1", false, "live, no gesture")
 	tbAssertExpanded(t, c, "tekton-2", false, "completed, no gesture")
 
-	// …and in the render: two collapsed cards, no expanded face anywhere
+	// …and in the render: header+sneak lines only, no expanded face
 	view := ansi.Strip(c.View())
 	fmt.Println("---- CHAT PANEL (40 cols, threads collapsed by default, ansi-stripped) ----")
 	fmt.Print(view)
@@ -262,35 +271,40 @@ func TestThreadCardsCollapsedByDefaultWithCaretsAndBox(t *testing.T) {
 			t.Fatalf("row %d overflows the 40-col budget (%d cells): %q\nfull view:\n%s", i, w, r, view)
 		}
 	}
-	if strings.Contains(view, "┌") || strings.Contains(view, "│ [tool]") {
-		t.Fatalf("collapsed-by-default: no thread may render its expanded face:\n%s", view)
+	if strings.Contains(view, "[tool] ") {
+		t.Fatalf("collapsed-by-default: no thread may render its expanded tool list:\n%s", view)
 	}
 	for _, want := range []string{
-		// (2)+(3) the caret opens the summary row INSIDE the box's left
-		// rail — "│▾" is border + caret fused, the card-frame signature;
-		// at 40 cols the summary WRAPS to a hanging continuation row
-		// inside the same card (never truncated)
-		"│▾ tekton-1 · Fix the lexer (· 2 tool",
-		"│  calls · 1 think ✓ done)",
-		"│▾ tekton-2 · Wire the tests (· 1 tool",
-		"│  call · 1 think ✓ done)",
+		// (2) LIVE thread: office-tick braille glyph (tick 6 →
+		// threadLiveFrames[6] "⠾") + role-kind title — no rollup while
+		// running; DONE thread: dim "✓" + title, its rollup CLIPPED into
+		// the single row (no hanging continuation survives)
+		"⠾ Developer Task — Fix the lexer",
+		"✓ Developer Task — Wire the tests",
+		// (3) each collapsed thread's sneak is its NEWEST TOOL entry —
+		// shaped + BARE; tekton-2's trailing thought rolls up in the
+		// "· 1 think" count instead of leading the peek
+		"  ↳ Edit lex.go",
+		"  ↳ Read wire.go",
+		// the live thread's hint row trails the last thread block
+		"ctrl+g · view subagents",
 	} {
 		if !strings.Contains(view, want) {
-			t.Fatalf("collapsed card missing caret/summary/box shape %q:\n%s", want, view)
+			t.Fatalf("collapsed thread missing opencode shape %q:\n%s", want, view)
 		}
 	}
-	if n := strings.Count(view, "╭"); n != 2 {
-		t.Fatalf("two collapsed cards want two box caps, got %d:\n%s", n, view)
-	}
-	if n := strings.Count(view, "╰"); n != 2 {
-		t.Fatalf("two collapsed cards want two box sills, got %d:\n%s", n, view)
+	// single-row contract at 40 cols: no rollup text survives (the LIVE
+	// head carries none, the DONE head's is clipped mid-word), no sneak
+	// continuation rows
+	if strings.Contains(view, "✓ done") || strings.Contains(view, "  tool call") {
+		t.Fatalf("headers/sneaks are SINGLE rows — no rollup wrap may leak at 40 cols:\n%s", view)
 	}
 
-	// (4) the click map: every card registers its cap row AND its header
-	// row (2 cards × 2 rows), and a click at those NEW coordinates
-	// toggles that agent's thread like before
+	// (4) the click map: every collapsed thread registers its ONE
+	// header row AND its ONE sneak row (2 threads × 2 rows), and a
+	// click at those NEW coordinates toggles that agent's thread
 	if len(c.threadRows) != 4 {
-		t.Fatalf("two cards must register 4 clickable rows (cap + header each), got %v", c.threadRows)
+		t.Fatalf("two collapsed threads must register 4 clickable rows (1 header + 1 sneak each), got %v", c.threadRows)
 	}
 	clickAgent := func(agent string) {
 		t.Helper()
@@ -305,18 +319,20 @@ func TestThreadCardsCollapsedByDefaultWithCaretsAndBox(t *testing.T) {
 			t.Fatalf("no clickable row registered for %q", agent)
 		}
 		if !c.ClickRow(2, row) {
-			t.Fatalf("click at the registered card row %d was not claimed", row)
+			t.Fatalf("click at the registered thread row %d was not claimed", row)
 		}
 	}
 	clickAgent("tekton-1")
-	tbAssertExpanded(t, c, "tekton-1", true, "after card click")
-	tbAssertExpanded(t, c, "tekton-2", false, "after card click (other card)")
+	tbAssertExpanded(t, c, "tekton-1", true, "after header click")
+	tbAssertExpanded(t, c, "tekton-2", false, "after header click (other thread)")
 
-	// the expanded card: "▴ ┌" header + tool rows, all inside the box,
-	// while the quiet thread keeps its collapsed card — and with the
-	// per-agent override in place, think bodies ride along (full expand)
+	// the expanded thread: same header on top, then the merged tool rows
+	// 2-cell indented — with the per-agent override the thought's body
+	// rides along (full expand) — then the ↳ sneak AGAIN as the
+	// "current task" line and the dim closing summary, while the quiet
+	// thread keeps its collapsed header+sneak pair
 	view = ansi.Strip(c.View())
-	fmt.Println("---- CHAT PANEL (40 cols, tekton-1 card expanded by click, ansi-stripped) ----")
+	fmt.Println("---- CHAT PANEL (40 cols, tekton-1 thread expanded by click, ansi-stripped) ----")
 	fmt.Print(view)
 	fmt.Println("---- END PANEL ----")
 	for i, r := range strings.Split(view, "\n") {
@@ -324,31 +340,47 @@ func TestThreadCardsCollapsedByDefaultWithCaretsAndBox(t *testing.T) {
 			t.Fatalf("row %d overflows the 40-col budget (%d cells): %q\nfull view:\n%s", i, w, r, view)
 		}
 	}
-	if !strings.Contains(view, "▴ ┌ tekton-1 · Fix the lexer") {
-		t.Fatalf("the expanded card's careted header is missing:\n%s", view)
-	}
-	if !strings.Contains(view, "│ [tool] read · lex.go ✓") ||
-		!strings.Contains(view, "│ [tool] edit · lex.go ✓") {
-		t.Fatalf("the expanded card's tool rows must ride inside the box:\n%s", view)
-	}
-	// a per-agent expand is a FULL expand: the thought's header row AND
-	// its body ride the same card, framed by the box's left rail
-	if !strings.Contains(view, "│ thinking") || !strings.Contains(view, "│   tiny thought") {
-		t.Fatalf("the expanded card's thought rows must ride inside the box:\n%s", view)
-	}
-	if n := strings.Count(view, "╭"); n != 2 || strings.Count(view, "╰") != 2 {
-		t.Fatalf("expanded + collapsed cards both want the box frame (2 caps, 2 sills):\n%s", view)
-	}
-	if !strings.Contains(view, "│▾ tekton-2 · Wire the tests (· 1 tool") ||
-		!strings.Contains(view, "│  call · 1 think ✓ done)") {
-		t.Fatalf("the quiet thread's collapsed card must survive its neighbor's expand:\n%s", view)
+	for _, want := range []string{
+		"⠾ Developer Task — Fix the lexer",
+		"  [tool] Read lex.go ✓",
+		"  [tool] Edit lex.go ✓",
+		"  thinking",
+		"    tiny thought",
+		"  ↳ Edit lex.go",
+		"  · 2 tool calls · 1 think ✓ done",
+		"✓ Developer Task — Wire the tests",
+		"  ↳ Read wire.go",
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("expanded thread missing shape %q:\n%s", want, view)
+		}
 	}
 
-	// the map REBUILDS each render: the expanded card's rows moved
-	// (cap + header again, mid-box rows unclaimed) and a fresh click
-	// folds the thread back to its collapsed card
+	// expanded internal TOOL rows NEVER toggle: the first tool row
+	// (header line + 1) has no threadRows entry, so its click falls
+	// through
+	headerLine := -1
+	for line, name := range c.threadRows {
+		if name == "tekton-1" && (headerLine < 0 || line < headerLine) {
+			headerLine = line
+		}
+	}
+	if headerLine < 0 {
+		t.Fatal("expanded tekton-1 must still register its header row")
+	}
+	if c.ClickRow(2, headerLine+1) {
+		t.Fatalf("click on an expanded internal row (line %d) must not be claimed", headerLine+1)
+	}
+	tbAssertExpanded(t, c, "tekton-1", true, "after internal-row click (no-op)")
+
+	// the map REBUILDS each render: a fresh click on the header folds the
+	// thread back to its collapsed header+sneak pair
 	clickAgent("tekton-1")
-	tbAssertExpanded(t, c, "tekton-1", false, "after second card click")
+	tbAssertExpanded(t, c, "tekton-1", false, "after second header click")
+	view = ansi.Strip(c.View())
+	if strings.Contains(view, "[tool] ") || !strings.Contains(view, "  ↳ Edit lex.go") {
+		t.Fatalf("second click must restore the collapsed sneak:\n%s", view)
+	}
 }
 
 // TestChatKeepsFullTranscriptPastTheOldCap — the WhatsApp retention

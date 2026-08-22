@@ -9,8 +9,8 @@ import (
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 
-	"github.com/theboringhumane/grafeio/internal/chrome"
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/chrome"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 // ActivityCap bounds the rolling log.

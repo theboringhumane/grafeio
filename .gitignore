@@ -2,3 +2,13 @@ node_modules/
 dist/
 *.tgz
 .DS_Store
+
+# Built Go harness binaries (go build ./cmd/... produces these at repo root)
+/headless
+/uishot
+/grafeio
+/theboringoffice
+/termshot
+/soundtest
+/main
+/floorshot

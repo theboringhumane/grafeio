@@ -6,7 +6,7 @@
 package office
 
 import (
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 // ROLE_GLYPH — one rune per role.
@@ -17,6 +17,7 @@ var ROLE_GLYPH = map[state.EmployeeRole]rune{
 	state.RoleScout:     'S',
 	state.RoleReviewer:  'D',
 	state.RoleRunner:    'R',
+	state.RoleCTO:       'C',
 }
 
 // ROLE_COLOR — sprite paint per role, matches the app legend (M yellow, H red, ...).
@@ -27,6 +28,7 @@ var ROLE_COLOR = map[state.EmployeeRole]ColorName{
 	state.RoleScout:     "green",
 	state.RoleReviewer:  "magenta",
 	state.RoleRunner:    "blue",
+	state.RoleCTO:       "white",
 }
 
 const coffeeTicks = 60 // how long a break lasts
@@ -37,7 +39,7 @@ func SpriteFrame(role state.EmployeeRole, sprite state.SpriteState, tick int) st
 	if L == "" {
 		L = "?"
 	}
-	beat := tick % 2 != 0
+	beat := tick%2 != 0
 	switch sprite {
 	case state.SpriteWorking: // typing arms
 		if beat {

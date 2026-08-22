@@ -29,8 +29,8 @@ import (
 	"math/rand"
 	"strings"
 
-	"github.com/theboringhumane/grafeio/internal/office"
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/office"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 const (
@@ -138,18 +138,18 @@ func banterBank(ra, rb state.EmployeeRole) [][]string {
 // `due` ticks, or an arrival CHECK (checkTea): both walkers reached the
 // machine → both bubble "good idea." exactly once.
 type socialBeat struct {
-	due          int
-	events       []state.Event
-	checkTea     bool
-	teaA, teaB   string // walker ids for the arrival check
+	due        int
+	events     []state.Event
+	checkTea   bool
+	teaA, teaB string // walker ids for the arrival check
 }
 
 // SocialClock — the decision state. Model copies share ONE instance (pointer
 // field) so the plan survives the value-copy update loop.
 type SocialClock struct {
-	lastFired int           // tick of the most recent firing decision
-	seq       int           // firing sequence (part of the deterministic seed)
-	pending   []socialBeat  // armed beats, tick-counter scheduled (disarm: pop)
+	lastFired int             // tick of the most recent firing decision
+	seq       int             // firing sequence (part of the deterministic seed)
+	pending   []socialBeat    // armed beats, tick-counter scheduled (disarm: pop)
 	teaPairs  map[string]bool // walker ids with an in-flight tea walk (overlap guard)
 }
 
@@ -389,7 +389,7 @@ func (m *Model) runSocial() {
 	if m.social == nil {
 		return
 	}
-	if beats := m.social.socialStep(m.st, m.perm != nil || m.question != nil,
+	if beats := m.social.socialStep(m.st, m.permQ.front() != nil || m.question != nil,
 		len(m.activeThink) > 0, m.lastDispatchTick); len(beats) > 0 {
 		m.social.pending = append(m.social.pending, beats...)
 	}

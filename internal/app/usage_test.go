@@ -5,7 +5,7 @@ package app
 import (
 	"testing"
 
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 func TestReducerUsageAccumulates(t *testing.T) {

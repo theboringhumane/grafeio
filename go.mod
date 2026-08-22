@@ -1,4 +1,4 @@
-module github.com/theboringhumane/grafeio
+module github.com/theboringhumane/theboringoffice
 
 go 1.25.8
 

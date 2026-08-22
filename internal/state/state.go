@@ -18,7 +18,7 @@ type Attachment struct {
 	Mime string `json:"mime,omitempty"` // resolved at attach time; senders re-sniff when empty
 	Path string `json:"path"`           // the file the sender base64s into the data URL
 	// Temp — non-empty when Path lives in a panel-created temp dir
-	// (os.MkdirTemp "grafeio-paste-*"): the app removes the dir once the
+	// (os.MkdirTemp "theboringoffice-paste-*"): the app removes the dir once the
 	// send resolves (best effort — a queued send must find the file at
 	// flush time, so removal never happens at enqueue).
 	Temp string `json:"-"`
@@ -82,7 +82,23 @@ const (
 	RoleScout     EmployeeRole = "scout"
 	RoleReviewer  EmployeeRole = "reviewer"
 	RoleRunner    EmployeeRole = "runner"
+	RoleCTO       EmployeeRole = "cto"
 )
+
+// IsArchitectureBrief — the ONE architecture-brief matcher for task
+// titles. A brief is architecture-flavored when its title names an
+// architecture activity: it contains "architect", "design" or "review"
+// (case-insensitive substring match — "designer" trips "design" too; the
+// contract is deliberately the dumb substring, not NL). Both backends
+// consult this — never re-check locally: the demo's ad-hoc dispatch
+// routing and the live roleFromSession mapping share it, and it is the
+// unit-tested surface (no second copy may grow anywhere).
+func IsArchitectureBrief(title string) bool {
+	hay := strings.ToLower(title)
+	return strings.Contains(hay, "architect") ||
+		strings.Contains(hay, "design") ||
+		strings.Contains(hay, "review")
+}
 
 type Employee struct {
 	ID     string       `json:"id"`
@@ -151,12 +167,29 @@ type ChatMsg struct {
 	// of the SAME Msg.ID grow the one bubble. The completion pin re-emits the
 	// same ID with Pending:false and the pinned full text; the UI replaces
 	// the streaming bubble with it. A stream that dies before completion
-	// (abort/error/stop) ends Pending:false with a "[grafeio] stream
+	// (abort/error/stop) ends Pending:false with a "[theboringoffice] stream
 	// interrupted" note appended. UI: update-in-place by Msg.ID, never
 	// append a streaming update as a new bubble.
 	Kind string `json:"kind,omitempty"`
 	// Meta — short decoration, e.g. "read · src/main.go". Empty for plain chat.
 	Meta string `json:"meta,omitempty"`
+}
+
+// QuestionOption is one selectable answer of a boss question popover.
+type QuestionOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+}
+
+// QuestionItem is one page of a question.asked request: its text, an
+// optional header chip, its selectable options, and whether several
+// options may be picked (checkbox) or exactly one (radio). A question
+// with NO options is a free-text (textarea) page.
+type QuestionItem struct {
+	Question string           `json:"question"`
+	Header   string           `json:"header,omitempty"`
+	Options  []QuestionOption `json:"options,omitempty"`
+	Multiple bool             `json:"multiple,omitempty"`
 }
 
 // SpeechBubble — ambient office chatter balloon, expires after ttl ticks.
@@ -183,6 +216,10 @@ type OfficeState struct {
 	Mode       Mode           `json:"mode"`
 	StatusLine string         `json:"statusLine"`
 	Tick       int            `json:"tick"`
+	// Offline — set while the connectivity watcher reports the network
+	// down (EvOffline/EvOnline). UI shows an "[offline]" badge and the
+	// backend suspends its pump/poller until EvOnline clears it.
+	Offline bool `json:"offline,omitempty"`
 	// BossThinking — the primary session is between a prompt and its reply,
 	// with a live EvThought open. UI dims the desk glyph / shows a spinner.
 	BossThinking bool `json:"bossThinking,omitempty"`
@@ -249,6 +286,10 @@ const (
 	// owns (primary, concierge pseudo-desk, hired children) and only when
 	// the delta is non-zero.
 	EvUsage EventKind = "usage"
+	// EvOffline/EvOnline — network connectivity transitions from the
+	// backend's watcher (pure-Go probe). Emit once per transition.
+	EvOffline EventKind = "offline"
+	EvOnline  EventKind = "online"
 )
 
 // Event — the wire between backend and the tea.Model. Only fields relevant
@@ -269,7 +310,7 @@ type Event struct {
 	EmployeeName string `json:"employeeName,omitempty"` // thought/tool
 	// Tool fields (EvTool).
 	ToolName    string `json:"toolName,omitempty"`
-	ToolSummary string `json:"toolSummary,omitempty"` // e.g. "src/main.go" or "GRAFEIO_*, 12 hits"
+	ToolSummary string `json:"toolSummary,omitempty"` // e.g. "src/main.go" or "THEBORINGOFFICE_*, 12 hits"
 	ToolState   string `json:"toolState,omitempty"`   // "running" | "done" | "error"
 	CallID      string `json:"callId,omitempty"`      // part/call id for dedupe
 	Done        bool   `json:"done,omitempty"`        // thought completion
@@ -280,10 +321,16 @@ type Event struct {
 	PermissionID string `json:"permissionId,omitempty"`
 	SessionID    string `json:"sessionId,omitempty"`
 	QuestionID   string `json:"questionId,omitempty"`
-	DiffPath     string `json:"diffPath,omitempty"` // file path relative to the working dir
-	DiffBody     string `json:"diffBody,omitempty"` // compact unified diff, capped by the backend
-	DiffAdd      int    `json:"diffAdd,omitempty"`
-	DiffDel      int    `json:"diffDel,omitempty"`
+	// Questions — the STRUCTURED pages of an EvQuestion popover (radio /
+	// checkbox / textarea), one QuestionItem per asked question. ADDITIVE:
+	// Text/ToolSummary still carry the legacy flattened "a | b | c" one-
+	// liner for history/list views, and backends leave this nil until the
+	// structured question wire (ocQuestionInfo) feeds it.
+	Questions []QuestionItem `json:"questions,omitempty"`
+	DiffPath  string         `json:"diffPath,omitempty"` // file path relative to the working dir
+	DiffBody  string         `json:"diffBody,omitempty"` // compact unified diff, capped by the backend
+	DiffAdd   int            `json:"diffAdd,omitempty"`
+	DiffDel   int            `json:"diffDel,omitempty"`
 	// Usage fields (EvUsage): per-message DELTAS, not absolutes — the
 	// backend remembers what each messageID already reported and sends
 	// only the growth, so the app accumulates with += and repeated
@@ -291,6 +338,15 @@ type Event struct {
 	TokensIn  int64   `json:"tokensIn,omitempty"`  // wire tokens.input growth
 	TokensOut int64   `json:"tokensOut,omitempty"` // wire tokens.output+reasoning growth
 	CostUSD   float64 `json:"costUsd,omitempty"`   // wire cost growth (USD, opencode-computed)
+}
+
+// MCPServer is one configured MCP server with its live status as the
+// backend last reported it (tools count/status fields are best-effort —
+// older serves return less).
+type MCPServer struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`           // connected|disabled|needs_auth|failed|unknown
+	Detail string `json:"detail,omitempty"` // error text / tool count / auth hint
 }
 
 // Backend — one per run. Demo scripted, live via opencode serve + agentmemory.
@@ -313,14 +369,19 @@ type Backend interface {
 	// the question tool; the agent loop is PARKED at question.asked until
 	// the question API gets this reply — a normal chat prompt does NOT
 	// answer it, which is the question-loop deadlock). answers is one
-	// string per asked question, in order (ui picks one label or free-form
-	// text per question); the backend wraps each in its own array for the
-	// wire shape (QuestionAnswer = string[], payload answers = string[][]).
-	AnswerQuestion(requestID string, answers []string) error
+	// string array per asked question, in order — QuestionItem.Multiple
+	// (checkbox) pages put several labels in THEIR array, radio/free-text
+	// pages put exactly one; the backend ships it verbatim (payload
+	// answers = string[][], opencode's QuestionAnswer = string[]).
+	AnswerQuestion(requestID string, answers [][]string) error
 	// RejectQuestion declines a pending question request outright, freeing
 	// the parked turn without an answer (opencode serve exposes a true
 	// reject route: POST /question/{requestID}/reject, /doc 1.18.19).
 	RejectQuestion(requestID string) error
+	// MCPServers lists the configured MCP servers with live status.
+	MCPServers() ([]MCPServer, error)
+	// ReconnectMCP asks the server to re-establish one MCP connection.
+	ReconnectMCP(name string) error
 	Stop() error
 }
 
@@ -329,7 +390,7 @@ type Backend interface {
 // abort seams — harness stubs stay untouched, the app type-asserts it).
 //
 // The concierge keeps the member answered while the boss's turn is occupied:
-// SendConcierge delivers chat to a lightweight side session ("grafeio
+// SendConcierge delivers chat to a lightweight side session ("theboringoffice
 // concierge", lazily created on FIRST use on the live backend) that answers
 // instantly — directly when the message is trivial, by dispatching its own
 // developer sub-agents (tracked like the boss's children) when it is real

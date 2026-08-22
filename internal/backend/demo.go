@@ -10,14 +10,16 @@
 package backend
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/theboringhumane/grafeio/internal/config"
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/config"
+	"github.com/theboringhumane/theboringoffice/internal/netwatch"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 const (
@@ -32,7 +34,10 @@ type demoBackend struct {
 	// cfg is the brain.json the factory received (never nil — NewDemo
 	// substitutes config.Default()). The scripted day is fixed, so the demo
 	// currently reads nothing from it; it is kept so future demo knobs
-	// (names, cadence) surface identically with the live backend.
+	// (names, cadence) surface identically with the live backend. In
+	// particular the model knobs (backend.bossModel/ctoModel, boss.model)
+	// are intentionally inert here — the tour invents no wire and no
+	// prompts for them to ride.
 	cfg *config.Config
 
 	mu              sync.Mutex // guards the demo board state below
@@ -42,10 +47,25 @@ type demoBackend struct {
 	blockedIDs      map[string]bool     // waving at the mailbox, not typing
 	pendingPerm     map[string]permHold // permission request id -> hold
 	pendingQuestion map[string]permHold // question request id -> hold
+	review          reviewLatch         // the CTO's once-per-drained-board latch
 	pulseIdx        int
 	ambientBeat     int
 	adHocSeq        int
 	chatSeq         int
+	// mcpReconnected — MCP server names the member reconnected back to
+	// life via ReconnectMCP (the demo fixture's failed postgres flips to
+	// connected); lazily initialized, see mcp.go.
+	mcpReconnected map[string]bool
+
+	// net — the demo's connectivity watcher, started in Start exactly like
+	// the live backend's (a tipped-over router offs the demo office too).
+	// Tests swap a scripted probe in BEFORE Start, or skip the timer and
+	// call SetOffline directly — both ride netTransition.
+	net       *netwatch.Watcher
+	netCancel context.CancelFunc
+	// offline latches the state SetOffline last drove, so repeated calls
+	// can't spam the event pair (the watcher is transitions-only already).
+	offline bool
 }
 
 func newDemoBackend(cfg *config.Config) *demoBackend {
@@ -56,6 +76,7 @@ func newDemoBackend(cfg *config.Config) *demoBackend {
 		blockedIDs:      make(map[string]bool),
 		pendingPerm:     make(map[string]permHold),
 		pendingQuestion: make(map[string]permHold),
+		net:             netwatch.New(nil, 0),
 	}
 }
 
@@ -67,21 +88,35 @@ func demoEmployee(id string, role state.EmployeeRole, seat string) state.Employe
 
 // ---------------------------------------------------------------- start
 
-// Start replays the office day: floor opens at t0, first briefs at 400ms,
-// a third hire at 1s, a streaming boss thought at 1.6s-2.4s (four growing
-// updates on CallID th-1, then done), a boss question
-// at 2s, a boss grep at 2.4s, tekton-2's file diff at 4.5s, returns at
-// 2.5s/4s/6.5s, tekton-1's read at 5.2s (done 5.6s) ahead of the permission
-// gate at 6s (Write /tmp/x — stays until AnswerPermission or the scripted
-// return), ambient chatter bubbles at 3s/5s, coffee drift at 7s, then the
-// ambient loop forever. Working pulses fire round-robin every 700ms.
+// Start replays the office day: floor opens at t0 with the exec cast
+// (manager + hr + theboringcto, the CTO), first briefs at 400ms, a third
+// hire plus the architecture brief (t4, routed to the CTO via
+// state.IsArchitectureBrief) at 1s, a streaming boss thought at
+// 1.6s-2.4s (four growing updates on CallID th-1, then done), a boss
+// question at 2s, a boss grep at 2.4s, tekton-2's file diff at 4.5s,
+// returns at 2.5s/4s/6.5s, the CTO's return at 6.8s (the board drains —
+// he posts his ONE review beat: EvStatus + EvMail notice), tekton-1's
+// read at 5.2s (done 5.6s) ahead of the permission gate at 6s (Write
+// /tmp/x — stays until AnswerPermission or the scripted return), ambient
+// chatter bubbles at 3s/5s, coffee drift at 7s, then the ambient loop
+// forever. Working pulses fire round-robin every 700ms.
 func (b *demoBackend) Start(emit func(state.Event)) error {
 	b.fl.setEmit(emit)
 
-	// t0: floor opens. Manager + hr are permanent seats.
+	// t0: floor opens. Manager + hr + the CTO are the exec cast.
 	b.fl.emit(state.Event{Kind: state.EvStatus, Text: "DEMO - simulated events (no real agents)"})
 	b.hire(demoEmployee("manager", state.RoleManager, "manager"))
 	b.hire(demoEmployee("hr", state.RoleHR, "hr"))
+	b.hire(demoEmployee(ctoName, state.RoleCTO, "cto"))
+
+	// Connectivity watcher (OFFLINE mode): same watcher as the live
+	// backend — an actual connection loss parks the demo office behind the
+	// same EvOffline/EvOnline pair. Stop cancels the goroutine.
+	netCtx, netCancel := context.WithCancel(context.Background())
+	b.mu.Lock()
+	b.netCancel = netCancel
+	b.mu.Unlock()
+	go b.net.Start(netCtx, b.netTransition)
 
 	// t+400ms: the boss hands out the first two briefs.
 	b.fl.at(400*time.Millisecond, func() {
@@ -91,10 +126,12 @@ func (b *demoBackend) Start(emit func(state.Event)) error {
 		b.dispatch("t2", "Map the repo's event flow end to end", "skopos-1")
 	})
 
-	// t+1s: a third hire joins the first brief wave.
+	// t+1s: a third hire joins the first brief wave, plus the batch's
+	// architecture brief — routed to the CTO (he owns architecture work).
 	b.fl.at(1*time.Second, func() {
 		b.hire(demoEmployee("tekton-2", state.RoleDeveloper, "desk-3"))
 		b.dispatch("t3", "Draft the demo smoke script", "tekton-2")
+		b.dispatch("t4", "Design the agentmemory board sync protocol", ctoName)
 	})
 
 	// t+1.6s -> t+2.4s: the boss thinks out loud before tool work starts —
@@ -124,25 +161,44 @@ func (b *demoBackend) Start(emit func(state.Event)) error {
 
 	// t+2s: the boss wants a steer — a real question request (the UI would
 	// answer it in a question modal). The hold is registered so
-	// AnswerQuestion/RejectQuestion can resolve the same id.
+	// AnswerQuestion/RejectQuestion can resolve the same id. The request
+	// carries TWO structured pages (mirroring the live wire's ocQuestionInfo
+	// list): a radio page with 3 options and a free-text page, so the new
+	// popover kinds can be dogfooded in `theboringoffice --demo`; Text/ToolSummary
+	// stay the legacy flattened one-liner.
 	b.fl.at(2*time.Second, func() {
 		b.mu.Lock()
 		b.pendingQuestion["que-demo-1"] = permHold{
 			SessionID: "boss", EmployeeID: "boss", EmployeeName: "boss",
-			Title: "question", Summary: "internal/app/model.go | internal/state/state.go",
+			Title: "question", Summary: "internal/app/model.go | internal/state/state.go | internal/backend/events.go",
 		}
 		b.mu.Unlock()
 		b.fl.emit(state.Event{Kind: state.EvQuestion, QuestionID: "que-demo-1", SessionID: "boss",
 			EmployeeID: "boss", EmployeeName: "boss",
-			Text:        "Which file should I touch first?",
-			ToolSummary: "internal/app/model.go | internal/state/state.go",
-			ToolState:   "pending"})
+			Text:        "Which file should I touch first? Anything else I should know before I start?",
+			ToolSummary: "internal/app/model.go | internal/state/state.go | internal/backend/events.go",
+			ToolState:   "pending",
+			Questions: []state.QuestionItem{
+				{
+					Question: "Which file should I touch first?",
+					Header:   "scoping",
+					Options: []state.QuestionOption{
+						{Label: "internal/app/model.go", Description: "the office reducer, where events land"},
+						{Label: "internal/state/state.go", Description: "the backend/UI contract types"},
+						{Label: "internal/backend/events.go", Description: "the opencode wire normalizer"},
+					},
+				},
+				{
+					Question: "Anything else I should know before I start?",
+					Header:   "notes",
+				},
+			}})
 	})
 
 	// t+2.4s: the boss's own grep lands, done in the same beat.
 	b.fl.at(2400*time.Millisecond, func() {
 		b.fl.emit(state.Event{Kind: state.EvTool, EmployeeID: "boss", EmployeeName: "boss",
-			ToolName: "grep", ToolSummary: "GRAFEIO_*, 12 hits", ToolState: "done", CallID: "demo-call-1"})
+			ToolName: "grep", ToolSummary: "THEBORINGOFFICE_*, 12 hits", ToolState: "done", CallID: "demo-call-1"})
 	})
 
 	// t+4.5s: tekton-2's edits land inline — one file diff beside the brief.
@@ -251,6 +307,14 @@ func (b *demoBackend) Start(emit func(state.Event)) error {
 			"DONE - reducer consumes hire/dispatch/working/returned/blocked and the floor animates. VERIFY: demo timeline replays the whole flow without SDK calls.")
 	})
 
+	// t+6.8s: the CTO's design brief is the LAST return of the batch — the
+	// board drains, and he posts his ONE review beat (see doReturn +
+	// reviewLatch): an EvStatus note plus an EvMail notice.
+	b.fl.at(6800*time.Millisecond, func() {
+		b.doReturn(ctoName, "t4", "return: board sync protocol",
+			"DONE - board-sync protocol drafted: actions carry provenance tags, poll backoff stays bounded, queue mirrors stay idempotent. VERIFY: sync contract pinned in the board tests.")
+	})
+
 	// t+7s: someone drifts to the tea machine.
 	b.fl.at(7*time.Second, func() {
 		b.fl.emit(state.Event{Kind: state.EvIdleDrift, EmployeeID: "skopos-1"})
@@ -262,7 +326,7 @@ func (b *demoBackend) Start(emit func(state.Event)) error {
 		b.ambientBeat++
 		beat := b.ambientBeat
 		b.mu.Unlock()
-		folks := []string{"tekton-1", "skopos-1", "tekton-2"}
+		folks := []string{"tekton-1", "skopos-1", "tekton-2", ctoName}
 		who := folks[beat%len(folks)]
 		b.fl.emit(state.Event{Kind: state.EvWorking, EmployeeID: who})
 		if beat%3 == 0 {
@@ -343,6 +407,8 @@ func (b *demoBackend) SendWith(text string, atts []state.Attachment) error {
 	})
 
 	// ...and one ad-hoc dispatch cycle proves the request landed.
+	// Architecture-flavored asks route to the CTO — the one matcher is
+	// state.IsArchitectureBrief (same rule the live role mapping uses).
 	b.fl.at(900*time.Millisecond, func() {
 		b.mu.Lock()
 		assignee := "tekton-1"
@@ -352,7 +418,11 @@ func (b *demoBackend) SendWith(text string, atts []state.Attachment) error {
 		b.adHocSeq++
 		taskID := "adhoc-" + itoa(b.adHocSeq)
 		b.mu.Unlock()
-		b.dispatch(taskID, "Ad-hoc: "+shortTitle(trimmed, 36), assignee)
+		title := "Ad-hoc: " + shortTitle(trimmed, 36)
+		if state.IsArchitectureBrief(title) {
+			assignee = ctoName
+		}
+		b.dispatch(taskID, title, assignee)
 	})
 	return nil
 }
@@ -424,8 +494,10 @@ func (b *demoBackend) AnswerPermission(permissionID, response string) error {
 
 // AnswerQuestion resolves a pending demo question: logs the answers on the
 // status line and emits a "resolved" EvQuestion on the same id so the UI
-// drops the question modal.
-func (b *demoBackend) AnswerQuestion(requestID string, answers []string) error {
+// drops the question modal. answers is per-question string arrays (radio /
+// free-text pages carry one, checkbox pages carry several); the log joins a
+// page's picks with ", " and the pages themselves with "; " ("a, b; c").
+func (b *demoBackend) AnswerQuestion(requestID string, answers [][]string) error {
 	if b.fl.isStopped() {
 		return errors.New("backend stopped")
 	}
@@ -440,8 +512,12 @@ func (b *demoBackend) AnswerQuestion(requestID string, answers []string) error {
 	}
 	b.mu.Unlock()
 
+	pages := make([]string, len(answers))
+	for i, a := range answers {
+		pages[i] = strings.Join(a, ", ")
+	}
 	b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
-		"[demo] answered question %s: %s", requestID, strings.Join(answers, ", "))})
+		"[demo] answered question %s: %s", requestID, strings.Join(pages, "; "))})
 	b.fl.emit(state.Event{Kind: state.EvQuestion, QuestionID: requestID,
 		SessionID: hold.SessionID, EmployeeID: hold.EmployeeID, EmployeeName: hold.EmployeeName,
 		ToolSummary: "answered", ToolState: "resolved"})
@@ -501,9 +577,46 @@ func (b *demoBackend) QueueItemDone(boardID string) {}
 // ResetPrimary is a demo no-op (a scripted boss has no session to drop).
 func (b *demoBackend) ResetPrimary(forceNew bool) error { return nil }
 
+// ---------------------------------------------------------------- offline (simulation seam)
+
+// netTransition is the watcher's emit callback (and SetOffline's direct
+// path): ONE EvOffline/EvOnline + status pair per flip, the same contract
+// the live backend's onNetTransition speaks, so the reducer/UI paths under
+// test never know which backend drove them.
+func (b *demoBackend) netTransition(online bool) {
+	if !online {
+		b.fl.emit(state.Event{Kind: state.EvOffline})
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] offline — office waiting for internet…"})
+		return
+	}
+	b.fl.emit(state.Event{Kind: state.EvOnline})
+	b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] back online — resumed"})
+}
+
+// SetOffline drives the offline/online event pair directly — the manual
+// simulation hook for tests and scripted scenarios that must not touch the
+// live watcher. Repeated same-state calls are silent.
+func (b *demoBackend) SetOffline(offline bool) {
+	b.mu.Lock()
+	if b.offline == offline {
+		b.mu.Unlock()
+		return
+	}
+	b.offline = offline
+	b.mu.Unlock()
+	b.netTransition(!offline)
+}
+
 // ---------------------------------------------------------------- stop
 
 func (b *demoBackend) Stop() error {
+	b.mu.Lock()
+	netCancel := b.netCancel
+	b.netCancel = nil
+	b.mu.Unlock()
+	if netCancel != nil {
+		netCancel() // kills the connectivity watcher goroutine (no leak)
+	}
 	b.fl.stop()
 	return nil
 }
@@ -527,6 +640,7 @@ func (b *demoBackend) dispatch(taskID, title, owner string) {
 	}
 	b.mu.Lock()
 	b.taskByID[taskID] = t
+	b.review.arm() // a fresh batch begins — the CTO owes it ONE review
 	found := false
 	for _, id := range b.active {
 		if id == owner {
@@ -564,6 +678,10 @@ func (b *demoBackend) doReturn(employeeID, taskID, subject, body string) {
 	}
 	b.active = next
 	delete(b.blockedIDs, employeeID)
+	// The CTO's review beat: if THIS return drained the batch board
+	// (zero open briefs left) he posts exactly one EvStatus + EvMail
+	// notice — the latch spends it, and only a fresh dispatch re-arms.
+	review := b.review.beat(countBoard(b.taskByID))
 	// A staged return implies the boss approved: auto-resolve any permission
 	// the employee was still waiting on so no modal dangles past the brief.
 	var resolved []state.Event
@@ -592,4 +710,7 @@ func (b *demoBackend) doReturn(employeeID, taskID, subject, body string) {
 	}
 	b.fl.emit(state.Event{Kind: state.EvTask, Task: done})
 	b.fl.emit(state.Event{Kind: state.EvReturned, EmployeeID: employeeID, TaskID: done.ID, Mail: mail})
+	for _, ev := range review {
+		b.fl.emit(ev)
+	}
 }

@@ -17,7 +17,7 @@ import (
 
 	"github.com/charmbracelet/x/ansi"
 
-	state "github.com/theboringhumane/grafeio/internal/state"
+	state "github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 // newLoadingChat builds one deterministic fixture: worker tekton-1 at the

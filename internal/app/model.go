@@ -1,4 +1,4 @@
-// Package app — the root Bubble Tea model for Grafeio v2: state reducer
+// Package app — the root Bubble Tea model for theboringoffice v2: state reducer
 // (exact port of node-legacy/src/app.tsx officeReducer + initialState),
 // layout, key routing, the power governor, and the backend event seam.
 //
@@ -14,6 +14,7 @@
 package app
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -25,11 +26,12 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
-	"github.com/theboringhumane/grafeio/internal/chrome"
-	"github.com/theboringhumane/grafeio/internal/config"
-	"github.com/theboringhumane/grafeio/internal/office"
-	"github.com/theboringhumane/grafeio/internal/panels"
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/chrome"
+	"github.com/theboringhumane/theboringoffice/internal/config"
+	"github.com/theboringhumane/theboringoffice/internal/office"
+	"github.com/theboringhumane/theboringoffice/internal/panels"
+	"github.com/theboringhumane/theboringoffice/internal/projinfo"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 const (
@@ -53,8 +55,13 @@ const (
 	sidebarMax      = 100
 
 	degradeCols = 100 // below this, the sidebar shrinks instead of the floor
-	minCols     = 40
-	minRows     = 12
+	// mobileMaxCols — below this window width the middle flips to the
+	// mobile stack (compact floor band on top, active panel full-width
+	// below). The horizontal split needs ~100 cols: the sidebar eats
+	// ~26..80 of them, so a sub-100 window leaves the floor <65 cols.
+	mobileMaxCols = 100
+	minCols       = 40
+	minRows       = 12
 
 	// Message queue — the INTELLIGENT BACKLOG: Enter while the turn is
 	// ROADBLOCKED (an open permission modal, or a question hold outstanding)
@@ -149,7 +156,7 @@ func qdebugf(format string, args ...any) {
 }
 
 // cleanupAttachments removes panel-created temp dirs (pasted images live in
-// os.MkdirTemp "grafeio-paste-*", Attachment.Temp). Best-effort, and ONLY
+// os.MkdirTemp "theboringoffice-paste-*", Attachment.Temp). Best-effort, and ONLY
 // ever called after a send has resolved: enqueue must not clean (the flush
 // still needs the file), and the batch respawn path keeps them for its one
 // retry — the cleanup fires on success or on the terminal failure.
@@ -217,7 +224,7 @@ type Model struct {
 	floorW        int
 	tabs          *panels.Tabs
 	chat          *panels.Chat
-	agents        *panels.Agents   // roster tab — floor-click selection highlight
+	agents        *panels.Agents // roster tab — floor-click selection highlight
 	activity      *panels.Activity
 	termTab       *termTabWrap // tab 2: the real OS-shell (lazy PTY, terminal.go)
 	keys          KeyMap
@@ -282,19 +289,23 @@ type Model struct {
 	// it when the turn ends.
 	conciergeNoted bool
 
-	// Permission prompts (boss/primary session only): perm is the OPEN
-	// prompt replacing the textarea; permEscd is the latest esc'd-but-
-	// unanswered prompt /perm can re-open.
-	perm     *permPrompt
-	permEscd *permPrompt
+	// Permission prompts (boss AND child sessions — a child's ask rides
+	// the same queue as the boss's): permQ.pending is the fifo of
+	// unanswered asks, pending[0] the OPEN prompt replacing the textarea
+	// (asks stack, displayed one at a time with a "1 of N" position);
+	// permQ.escd holds esc'd-but-unanswered prompts, most recent last,
+	// /perm re-opens the newest. The floor's blocked sprite + the
+	// statusbar/activity [blocked] lines come from EvBlocked, untouched.
+	permQ permQueue
 
 	// Question holds (boss/primary session only): question is the OPEN
-	// hold whose modal replaces the textarea (a free-text input, unlike
-	// the y/a/n permission modal); questionEscd is the latest esc'd-but-
-	// unanswered hold /question can re-open. questionParked survives
-	// defer: the opencode turn is parked at the question reply API (not
-	// "typing") until a completed chat-boss arrives after resolution, so
-	// the message queue must NOT flush and typed text keeps enqueuing.
+	// hold whose WIZARD popover replaces the textarea (radio/checkbox/
+	// free-text pages, unlike the y/a/n permission popover); questionEscd
+	// is the latest esc'd-but-unanswered hold /question can re-open.
+	// questionParked survives defer: the opencode turn is parked at the
+	// question reply API (not "typing") until a completed chat-boss
+	// arrives after resolution, so the message queue must NOT flush and
+	// typed text keeps enqueuing.
 	question       *questionHold
 	questionEscd   *questionHold
 	questionParked bool
@@ -318,22 +329,146 @@ type Model struct {
 	// persist), sessLast throttles the 5s cheap-write loop off EvTick.
 	sessDir  string
 	sessLast time.Time
+
+	// proj — cached project/git-branch info feeding the top bar right
+	// segment (internal/projinfo; TTL-bounded, exec at most once per TTL).
+	proj *projinfo.Cache
+
+	// boot — the animated ASCII splash shown while the backend warms up.
+	// bootDone flips on the splash's done/skip msg (or any key); once done
+	// the gate below routes every msg into the normal Update switch.
+	boot     Boot
+	bootDone bool
 }
 
-// permPrompt is a pending boss permission request.
+// permPrompt is a pending permission request — boss or child, the Agent
+// field names the requester in the popover header.
 type permPrompt struct {
 	ID       string
 	ToolName string
 	Summary  string
+	Agent    string // display name of the requesting agent ("boss" or child)
 }
 
-// questionHold is a pending boss question hold. IDs batches every pending
-// wire request id of one question call (v1: ONE typed answer answers each
-// batched id); Text/Options render the modal header + dim options list.
+// permQueue — the pending-permission stack. pending is the fifo of asks
+// waiting on an answer (pending[0] is what the popover displays); escd
+// holds esc'd-but-unanswered asks, most recent last, /perm re-opens the
+// newest. An ask lives in exactly ONE of the two slices.
+type permQueue struct {
+	pending []*permPrompt
+	escd    []*permPrompt
+}
+
+// front is the displayed ask (pending[0]), nil while nothing is pending.
+func (q *permQueue) front() *permPrompt {
+	if len(q.pending) == 0 {
+		return nil
+	}
+	return q.pending[0]
+}
+
+// resolve drops an id from BOTH slices (a server-side resolution races the
+// popover and the esc'd pile alike). True when the dropped entry was the
+// displayed front, i.e. the popover has to close or advance.
+func (q *permQueue) resolve(id string) bool {
+	displayed := q.front() != nil && q.front().ID == id
+	q.pending = dropPrompt(q.pending, id)
+	q.escd = dropPrompt(q.escd, id)
+	return displayed
+}
+
+// view renders the queue front as the panel view — Index is the 1-based
+// position of the displayed ask (the front is always 1), Total the queue
+// depth, so the header reads "1 of N" while asks stack. nil = close.
+func (q *permQueue) view() *panels.PermissionView {
+	p := q.front()
+	if p == nil {
+		return nil
+	}
+	return &panels.PermissionView{
+		ID:       p.ID,
+		ToolName: p.ToolName,
+		Summary:  p.Summary,
+		Agent:    p.Agent,
+		Index:    1,
+		Total:    len(q.pending),
+	}
+}
+
+// dropPrompt removes the first prompt with the given id (ids are unique
+// per wire request — one drop is enough).
+func dropPrompt(list []*permPrompt, id string) []*permPrompt {
+	for i, p := range list {
+		if p.ID == id {
+			return append(list[:i], list[i+1:]...)
+		}
+	}
+	return list
+}
+
+// questionHold is a pending boss question request being paged through the
+// chat panel's question popover as a WIZARD: IDs batches every pending
+// wire request id of one question call (the SAME accumulated answer set
+// replies to each batched id), Items is the request's pages (one
+// state.QuestionItem per asked question), Answers accumulates one entry
+// per page (a checkbox page's picked labels, [label] for radio,
+// [text] for free-text; nil until that page is answered) and Cursor is
+// the page currently on display.
 type questionHold struct {
 	IDs     []string
-	Text    string
-	Options string
+	Items   []state.QuestionItem
+	Answers [][]string // one slot per Item, nil until that page is answered
+	Cursor  int        // current wizard page
+}
+
+// legacyQuestionPage degrades a FLATTENED EvQuestion (Text only, no
+// structured Questions) to one wizard page: a flat options list in
+// ToolSummary ("a | b | c", anything but the "free-form answer" sentinel)
+// becomes radio options, everything else a free-text page. Best-effort
+// migration path for backends that predate the structured wire.
+func legacyQuestionPage(ev state.Event) state.QuestionItem {
+	page := state.QuestionItem{Question: ev.Text}
+	if ev.ToolSummary != "" && ev.ToolSummary != "free-form answer" {
+		for _, opt := range strings.Split(ev.ToolSummary, " | ") {
+			if opt = strings.TrimSpace(opt); opt != "" {
+				page.Options = append(page.Options, state.QuestionOption{Label: opt})
+			}
+		}
+	}
+	return page
+}
+
+// views renders the hold's CURRENT page as the panel's QuestionView — the
+// kind is classified from the item's shape (options? multiple? confirm?)
+// by the panels package, which owns the popover; Index is 1-based for the
+// "1 of N" header. nil when nothing is open (SetQuestion closes on nil).
+func (m *Model) questionView(h *questionHold) *panels.QuestionView {
+	if h == nil || h.Cursor < 0 || h.Cursor >= len(h.Items) {
+		return nil
+	}
+	it := h.Items[h.Cursor]
+	return &panels.QuestionView{
+		ID:       h.IDs[0],
+		Question: it.Question,
+		Header:   it.Header,
+		Kind:     panels.ClassifyQuestion(it),
+		Options:  it.Options,
+		Index:    h.Cursor + 1,
+		Total:    len(h.Items),
+	}
+}
+
+// summary renders the accumulated answer set as the user bubble's short
+// trace: each answered page renders its picks joined ", " (free-text
+// pages recorded [text] render the text), pages joined " · ".
+func (h *questionHold) summary() string {
+	pages := make([]string, 0, len(h.Answers))
+	for _, a := range h.Answers {
+		if len(a) > 0 {
+			pages = append(pages, strings.Join(a, ", "))
+		}
+	}
+	return strings.Join(pages, " · ")
 }
 
 // chatSentMsg fires after backend.Send succeeds — the local user bubble and
@@ -399,13 +534,26 @@ type permAnswerMsg struct{ response string }
 // /perm.
 type permLaterMsg struct{}
 
-// questionAnswerMsg fires when the user hits Enter in an open question
-// modal — the typed text goes through AnswerQuestion (this is the fix: a
-// plain Send parks the opencode loop at the question reply API forever).
-type questionAnswerMsg struct{ text string }
+// mcpStatusMsg ferries the /mcp (and /mcp reconnect) backend round trip
+// back into Update — the render itself happens model-side so the panel's
+// pure renderer (panels.RenderMCPStatus) gets the sidebar width.
+type mcpStatusMsg struct {
+	servers     []state.MCPServer
+	err         error
+	reconnected string // echo of the server /mcp reconnect <name> targeted
+}
 
-// questionLaterMsg fires on esc in an open question modal — the hold
-// stays pending, re-openable with /question.
+// questionAnswerMsg fires when the user confirms the CURRENT page of an
+// open question wizard — the popover hands over its QuestionAnswer (the
+// selected option labels and/or the free-text buffer); the model records
+// it as that page's answers entry and advances. On the LAST page the
+// accumulated [][]string goes through AnswerQuestion (this is the fix: a
+// plain Send parks the opencode loop at the question reply API forever).
+type questionAnswerMsg struct{ ans panels.QuestionAnswer }
+
+// questionLaterMsg fires on esc in an open question wizard — the WHOLE
+// request defers (pages + recorded answers intact), re-openable with
+// /question.
 type questionLaterMsg struct{}
 
 // stopWorkMsg fires on a DOUBLE-esc in the main chat input — the chat
@@ -477,6 +625,7 @@ func New(b state.Backend, cfg *config.Config) Model {
 			activity,
 		),
 		keys: NewKeyMap(),
+		boot: NewBoot(0, 0),
 	}
 	// Queue + permission seams: the panel owns the keys, the model owns the
 	// queue/prompt state; callbacks ferry over tea.Msgs so the model value
@@ -506,8 +655,8 @@ func New(b state.Backend, cfg *config.Config) Model {
 		},
 	)
 	chat.SetQuestionHandlers(
-		func(text string) tea.Cmd {
-			return func() tea.Msg { return questionAnswerMsg{text: text} }
+		func(ans panels.QuestionAnswer) tea.Cmd {
+			return func() tea.Msg { return questionAnswerMsg{ans: ans} }
 		},
 		func() tea.Cmd {
 			return func() tea.Msg { return questionLaterMsg{} }
@@ -522,6 +671,11 @@ func New(b state.Backend, cfg *config.Config) Model {
 	m.tabs.SetCompact(m.compact())
 	m.chat.SetCompact(m.compact())
 	m.tabs.SetState(m.st)
+
+	// Top bar's project+branch feed: cached, exec-bounded, ""-safe in demo
+	// (projinfo falls back to os.Getwd when sessDir is "").
+	m.proj = projinfo.DefaultCache()
+
 	// Office-session restore (LIVE ONLY — demo is a scripted tour and a
 	// restored real transcript would confuse it; per the ruling, demo
 	// skips). The PrimaryOverride MUST land before backend.Start (main
@@ -537,6 +691,10 @@ func New(b state.Backend, cfg *config.Config) Model {
 					}
 				}
 				m.hydrateSession(sf)
+				// A restored office is already warm — skip the boot
+				// splash so the transcript + restore notice are the
+				// first frame (the splash opens cold starts only).
+				m.bootDone = true
 			}
 		}
 	}
@@ -577,9 +735,10 @@ func (m Model) State() state.OfficeState {
 	return m.st
 }
 
-// Init arms the first power-governed tick; applyEvent re-arms every cycle.
+// Init arms the first power-governed tick plus the boot splash's own
+// frame ticker; applyEvent re-arms the office tick every cycle.
 func (m Model) Init() tea.Cmd {
-	return m.tickCmd()
+	return tea.Batch(m.tickCmd(), bootTick())
 }
 
 // tickCmd re-arms the animation tick at the delay the governor picks for
@@ -587,7 +746,7 @@ func (m Model) Init() tea.Cmd {
 // idle duration from the drift clock). Busy refreshes lastBusy; 60s of
 // continuous quiet in auto mode slips into screensaver cadence.
 func (m *Model) tickCmd() tea.Cmd {
-	modalOpen := m.perm != nil || m.question != nil
+	modalOpen := m.permQ.front() != nil || m.question != nil
 	thinkActive := len(m.activeThink) > 0
 	now := time.Now()
 	if officeBusy(m.st, modalOpen, thinkActive) {
@@ -613,10 +772,53 @@ func (m Model) FrameCacheStats() (hits, misses uint64) {
 
 // Update routes keys, backend events and component ticks.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Boot gate: until the splash is done (cascade + ready, 4s cap, or a
+	// keypress skip) INPUT feeds the boot component only — the office
+	// tick, backend events and resizes keep flowing to the normal switch
+	// underneath so the office is already live when the splash lifts.
+	// The first backend event marks the boot uplink ready (goroutines
+	// emit after Start connects; demo emits instantly).
+	if !m.bootDone {
+		switch msg := msg.(type) {
+		case bootDoneMsg, bootSkipMsg:
+			m.bootDone = true // splash lifts; the msg itself is harmless below
+		case bootTickMsg:
+			nb, cmd := m.boot.Update(msg)
+			m.boot = nb
+			if m.boot.Done() {
+				m.bootDone = true
+			}
+			return m, cmd
+		case tea.KeyPressMsg:
+			// keys dismiss the splash AND keep flowing — the user's first
+			// typed character must not vanish into the boot skip (uisot
+			// workloads type at t≈0; ctrl+c rides the normal persist-quit
+			// arm below).
+			m.bootDone = true
+		case tea.MouseClickMsg:
+			// a click dismisses the splash AND the same click lands — the
+			// floor/tab under it is the thing the user aimed at (uisot
+			// click proofs depend on one click acting, not two).
+			m.bootDone = true
+		case tea.WindowSizeMsg:
+			nb, _ := m.boot.Update(msg) // size also flows to resize below
+			m.boot = nb
+		case state.Event:
+			m.boot.SetReady() // then keeps flowing — the office warms behind the splash
+		case tea.QuitMsg:
+			return m, tea.Quit
+		}
+	}
 	var cmds []tea.Cmd
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.resize(msg.Width, msg.Height)
+	case tea.BackgroundColorMsg:
+		// Device light/dark: auto-adapt the theme to the terminal
+		// background unless the user pinned one. Office floor re-points
+		// inside; auto picks never persist, and macOS dark↔light flips
+		// re-theme live as spontaneous events.
+		chrome.SetThemeAuto(msg.IsDark())
 	case tea.KeyPressMsg:
 		// keys can mutate panel ephemera (textarea, scroll) the state
 		// digest can't see — invalidate the frame cache conservatively.
@@ -660,7 +862,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.playSound("error")
 		cmds = append(cmds, m.applyEvent(state.Event{
 			Kind: state.EvStatus,
-			Text: fmt.Sprintf("[grafeio] send failed: %v", msg.err),
+			Text: fmt.Sprintf("[theboringoffice] send failed: %v", msg.err),
 		}))
 	case queueSendErrMsg:
 		// FAILURE RESPAWN — one per flush call: the boss session died at
@@ -684,7 +886,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.playSound("error")
 		cmds = append(cmds, m.applyEvent(state.Event{
 			Kind: state.EvStatus,
-			Text: fmt.Sprintf("[grafeio] send failed: %v", msg.err),
+			Text: fmt.Sprintf("[theboringoffice] send failed: %v", msg.err),
 		}))
 	case slashMsg:
 		// slash handlers mutate panel-only visual state (thinking/tools/
@@ -723,13 +925,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.flushQueued())
 		}
 	case permAnswerMsg:
-		if m.perm != nil {
-			pid, response := m.perm.ID, msg.response
-			if m.permEscd != nil && m.permEscd.ID == pid {
-				m.permEscd = nil
-			}
-			m.perm = nil
-			m.chat.SetPermission(nil)
+		// y/a/n answers ONLY the displayed front, then the popover advances
+		// to the next pending ask (or closes). The wire reply rides the
+		// generic AnswerPermission seam — child holds sit in the same
+		// backend pendingPerms map as the boss's.
+		if p := m.permQ.front(); p != nil {
+			pid, response := p.ID, msg.response
+			m.permQ.pending = m.permQ.pending[1:]
+			m.permQ.escd = dropPrompt(m.permQ.escd, pid) // defensive: an ask lives in exactly one slice
+			m.chat.SetPermission(m.permQ.view())
 			cmds = append(cmds, func() tea.Msg {
 				if m.backend != nil {
 					if err := m.backend.AnswerPermission(pid, response); err != nil {
@@ -740,39 +944,89 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			})
 		}
 	case permLaterMsg:
-		if m.perm != nil {
-			m.permEscd = m.perm
-			m.perm = nil
-			m.chat.SetPermission(nil)
+		// esc parks the displayed front at the tail of the esc'd pile and
+		// shows the next pending ask; /perm re-opens the most recent esc'd.
+		if p := m.permQ.front(); p != nil {
+			m.permQ.pending = m.permQ.pending[1:]
+			m.permQ.escd = append(m.permQ.escd, p)
+			m.chat.SetPermission(m.permQ.view())
 			m.notice("esc'd permission pending (/perm)")
 		}
 	case questionAnswerMsg:
 		if m.question != nil {
 			hold := m.question
+			// record THIS page's answer: the popover's picked labels win
+			// (radio = one, checkbox = several), free-text pages record
+			// the trimmed text as the one entry. A fully empty submission
+			// is a no-op — the wizard stays on the current page.
+			ans := msg.ans.Picks
+			if len(ans) == 0 {
+				if t := strings.TrimSpace(msg.ans.Text); t != "" {
+					ans = []string{t}
+				}
+			}
+			if len(ans) == 0 {
+				break
+			}
+			hold.Answers[hold.Cursor] = append([]string(nil), ans...)
+			if hold.Cursor < len(hold.Items)-1 {
+				// more pages in this request — advance, re-render
+				hold.Cursor++
+				m.chat.SetQuestion(m.questionView(hold))
+				break
+			}
+			// last page: submit the FULL accumulated answer set — one
+			// AnswerQuestion per batched wire id, the same [][]string
+			// (opencode's QuestionAnswer = string[] per asked question).
 			m.question = nil
 			m.chat.SetQuestion(nil)
+			// the question popover hides the permission popover — re-push
+			// the queue front now the region is free again.
+			m.chat.SetPermission(m.permQ.view())
 			b := m.backend
-			text := msg.text
+			ids := append([]string(nil), hold.IDs...)
+			answers := hold.Answers
 			cmds = append(cmds, func() tea.Msg {
-				// v1: ONE typed string answers every pending QuestionID of
-				// the hold — a question call batching several ids still
-				// unblocks them all with the same answer.
 				if b != nil {
-					for _, qid := range hold.IDs {
-						if err := b.AnswerQuestion(qid, []string{text}); err != nil {
+					for _, qid := range ids {
+						if err := b.AnswerQuestion(qid, answers); err != nil {
 							return sendErrMsg{err: err}
 						}
 					}
 				}
 				return nil
 			})
+			// the member's own answer set joins the transcript as a user
+			// bubble where the answered request surfaced (the resolved
+			// marker lands via the backend's resolved event).
+			if trace := hold.summary(); trace != "" {
+				m.st.Chat = capChat(appendChat(m.st.Chat, state.ChatMsg{
+					ID:   "qans-" + ids[0],
+					From: "user",
+					Text: trace,
+					At:   time.Now().UnixMilli(),
+				}))
+				m.tabs.SetState(m.st)
+			}
 		}
 	case questionLaterMsg:
 		if m.question != nil {
 			m.questionEscd = m.question
 			m.question = nil
 			m.chat.SetQuestion(nil)
+			// same re-push: the permission popover survives question defer.
+			m.chat.SetPermission(m.permQ.view())
 			m.notice("(question deferred — /question to reopen)")
+		}
+	case mcpStatusMsg:
+		if msg.err != nil {
+			m.noticeErr("mcp: " + msg.err.Error())
+		} else {
+			lines := panels.RenderMCPStatus(msg.servers, max(20, m.sidebar-4))
+			if msg.reconnected != "" {
+				lines = append([]string{"mcp: reconnected " + msg.reconnected}, lines...)
+			}
+			m.notice(strings.Join(lines, "\n"))
 		}
 	case stopWorkMsg:
 		// double-esc in the main chat input == /stop (abort + unwind);
@@ -794,10 +1048,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // View builds the final frame for bubbletea v2 (alt-screen + mouse).
 func (m Model) View() tea.View {
+	// Boot splash owns the whole frame until done/skipped. Gated on View
+	// (not Frame) so snapshot harnesses (cmd/uishot) keep printing the
+	// office frame byte-identically — the splash never leaks into shots.
+	if !m.bootDone && m.width > 0 {
+		v := tea.NewView(m.boot.View())
+		v.AltScreen = true
+		return v
+	}
 	v := tea.NewView(m.Frame())
 	v.AltScreen = true
 	v.MouseMode = tea.MouseModeCellMotion
 	return v
+}
+
+// projInfo — nil-safe feed for the top bar's project+branch segment.
+func (m Model) projInfo() projinfo.Info {
+	if m.proj == nil {
+		return projinfo.Info{}
+	}
+	return m.proj.Get(m.sessDir)
 }
 
 // Frame renders the whole UI as one string — also what snapshot harnesses
@@ -807,7 +1077,7 @@ func (m Model) View() tea.View {
 // same tick+sprites never rebuilds the grid).
 func (m Model) Frame() string {
 	if m.width == 0 {
-		return "grafeio — waiting for terminal size…"
+		return "theboringoffice — waiting for terminal size…"
 	}
 	digest := m.frameDigest()
 	if m.gov.frameCached != "" && m.gov.frameKey == digest {
@@ -815,9 +1085,10 @@ func (m Model) Frame() string {
 		return m.gov.frameCached
 	}
 	m.gov.frameMisses++
-	top := chrome.TopBar(m.st, m.width)
+	info := m.projInfo()
+	top := chrome.TopBar(m.st, m.width, info)
 	if m.compact() {
-		top = chrome.TopBarCompact(m.st, m.width)
+		top = chrome.TopBarCompact(m.st, m.width, info)
 	}
 	var mid, bot string
 	if m.zen {
@@ -826,6 +1097,22 @@ func (m Model) Frame() string {
 		mid = lipgloss.NewStyle().Width(m.width).Height(m.middleH).
 			Render(office.CachedStyled(m.st, m.width, m.middleH))
 		bot = chrome.StatusBarZen(m.st, m.width)
+	} else if m.mobile() {
+		// mobile (auto, width < mobileMaxCols): the middle stacks
+		// VERTICALLY — a compact floor band on top, the active panel
+		// full-width below it. No horizontal split, no sidebar frame
+		// eating columns; the chrome rows (topbar/statusbar) stay as-is.
+		bandH := m.floorBandH()
+		floor := lipgloss.NewStyle().Width(m.width).Height(bandH).
+			Render(office.CachedStyled(m.st, m.width, bandH))
+		side := lipgloss.NewStyle().Width(m.width).Height(m.middleH - bandH).
+			Render(m.tabs.View())
+		mid = lipgloss.JoinVertical(lipgloss.Left, floor, side)
+		hint := m.keys.HintLine()
+		if m.terminalActive() {
+			hint = termHint
+		}
+		bot = chrome.StatusBar(m.st, hint, len(m.queue), m.width)
 	} else {
 		floor := lipgloss.NewStyle().Width(m.floorW).Height(m.middleH).
 			Render(office.CachedStyled(m.st, m.floorW, m.middleH))
@@ -939,9 +1226,11 @@ const clickDblWindow = 400 * time.Millisecond
 // tab pins a ▸ marker on its row, and an office notice names it; a second
 // click on the SAME sprite inside clickDblWindow instead toggles that
 // agent's work thread in chat (and jumps there). CHAT (sidebar, chat tab):
-// a click on an expanded worker thread's "┌" header row toggles that
-// agent's thread too. Clicks landing in the 2-cell frame chrome (topbar
-// row / statusbar row) are ignored outright.
+// a click inside the open permission popover's card answers it on the spot
+// (PermClick owns the card's fixed hit-map — same response strings the
+// y/a/n keys send); a click on an expanded worker thread's "┌" header row
+// toggles that agent's thread too. Clicks landing in the 2-cell frame
+// chrome (topbar row / statusbar row) are ignored outright.
 func (m *Model) handleClick(msg tea.MouseClickMsg) tea.Cmd {
 	if m.height == 0 || m.zen || msg.Button != tea.MouseLeft {
 		return nil
@@ -950,15 +1239,39 @@ func (m *Model) handleClick(msg tea.MouseClickMsg) tea.Cmd {
 	if msg.Y <= 0 || msg.Y >= m.height-1 {
 		return nil
 	}
-	if msg.X >= m.floorW {
-		// sidebar: only the chat tab claims clicks (thread header rows).
-		// Content coords = screen minus the box chrome (floor border col +
+	if m.mobile() {
+		// mobile stack: the floor band owns rows 1..floorBandH (hit-tested
+		// by the shared floor tail below); BELOW the band sits the panel,
+		// whose chat tab claims clicks exactly like the sidebar does —
+		// content coords just shift down past the band.
+		if msg.Y >= 1+m.floorBandH() {
+			if m.tabs.ActiveIndex() != 0 || m.chat == nil {
+				return nil
+			}
+			dx, dy := m.tabs.ContentOffset()
+			cx, cy := msg.X-dx, msg.Y-(1+m.floorBandH()+dy)
+			if cmd := m.chat.PermClick(cx, cy); cmd != nil {
+				return cmd
+			}
+			m.chat.ClickRow(cx, cy)
+			return nil
+		}
+	} else if msg.X >= m.floorW {
+		// sidebar: only the chat tab claims clicks (the permission
+		// popover's card, then worker thread header rows). Content
+		// coords = screen minus the box chrome (floor border col +
 		// sidebar top row + tab bar & border — Tabs.ContentOffset).
 		if m.tabs.ActiveIndex() != 0 || m.chat == nil {
 			return nil
 		}
 		dx, dy := m.tabs.ContentOffset()
-		m.chat.ClickRow(msg.X-(m.floorW+dx), msg.Y-(1+dy))
+		cx, cy := msg.X-(m.floorW+dx), msg.Y-(1+dy)
+		// the popover claims clicks inside its card first (fires the
+		// answer seam); outside it returns nil and thread rows take over
+		if cmd := m.chat.PermClick(cx, cy); cmd != nil {
+			return cmd
+		}
+		m.chat.ClickRow(cx, cy)
 		return nil
 	}
 	id, ok := office.HitAgent(m.st, msg.X, msg.Y-1 /* topbar row */)
@@ -1016,7 +1329,7 @@ func (m *Model) closeTerminal() {
 	}
 }
 
-// CloseTerminal is the exported quit-path hook for cmd/grafeio (the runtime
+// CloseTerminal is the exported quit-path hook for cmd/theboringoffice (the runtime
 // intercepts tea.QuitMsg before Update, so an external p.Quit skips
 // handleKey — call CloseTerminal alongside to never leak a shell process).
 func (m *Model) CloseTerminal() { m.closeTerminal() }
@@ -1031,7 +1344,7 @@ func (m Model) LayoutInfo() (width, height, sidebar, floor int) {
 func (m *Model) applyEvent(ev state.Event) tea.Cmd {
 	// permission prompts + question holds are model-owned UI state (not
 	// chat history) — handle before the reducer (the reducer also uses
-	// the parked state: a question modal drops the typing placeholder).
+	// the parked state: a question popover drops the typing placeholder).
 	if ev.Kind == state.EvPermission {
 		m.handlePermissionEvent(ev)
 	}
@@ -1549,46 +1862,50 @@ func (m *Model) resendBatchCmd(items []queueEntry) tea.Cmd {
 	}
 }
 
-// handlePermissionEvent opens/closes the boss permission prompt. Boss/primary
-// requests (pending ToolState) REPLACE the textarea with the answer modal;
-// "resolved" closes the matching open (or esc'd) prompt silently. Child-
-// session requests never open a modal — they surface as an activity line
-// (describeEvent) plus the backend's usual floor blocked sprite.
+// handlePermissionEvent enqueues/opens permission asks from ANY session —
+// boss/primary AND children ride the same queue now. Pending asks append
+// behind the displayed front and the popover re-renders ("1 of N"); the
+// Agent field names the requester. "resolved" drops the matching id from
+// pending AND esc'd; a dropped front closes (or advances) the popover.
+// The child's floor blocked sprite + activity line still come from the
+// backend's EvBlocked/describeEvent paths — the popover is additional UI,
+// not a floor-state replacement.
 func (m *Model) handlePermissionEvent(ev state.Event) {
 	if ev.ToolState == "resolved" {
-		if m.perm != nil && m.perm.ID == ev.PermissionID {
-			m.perm = nil
-			m.chat.SetPermission(nil)
-		}
-		if m.permEscd != nil && m.permEscd.ID == ev.PermissionID {
-			m.permEscd = nil
-		}
+		m.permQ.resolve(ev.PermissionID)
+		m.chat.SetPermission(m.permQ.view())
 		return
 	}
-	if ev.EmployeeName != "boss" && ev.EmployeeName != "" {
-		return // child permission: activity line only, no modal
+	agent := ev.EmployeeName
+	if agent == "" {
+		agent = "boss"
 	}
-	m.perm = &permPrompt{ID: ev.PermissionID, ToolName: ev.ToolName, Summary: ev.ToolSummary}
-	m.playSound("alert") // boss permission modal opening
-	m.chat.SetPermission(&panels.PermissionView{
-		ID:       ev.PermissionID,
-		ToolName: ev.ToolName,
-		Summary:  ev.ToolSummary,
+	m.permQ.pending = append(m.permQ.pending, &permPrompt{
+		ID: ev.PermissionID, ToolName: ev.ToolName, Summary: ev.ToolSummary,
+		Agent: agent,
 	})
+	m.playSound("alert") // every NEW ask opening the popover (boss or child)
+	m.chat.SetPermission(m.permQ.view())
 }
 
-// handleQuestionEvent opens/closes the boss question hold. Boss/primary
-// requests (pending ToolState) park the turn: the open hold REPLACES the
-// textarea with a free-text answer modal (opencode waits at the question
-// reply API — typing a chat message would queue but never resume it, the
-// reported deadlock). "resolved" closes the matching hold silently.
-// Employee questions never open a modal — activity line only, like
-// employee thoughts/permissions.
+// handleQuestionEvent opens/closes the boss question WIZARD. Boss/primary
+// requests (pending ToolState) park the turn: the open hold pages the
+// request's question items through the chat panel's question popover one
+// at a time (opencode waits at the question reply API — typing a chat
+// message would queue but never resume it, the reported deadlock). An
+// EvQuestion with NO structured Questions degrades to a single free-text
+// page (legacy/flattened emitters — see legacyQuestionPage). "resolved"
+// closes the whole request silently (ANY batched id — open and esc'd
+// holds alike). Employee questions never open a popover — activity line
+// only, like employee thoughts/permissions.
 func (m *Model) handleQuestionEvent(ev state.Event) {
 	if ev.ToolState == "resolved" {
 		if m.question != nil && hasQuestionID(m.question.IDs, ev.QuestionID) {
 			m.question = nil
 			m.chat.SetQuestion(nil)
+			// a closed question popover frees the region — re-push the
+			// permission queue front (asks can have stacked behind it).
+			m.chat.SetPermission(m.permQ.view())
 		}
 		if m.questionEscd != nil && hasQuestionID(m.questionEscd.IDs, ev.QuestionID) {
 			m.questionEscd = nil
@@ -1601,25 +1918,41 @@ func (m *Model) handleQuestionEvent(ev state.Event) {
 	if ev.QuestionID == "" {
 		return
 	}
-	// v1: while ANY hold is outstanding, a fresh pending boss question is
-	// folded into it — a question call batching several QuestionIDs emits
-	// one event per id; one typed answer unblocks every batched id.
-	if m.question != nil {
-		m.question.IDs = append(m.question.IDs, ev.QuestionID)
-		return
+	items := ev.Questions
+	if len(items) == 0 {
+		items = []state.QuestionItem{legacyQuestionPage(ev)}
 	}
-	if m.questionEscd != nil {
-		m.questionEscd.IDs = append(m.questionEscd.IDs, ev.QuestionID)
+	// fold-in (chosen over rejecting second requests): while ANY hold is
+	// outstanding, a fresh pending boss question joins it — the batched
+	// wire ids keep today's fold-in (a question call batching several
+	// QuestionIDs emits one event per id; one submitted answer set
+	// unblocks every batched id), and the fresh request's PAGES append as
+	// extra wizard pages so the member walks everything outstanding in
+	// one pass. A repeat of an already-known id folds nothing twice.
+	h := m.question
+	if h == nil {
+		h = m.questionEscd
+	}
+	if h != nil {
+		if !hasQuestionID(h.IDs, ev.QuestionID) {
+			h.IDs = append(h.IDs, ev.QuestionID)
+			h.Items = append(h.Items, items...)
+			h.Answers = append(h.Answers, make([][]string, len(items))...)
+			if h == m.question {
+				// the page count grew behind the member — re-render so
+				// the "N of M" header keeps telling the truth
+				m.chat.SetQuestion(m.questionView(h))
+			}
+		}
 		return
 	}
 	m.parkForQuestion()
-	m.question = &questionHold{IDs: []string{ev.QuestionID},
-		Text: ev.Text, Options: ev.ToolSummary}
-	m.chat.SetQuestion(&panels.QuestionView{
-		ID:      ev.QuestionID,
-		Text:    ev.Text,
-		Options: ev.ToolSummary,
-	})
+	m.question = &questionHold{
+		IDs:     []string{ev.QuestionID},
+		Items:   append([]state.QuestionItem(nil), items...),
+		Answers: make([][]string, len(items)),
+	}
+	m.chat.SetQuestion(m.questionView(m.question))
 }
 
 // parkForQuestion marks the turn parked at the question reply API: any
@@ -1662,6 +1995,39 @@ func (m Model) compact() bool {
 		return false
 	}
 	return m.cfg.UI.Compact
+}
+
+// mobile — the AUTOMATIC narrow-terminal layout: window width below
+// mobileMaxCols drops the horizontal floor|sidebar split for a vertical
+// stack (compact floor band over the active panel). No command, no
+// persistence: resize() picks the layout per window size, and the width
+// term in frameDigest re-renders on the same frame the threshold crosses.
+// Interplay with the other modes:
+//   - zen (/zen) still wins outright — the transient fullscreen floor is
+//     zen even when the window is narrow; mobile reshapes only the NORMAL
+//     layout (Frame checks m.zen first).
+//   - compact (/compact) stays orthogonal — it swaps topbar/tab-label
+//     density and applies in either layout (Frame picks TopBarCompact
+//     before the layout branch).
+//
+// m.width is always >= minCols by the time Frame renders (resize clamps).
+func (m Model) mobile() bool {
+	return m.width < mobileMaxCols
+}
+
+// floorBandH — the mobile floor band's row count: ~20% of the middle
+// area, clamped to 8..14 (8 keeps a legible boss corner + pod row; 14
+// leaves the panel the room it needs). resize clamps middleH >= 10, so
+// the panel below always keeps >= 2 rows.
+func (m Model) floorBandH() int {
+	h := m.middleH / 5
+	if h < 8 {
+		h = 8
+	}
+	if h > 14 {
+		h = 14
+	}
+	return h
 }
 
 // applyLayout pushes the current mode/UI config into every affected
@@ -1724,7 +2090,14 @@ func (m *Model) resize(w, h int) {
 	}
 	m.sidebar = sw
 	m.floorW = w - sw
-	m.tabs.SetSize(sw, m.middleH)
+	if m.mobile() {
+		// mobile stack: no sidebar — the tab strip owns the full width in
+		// the rows under the floor band (Frame renders the band itself at
+		// bandH; both sides share floorBandH() so they never drift apart).
+		m.tabs.SetSize(w, m.middleH-m.floorBandH())
+	} else {
+		m.tabs.SetSize(sw, m.middleH)
+	}
 }
 
 // --- reducer (exact port of node-legacy officeReducer + initialState) ------
@@ -1736,7 +2109,7 @@ func initialState(mode state.Mode) state.OfficeState {
 			{ID: "hr", Name: "hr", Role: state.RoleHR, Seat: "hr", Sprite: state.SpriteAtDesk},
 		},
 		Mode:       mode,
-		StatusLine: fmt.Sprintf("[grafeio] %s - booting...", string(mode)),
+		StatusLine: fmt.Sprintf("[theboringoffice] %s - booting...", string(mode)),
 	}
 }
 
@@ -2223,6 +2596,20 @@ func reducer(st state.OfficeState, ev state.Event) state.OfficeState {
 		st.StatusLine = ev.Text
 		return st
 
+	case state.EvOffline:
+		// Connectivity watcher says down — badge + status land together.
+		// The backend pairs this with its own EvStatus right after ("[theboringoffice]
+		// offline — office waiting for internet…"); this text is the fallback
+		// for a kind fired without a paired status.
+		st.Offline = true
+		st.StatusLine = "[office] OFFLINE — waiting for internet…"
+		return st
+
+	case state.EvOnline:
+		st.Offline = false
+		st.StatusLine = "[office] back online"
+		return st
+
 	case state.EvUsage:
 		// Real opencode assistant-message counters (EvUsage carries
 		// per-message DELTAS — see state.go); plain accumulation into the
@@ -2285,7 +2672,8 @@ const slashHelp = `commands:
   /question          re-open a deferred boss question
   /new               fresh office (previous transcript archived on disk)
   /status            office status
-  /quit              exit grafeio`
+  /mcp [reconnect x] show MCP servers; reconnect one by name
+  /quit              exit theboringoffice`
 
 // applySlash dispatches one slash command. Slash input never echoes as
 // chat-user; every outcome surfaces as a From "office" chat notice.
@@ -2298,6 +2686,37 @@ func (m *Model) applySlash(input string) tea.Cmd {
 	switch cmd {
 	case "/help":
 		m.notice(slashHelp)
+	case "/mcp":
+		// MCP console: status list from the backend's /mcp surface, or a
+		// reconnect of one server (the live route POSTs /mcp/{name}/connect,
+		// older serves may reject with a wrapped 404 — that error surfaces
+		// as the notice). Both hops are async so the input never stalls.
+		b := m.backend
+		if len(fields) >= 2 && fields[1] == "reconnect" {
+			if len(fields) < 3 {
+				m.noticeErr("/mcp: usage /mcp reconnect <name>")
+				return nil
+			}
+			name := fields[2]
+			m.notice("mcp: reconnecting " + name + "…")
+			return func() tea.Msg {
+				if b == nil {
+					return mcpStatusMsg{err: errors.New("no backend attached")}
+				}
+				if err := b.ReconnectMCP(name); err != nil {
+					return mcpStatusMsg{err: err}
+				}
+				sv, err := b.MCPServers()
+				return mcpStatusMsg{servers: sv, err: err, reconnected: name}
+			}
+		}
+		return func() tea.Msg {
+			if b == nil {
+				return mcpStatusMsg{err: errors.New("no backend attached")}
+			}
+			sv, err := b.MCPServers()
+			return mcpStatusMsg{servers: sv, err: err}
+		}
 	case "/clear":
 		m.st.Chat = nil
 		if m.chat != nil {
@@ -2481,17 +2900,21 @@ func (m *Model) applySlash(input string) tea.Cmd {
 		// stopped). The queue is untouched — it sends on the next turn.
 		m.stopWork()
 	case "/perm":
-		if m.permEscd == nil {
+		// re-open the most recent esc'd ask: it jumps the queue to the
+		// front (the popover displays it next). Nothing esc'd means either
+		// a prompt is already open or there's genuinely nothing pending.
+		if len(m.permQ.pending) == 0 && len(m.permQ.escd) == 0 {
 			m.notice("no pending permission (/perm re-opens an esc'd prompt)")
 			return nil
 		}
-		m.perm = m.permEscd
-		m.permEscd = nil
-		m.chat.SetPermission(&panels.PermissionView{
-			ID:       m.perm.ID,
-			ToolName: m.perm.ToolName,
-			Summary:  m.perm.Summary,
-		})
+		if len(m.permQ.escd) == 0 {
+			m.notice("permission prompt already open — answer it or esc to defer")
+			return nil
+		}
+		p := m.permQ.escd[len(m.permQ.escd)-1]
+		m.permQ.escd = m.permQ.escd[:len(m.permQ.escd)-1]
+		m.permQ.pending = append([]*permPrompt{p}, m.permQ.pending...)
+		m.chat.SetPermission(m.permQ.view())
 	case "/question":
 		if m.question != nil {
 			m.notice("boss question is open — answer it or esc to defer")
@@ -2503,13 +2926,18 @@ func (m *Model) applySlash(input string) tea.Cmd {
 		}
 		m.question = m.questionEscd
 		m.questionEscd = nil
-		m.chat.SetQuestion(&panels.QuestionView{
-			ID:      m.question.IDs[0],
-			Text:    m.question.Text,
-			Options: m.question.Options,
-		})
+		// resume the wizard at the FIRST page whose answer slot is still
+		// empty — pages already answered keep their recorded answers
+		// (re-opening never forces re-answering).
+		for i, a := range m.question.Answers {
+			if len(a) == 0 {
+				m.question.Cursor = i
+				break
+			}
+		}
+		m.chat.SetQuestion(m.questionView(m.question))
 	case "/new":
-		m.newOffice() // sessions.go — clear surfaces + fresh "grafeio office"
+		m.newOffice() // sessions.go — clear surfaces + fresh "theboringoffice office"
 	case "/status":
 		var pend, doing, done int
 		for _, t := range m.st.Tasks {
@@ -2696,6 +3124,10 @@ func (m *Model) describeEvent(ev state.Event) string {
 		what = fmt.Sprintf("diff — %s: %s +%d -%d", name, ev.DiffPath, ev.DiffAdd, ev.DiffDel)
 	case state.EvStatus:
 		what = "status — " + ev.Text
+	case state.EvOffline:
+		what = "OFFLINE — waiting for internet…"
+	case state.EvOnline:
+		what = "back online — resumed"
 	case state.EvUsage:
 		what = fmt.Sprintf("usage — +%d in / +%d out tok · +$%.4f", ev.TokensIn, ev.TokensOut, ev.CostUSD)
 	default:

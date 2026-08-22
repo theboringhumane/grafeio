@@ -16,8 +16,8 @@ import (
 
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/theboringhumane/grafeio/internal/panels"
-	"github.com/theboringhumane/grafeio/internal/term"
+	"github.com/theboringhumane/theboringoffice/internal/panels"
+	"github.com/theboringhumane/theboringoffice/internal/term"
 )
 
 // fail prints and exits 1.

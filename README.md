@@ -1,4 +1,4 @@
-# Grafeio (γραφείο)
+# theboringoffice
 
 **A startup office in your terminal, staffed by real agents.** (v2 — Go + Bubble Tea)
 
@@ -13,20 +13,55 @@ mail room is **agentmemory signals**.
 
 ![chat tab](docs/shots-go/chat.png)
 
-```bash
-go install github.com/theboringhumane/grafeio/cmd/grafeio@latest
+## Install
 
-grafeio            # live: spawns `opencode serve`, real boss (oikonomos)
-grafeio --demo     # touring mode: simulated events, labeled DEMO
-grafeio --server http://127.0.0.1:4096   # attach to an existing server
+One-liner — binary plus [agentmemory](https://github.com/rohitg00/agentmemory)
+wired as a reboot-safe service:
+
+```bash
+curl -fsSL \
+  https://raw.githubusercontent.com/theboringhumane/theboringoffice/main/install.sh | sh
+```
+
+Then `theboringoffice --demo` for touring mode.
+
+Pin the version you want — every tagged release gets stamped into the binary.
+
+```bash
+go install github.com/theboringhumane/theboringoffice/cmd/theboringoffice@v0.1.0   # exact tag
+go install github.com/theboringhumane/theboringoffice/cmd/theboringoffice@latest   # newest release
+```
+
+Or pull a prebuilt archive (darwin/linux, amd64/arm64, `checksums.txt`
+alongside) from [GitHub Releases](https://github.com/theboringhumane/theboringoffice/releases):
+
+```bash
+curl -LO https://github.com/theboringhumane/theboringoffice/releases/download/v0.1.0/theboringoffice_0.1.0_darwin_arm64.tar.gz
+tar -xzf theboringoffice_0.1.0_darwin_arm64.tar.gz   # -> theboringoffice binary; move it onto your PATH
+```
+
+Check the stamp — version, commit, and build date ride every binary:
+
+```bash
+$ theboringoffice --version
+theboringoffice v0.1.0 (abc1234, 2026-08-22)
+```
+
+Then run it:
+
+```bash
+theboringoffice            # live: spawns `opencode serve`, real boss (oikonomos)
+theboringoffice --demo     # touring mode: simulated events, labeled DEMO
+theboringoffice --server http://127.0.0.1:4096   # attach to an existing server
 ```
 
 ![agents tab](docs/shots-go/agents.png)
 
 Working detail stays visible: opencode-style diffs (line numbers, full-row
 red/green tints, inline syntax), thinking blocks, tool calls, permission
-prompts (`[y/a/n/esc]`), question prompts, and a message queue that never
-locks you out while the boss types.
+popovers (clickable allow-once/always/reject menu, queued "1 of N" when asks
+stack up), boss question wizard pages, sub-agent work threads, and a message
+queue that never locks you out while the boss types.
 
 ![diffs](docs/shots-go/chat-diff.png)
 
@@ -40,10 +75,44 @@ board rows, flush goes out as one `[BATCH DISPATCH]` the boss decomposes into
 parallel sub-agents (`/route` forces it early), and a dead boss respawns a fresh
 session and resends the batch.
 
+## Popovers and polish
+
+- **Concierge** — send while the boss is mid-task and the office concierge
+  answers instantly, as a real conversation turn (noted in chat as "office
+  routed: boss busy → concierge"); if the concierge is unavailable a notice
+  says so and the prompt rides the backlog instead.
+- **Question wizard** — boss questions open as popover pages, classified
+  automatically: **text** (free answer), **radio** (pick one), **checkbox**
+  (pick several), **confirm** (yes/no). Deferred one? `/question` re-opens it.
+- **Permission queue** — permission asks stack: the front of the queue shows
+  "1 of N" with a clickable allow-once / always / reject menu
+  (`y` `a` `n` `esc`). `/perm` re-opens an esc'd prompt.
+- **Work threads** — sub-agent work renders as opencode-style threads right
+  in the chat:
+
+  ```text
+  ⠿ Explore Task — Scout question kinds recon (· 2 tool calls ✓ done)
+    ↳ Read internal/panels/chat.go … running
+  ```
+
+  a `  ↳` sneak row previews the latest action; click the header (or
+  `ctrl+g`) to expand the full thread.
+- **`/stop` + free-send** — `enter` while the boss works never blocks: the
+  prompt free-sends into the backlog and the status line reads "busy · N
+  queued". `/stop` aborts current work (boss + workers).
+- **Ambient floor** — coffee steam off the tea machine, blinking server-rack
+  LEDs, and an uplink ripple along the server-room wall — all tick-driven
+  (no timers), so an idle office stays cheap.
+- **Boot splash** — animated startup splash, hard-capped at ~4s; any key
+  skips it.
+
 ## Configure the brain
 
-One file runs the office: **`~/.grafeio/configs/brain.json`** (created with
-defaults on first run; inspect anytime with `grafeio --print-default-config`).
+One file runs the office: **`~/.theboringoffice/configs/brain.json`** (created with
+defaults on first run; inspect anytime with `theboringoffice --print-default-config`).
+Upgrading from grafeio? Your old `~/.grafeio` config, theme and sessions are
+still READ (writes land on the new paths only), and `GRAFEIO_*` env vars keep
+working as fallbacks for the new `THEBORINGOFFICE_*` ones.
 
 ```jsonc
 {
@@ -93,7 +162,7 @@ Layout lives in the config *and* in the app:
 /zen                fullscreen floor, minimal chrome — any key exits
 ```
 
-Sounds: `ui.sounds = on | bell | off` (or `GRAFEIO_MUTE=1`).
+Sounds: `ui.sounds = on | bell | off` (or `THEBORINGOFFICE_MUTE=1`).
 
 ## Keys
 
@@ -118,6 +187,38 @@ drops past it), ride the message queue like text, and go out as prompt file
 parts; the echoed user bubble shows a `· 📎 N` suffix. `/clear` or a send
 clears the chips.
 
+## Slash commands
+
+`/` at a word start opens the picker: type to narrow (`/th` → `/theme
+/themes /thinking`), `↑`/`↓` move, `enter`/`tab` accept. Arrowing through
+`/theme` matches applies a live preview.
+
+| command | does |
+|---|---|
+| `/help` | this list |
+| `/theme <name>` | switch theme (persists) |
+| `/themes` | list themes |
+| `/thinking on\|off` | show/hide thinking blocks |
+| `/tools on\|off` | show/hide tool one-liners |
+| `/status` | office status |
+| `/mcp [reconnect <name>]` | MCP server status; reconnect one server |
+| `/clear` | empty the chat |
+| `/queue [clear]` | show the backlog (`clear` drops it) |
+| `/route` | force-dispatch the backlog now |
+| `/perm` | re-open an esc'd permission prompt |
+| `/diffs on\|off` | expand/collapse file diffs |
+| `/question` | re-open a deferred boss question |
+| `/power auto\|performance\|saver` | power governor |
+| `/model provider/model` | boss model |
+| `/compact on\|off` | compact layout this session |
+| `/mode normal\|compact` | layout mode (persists) |
+| `/wide 26..100` | sidebar width (0 = default) |
+| `/zen` | fullscreen floor, any key exits |
+| `/focus floor` | alias of `/zen` |
+| `/stop` | abort current work (boss + workers) |
+| `/new` | fresh office (transcript archived) |
+| `/quit` | exit theboringoffice |
+
 ## What v2 (Go) changed
 
 - Chat moved from a fixed bottom bar into a **tabbed right panel** with
@@ -127,9 +228,9 @@ clears the chips.
   spinner while the boss works.
 - New **activity** tab: rolling event log (dispatches, returns, blocks).
 - Native single binary. Themes: `--theme noir|paper|mono|dracula|solarized`
-  (also `/theme` in-app, persisted to `~/.config/grafeio/theme`).
-- Slash commands in chat: `/help /themes /theme <n> /thinking on|off
-  /tools on|off /status /clear /quit`.
+  (also `/theme` in-app, persisted to `~/.config/theboringoffice/theme`).
+- Slash commands in chat — the full picker-driven table is under
+  [Slash commands](#slash-commands).
 - The Ink/Node v0.1 app lived on as git tag `node-v0.1.0`.
 
 ## Behind the glass
@@ -141,4 +242,16 @@ clears the chips.
 
 Architecture and the floor plan: [docs/architecture.md](docs/architecture.md).
 
-MIT © Lynxlabs
+## agentmemory
+
+The office runs on memory. [agentmemory](https://github.com/rohitg00/agentmemory)
+is a persistent memory server for AI coding agents — sessions, recall, lessons,
+semantic search across sessions. The board already rides its actions and the mail
+room its signals; run it alongside and the office remembers across reboots —
+decisions, lessons, yesterday's batch: they survive `ctrl+q`. The install script
+sets it up as a reboot-safe service, or roll your own with
+`npm install -g @agentmemory/agentmemory` ([npm](https://www.npmjs.com/package/@agentmemory/agentmemory)).
+
+— theboringoffice, by [theboringhumane](https://github.com/theboringhumane) at theboredteam.
+
+MIT © theboredteam

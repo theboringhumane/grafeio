@@ -27,9 +27,9 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
-	"github.com/theboringhumane/grafeio/internal/chrome"
-	"github.com/theboringhumane/grafeio/internal/state"
-	"github.com/theboringhumane/grafeio/internal/term"
+	"github.com/theboringhumane/theboringoffice/internal/chrome"
+	"github.com/theboringhumane/theboringoffice/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/term"
 )
 
 // TermPanel is the terminal sidebar tab. It satisfies Tab + Interactive

@@ -1,19 +1,21 @@
 package app
 
 import (
+	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
-// scratchHome points GRAFEIO_HOME at a t.TempDir for the sessions tests.
+// scratchHome points THEBORINGOFFICE_HOME at a t.TempDir for the sessions tests.
 func scratchHome(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
-	t.Setenv("GRAFEIO_HOME", home)
+	t.Setenv("THEBORINGOFFICE_HOME", home)
 	return home
 }
 
@@ -48,6 +50,53 @@ func TestSessionRoundTrip(t *testing.T) {
 	if len(got.Chat) != 2 || len(got.Tasks) != 1 || len(got.Mails) != 1 || len(got.Agents) != 1 {
 		t.Fatalf("round trip surface counts: chat=%d tasks=%d mails=%d agents=%d",
 			len(got.Chat), len(got.Tasks), len(got.Mails), len(got.Agents))
+	}
+}
+
+// TestLoadSession_LegacyFallback pins the rename-era read contract: an
+// office session stored under the pre-rename ~/.grafeio/sessions root is
+// still found (the new root is written only), so an upgrade relaunches
+// into the old transcript instead of silently starting over.
+func TestLoadSession_LegacyFallback(t *testing.T) {
+	scratchHome(t)
+	dir := t.TempDir()
+	st := state.OfficeState{
+		Chat: []state.ChatMsg{{ID: "b1", From: "boss", Kind: "boss", Text: "old office", At: 4}},
+	}
+	sf := Snapshot(dir, "ses-legacy", st)
+
+	// Plant the file at the LEGACY path (SaveSession writes the new one).
+	legacy := filepath.Join(legacySessionsBase(), SessionDirHash(dir), "session.json")
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(sf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacy, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok := LoadSession(dir)
+	if !ok {
+		t.Fatal("LoadSession must read the legacy ~/.grafeio copy when the new root has none")
+	}
+	if got.PrimaryID != "ses-legacy" {
+		t.Fatalf("legacy restore mismatch: primary=%q", got.PrimaryID)
+	}
+
+	// A save still lands ONLY under the new root.
+	sf.PrimaryID = "ses-new"
+	if err := SaveSession(dir, sf); err != nil {
+		t.Fatal(err)
+	}
+	got, ok = LoadSession(dir)
+	if !ok || got.PrimaryID != "ses-new" {
+		t.Fatalf("after save the new root must win: %+v ok=%v", got, ok)
+	}
+	if b, _ := os.ReadFile(legacy); !strings.Contains(string(b), "ses-legacy") {
+		t.Fatalf("legacy file must stay untouched, got %s", b)
 	}
 }
 

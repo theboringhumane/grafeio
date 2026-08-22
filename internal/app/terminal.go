@@ -1,7 +1,7 @@
 // terminal.go — the sidebar's REAL OS-shell tab: a lazy-spawning adapter
 // around the parallel-built terminal panel.
 //
-// CONTRACT (the terminal dev builds this exactly; cmd/grafeio wires it):
+// CONTRACT (the terminal dev builds this exactly; cmd/theboringoffice wires it):
 //
 //	package panels
 //	NewTerminal(width, height int) (*TermPanel, error)
@@ -32,8 +32,8 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"github.com/theboringhumane/grafeio/internal/panels"
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/panels"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 // terminalIndex is the terminal tab's position in the sidebar strip
@@ -49,8 +49,9 @@ type TerminalTab interface {
 	Alive() bool
 }
 
-// SpawnTerminal — the factory cmd/grafeio wires to panels.NewTerminal once
-// the parallel build lands (uisshit wires a stub in the meantime). Contract:
+// SpawnTerminal — the factory cmd/theboringoffice wires to the real panels.NewTerminal
+// (the PTY panel landed at internal/panels/terminal.go; cmd/uishot still pins
+// its own stub so shot frames stay deterministic). Contract:
 // SpawnTerminal(cols, rows) returns a RUNNING shell panel; errors mean
 // "spawn failed" and land on the chat tab as an office notice.
 var SpawnTerminal func(cols, rows int) (TerminalTab, error)
@@ -95,7 +96,7 @@ func (t *termTabWrap) ensure() error {
 	}
 	t.tried = true
 	if SpawnTerminal == nil {
-		t.err = fmt.Errorf("terminal panel not linked yet (parallel build — cmd/grafeio wires panels.NewTerminal)")
+		t.err = fmt.Errorf("terminal panel not linked yet (parallel build — cmd/theboringoffice wires panels.NewTerminal)")
 		return t.err
 	}
 	cols, rows := t.w, t.h

@@ -6,15 +6,16 @@
 // visible chat entries and the thread groups into ONE ordered list:
 // timestamp ascending (oldest top, newest bottom), stable for ties, so a
 // thread renders as a normal conversation entry at its birth slot and the
-// pinned dock is gone. The rendering itself (a thread's collapsed one-row
-// summary or its live expanded block) is unchanged — only the position
-// moves.
+// pinned dock is gone. The rendering itself (threads_opencode.go's
+// opencode-style frame — single-row header + ↳ sneak while collapsed,
+// the merged tool/think rows while expanded) is unchanged by the merge —
+// only the position moves.
 package panels
 
 import (
 	"sort"
 
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 // timelineItem is one unit of the merged chat timeline: either a regular

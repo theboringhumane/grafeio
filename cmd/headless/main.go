@@ -1,20 +1,20 @@
-// headless — verification binary for the Grafeio backend layer.
+// headless — verification binary for the theboringoffice backend layer.
 //
-//	grafeio-headless            demo backend (default), ~7.2s of events, exit 0
-//	grafeio-headless --live     real `opencode serve` spawn + agentmemory probe,
+//	theboringoffice-headless            demo backend (default), ~7.2s of events, exit 0
+//	theboringoffice-headless --live     real `opencode serve` spawn + agentmemory probe,
 //	                            print startup events for 3s, stop, exit 0
-//	grafeio-headless --live --prompt "text"
+//	theboringoffice-headless --live --prompt "text"
 //	                            send the prompt once the primary session is
 //	                            ready, wait up to 60s for the completed boss
 //	                            reply, stop, exit 0
-//	grafeio-headless --live --prompt "text" --prompt2 "text2"
+//	theboringoffice-headless --live --prompt "text" --prompt2 "text2"
 //	                            stale-reply repro: send prompt, wait up to 60s
 //	                            for its completed boss text, send prompt2, wait
 //	                            likewise, then assert the two turns' texts are
 //	                            distinct and operation-appropriate. Prints
 //	                            "STALE-REPRO: FIXED" (exit 0) when all checks
 //	                            pass, "STALE-REPRO: BUG" (exit 1) otherwise.
-//	grafeio-headless --batch-probe
+//	theboringoffice-headless --batch-probe
 //	                            queue-flush contract probe (forces live):
 //	                            mirrors TWO queue items onto the agentmemory
 //	                            board via the QueueItemStart seam, sends ONE
@@ -24,21 +24,21 @@
 //	                            then marks the board actions done. Prints
 //	                            BATCH-PHASE lines + "BATCH-PROBE: OK" (exit 0)
 //	                            or "BATCH-PROBE: FAIL" (exit 1).
-//	grafeio-headless --answer   after the first permission event prints,
+//	theboringoffice-headless --answer   after the first permission event prints,
 //	                            call backend.AnswerPermission(pid, "once") and
 //	                            print the result (demo: clears tekton-1's block)
-//	grafeio-headless --cfg path/to/brain.json
+//	theboringoffice-headless --cfg path/to/brain.json
 //	                            use an explicit brain.json for this run
 //	                            (defaults-filled, never written back); without
-//	                            it, config.Load() reads GRAFEIO_HOME just like
+//	                            it, config.Load() reads THEBORINGOFFICE_HOME just like
 //	                            the UI binaries. A [cfg] summary line prints
 //	                            the loaded Boss/Backend before anything else.
-//	grafeio-headless --efficiency
+//	theboringoffice-headless --efficiency
 //	                            simulate 11 board-poll cadence decisions (8
 //	                            unchanged syncs, then a change) using the same
 //	                            BackoffInterval helper the live backend runs,
 //	                            printing the interval growth. EFFICIENCY: OK.
-//	grafeio-headless --ask      question-loop regression probe (forces live):
+//	theboringoffice-headless --ask      question-loop regression probe (forces live):
 //	                            auto-sends the question-tool prompt, answers the
 //	                            FIRST pending EvQuestion via
 //	                            backend.AnswerQuestion 2s after it surfaces, then
@@ -49,40 +49,41 @@
 //	                            answer. Prints "QUESTION-LOOP: FIXED" (exit 0) or
 //	                            "QUESTION-LOOP: STUCK" (exit 1).
 //
-//	grafeio-headless --persist-demo
+//	theboringoffice-headless --persist-demo
 //	                            office-session persist proof, run 1 (forces
-//	                            live): scratch GRAFEIO_HOME (created when
+//	                            live): scratch THEBORINGOFFICE_HOME (pre-rename name GRAFEIO_HOME also honored; created when
 //	                            unset, path printed as [persist-home]), Start,
 //	                            send "say pineapple", wait up to 60s for the
 //	                            completed boss bubble, persist the office
 //	                            session, print session.json verbatim. Prints
 //	                            "PERSIST: SAVED" (exit 0) or exits 1.
-//	grafeio-headless --persist-restore
+//	theboringoffice-headless --persist-restore
 //	                            office-session persist proof, run 2 (forces
-//	                            live; requires the SAME GRAFEIO_HOME + cwd as
+//	                            live; requires the SAME THEBORINGOFFICE_HOME + cwd as
 //	                            run 1): LoadSession + PrimaryOverride + Start,
 //	                            asserts the restore notice line AND that the
 //	                            SAME primary id got reused (session under the
 //	                            50-msg stale guard). Prints "PERSIST: RESTORED".
-//	grafeio-headless --persist-new
+//	theboringoffice-headless --persist-new
 //	                            office-session persist proof, run 3 (forces
-//	                            live; same GRAFEIO_HOME + cwd): /new leg —
+//	                            live; same THEBORINGOFFICE_HOME + cwd): /new leg —
 //	                            NewOffice() must mint a FRESH primary id (!=
 //	                            the saved one), print the /new notice, and
 //	                            prove the overwrite keeps the latest primary
 //	                            in session.json. Prints "PERSIST: NEW".
 //
-//	grafeio-headless --charter-probe
+//	theboringoffice-headless --charter-probe
 //	                            oikonomos-charter wiring probe: scratch dir,
 //	                            EnsureCharter twice (identical bytes, second
 //	                            run changed=false), spawn a REAL opencode
 //	                            serve rooted in the scratch with a curated
-//	                            env (GRAFEIO_*/OPENCODE_SERVER stripped),
+//	                            env (THEBORINGOFFICE_*/GRAFEIO_*/
+//	                            OPENCODE_SERVER stripped),
 //	                            create a session, ask the boss who it is +
 //	                            the dispatch minimum, assert the reply names
 //	                            (manager|oikonomos) AND (three|3). Prints
 //	                            CHARTER-PROBE: ACTIVE (exit 0) else exit 1.
-//	grafeio-headless --abort-probe
+//	theboringoffice-headless --abort-probe
 //	                            /stop probe (forces live): print the opencode
 //	                            serve /doc abort route excerpt, then send the
 //	                            long-running prompt "write a 2000-word essay
@@ -95,7 +96,7 @@
 //	                            flush) AND no further boss-bubble stream
 //	                            growth beyond a 1.5s in-flight grace. Prints
 //	                            "STOP: OK" (exit 0) or "STOP: FAIL" (exit 1).
-//	grafeio-headless --concierge-probe
+//	theboringoffice-headless --concierge-probe
 //	                            office concierge / busy-boss probe (forces
 //	                            live): boss send "count from 1 to 300 with one
 //	                            number per line, then stop" (still working),
@@ -110,7 +111,7 @@
 //	                            lazily (never by boss traffic). Prints
 //	                            "CONCIERGE: OK" (exit 0) else "CONCIERGE: FAIL"
 //	                            (exit 1).
-//	grafeio-headless --sse-sim
+//	theboringoffice-headless --sse-sim
 //	                            SSE reconnect sim (D1): a fake standard-library
 //	                            serve emulates session list/create plus a
 //	                            scripted /event flap profile (clean closes,
@@ -151,11 +152,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/theboringhumane/grafeio/internal/app"
-	"github.com/theboringhumane/grafeio/internal/backend"
-	"github.com/theboringhumane/grafeio/internal/charter"
-	"github.com/theboringhumane/grafeio/internal/config"
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/app"
+	"github.com/theboringhumane/theboringoffice/internal/backend"
+	"github.com/theboringhumane/theboringoffice/internal/charter"
+	"github.com/theboringhumane/theboringoffice/internal/config"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 func main() {
@@ -166,7 +167,7 @@ func main() {
 	answer := flag.Bool("answer", false, "auto-answer the first permission prompt with \"once\" and print the result")
 	ask := flag.Bool("ask", false, "live mode: question-loop probe — send the question-tool prompt, AnswerQuestion the first pending question after 2s, assert resolution (15s budget, QUESTION-LOOP: FIXED|STUCK)")
 	batchProbe := flag.Bool("batch-probe", false, "live mode: queue-flush batch probe — board-mirror 2 queue items, send one composed batch, assert the boss covers both (BATCH-PROBE: OK|FAIL)")
-	cfgPath := flag.String("cfg", "", "path to a brain.json for this run (else config.Load() honors GRAFEIO_HOME)")
+	cfgPath := flag.String("cfg", "", "path to a brain.json for this run (else config.Load() honors THEBORINGOFFICE_HOME)")
 	efficiency := flag.Bool("efficiency", false, "simulate 11 board-poll cadence decisions (8 unchanged syncs, then a change) and print the exponential backoff, then exit")
 	persistDemo := flag.Bool("persist-demo", false, "office-session persist proof run 1 (live): send 'say pineapple', wait for the completed bubble, persist the office session, print session.json (PERSIST: SAVED)")
 	persistRestore := flag.Bool("persist-restore", false, "office-session persist proof run 2 (live): restore boot — restore notice + SAME primary id reused (PERSIST: RESTORED)")
@@ -190,7 +191,7 @@ func main() {
 	}
 
 	// Office-session persist probes run in their own harness (own emit,
-	// own chat capture) and resolve GRAFEIO_HOME BEFORE loadConfig — run 1
+	// own chat capture) and resolve THEBORINGOFFICE_HOME BEFORE loadConfig — run 1
 	// with an unset env creates the scratch home first, so the brain.json
 	// first-boot write lands in the scratch, never in the real home.
 	if *persistDemo || *persistRestore || *persistNew {
@@ -199,7 +200,7 @@ func main() {
 	}
 
 	// brain.json for this run. --cfg points at an explicit file; otherwise
-	// config.Load() reads (and first-boots) GRAFEIO_HOME/.grafeio/configs/
+	// config.Load() reads (and first-boots) THEBORINGOFFICE_HOME/.theboringoffice/configs/
 	// brain.json — identical to how the UI binaries load it.
 	cfg, err := loadConfig(*cfgPath)
 	if err != nil {
@@ -376,7 +377,7 @@ func main() {
 			qid := askQID
 			fmt.Printf("[ask] question %s captured; auto-answering in %s with %q\n", qid, askDelay, askAnswers)
 			time.AfterFunc(askDelay, func() {
-				err := b.AnswerQuestion(qid, askAnswers)
+				err := b.AnswerQuestion(qid, [][]string{askAnswers})
 				mu.Lock()
 				defer mu.Unlock()
 				if err != nil {
@@ -415,7 +416,7 @@ func main() {
 		// The composed batch literal, in the shape the app's queue-flush
 		// composes: one header naming the count, one line per QUE item.
 		var sb strings.Builder
-		fmt.Fprintf(&sb, "[grafeio office] QUEUE FLUSH: %d queued items arrived together. Work ALL %d items in this one turn, then reply confirming EACH item by its QUE id and short answer.\n", len(items), len(items))
+		fmt.Fprintf(&sb, "[theboringoffice office] QUEUE FLUSH: %d queued items arrived together. Work ALL %d items in this one turn, then reply confirming EACH item by its QUE id and short answer.\n", len(items), len(items))
 		for i, title := range items {
 			fmt.Fprintf(&sb, "QUE-%d: %s\n", i+1, title)
 		}
@@ -666,7 +667,7 @@ type queueBoard interface {
 
 // loadConfig resolves the run's brain.json: an explicit --cfg path wins
 // (defaults-filled, read-only — never written back), otherwise the standard
-// loader honors GRAFEIO_HOME like every other grafeio binary.
+// loader honors THEBORINGOFFICE_HOME like every other theboringoffice binary.
 func loadConfig(path string) (*config.Config, error) {
 	if path == "" {
 		return config.Load()
@@ -732,11 +733,11 @@ type officeSpawnSeam interface {
 
 // runPersistProbe drives the three-run office-session proof:
 //
-//	run 1 --persist-demo    (own GRAFEIO_HOME): boot live, send "say
+//	run 1 --persist-demo    (own THEBORINGOFFICE_HOME): boot live, send "say
 //	                        pineapple", wait for the completed bubble,
 //	                        persist the office session, print session.json.
 //	                        Verdict: PERSIST: SAVED.
-//	run 2 --persist-restore (SAME GRAFEIO_HOME + cwd as run 1): rebuild the
+//	run 2 --persist-restore (SAME THEBORINGOFFICE_HOME + cwd as run 1): rebuild the
 //	                        boot exactly as app.New does — LoadSession,
 //	                        PrimaryOverride before Start — then assert the
 //	                        restore notice line and that the SAME primary id
@@ -759,22 +760,22 @@ func runPersistProbe(cfgPath string, demo, restore, fresh bool) {
 		os.Exit(2)
 	}
 
-	// Scratch home: run 1 creates one when GRAFEIO_HOME is unset (and
+	// Scratch home: run 1 creates one when THEBORINGOFFICE_HOME is unset (and
 	// prints it — runs 2/3 MUST be invoked with that same home exported);
 	// runs 2/3 hard-require it so a stray run cannot read/write the real
-	// ~/.grafeio/sessions.
-	home := os.Getenv("GRAFEIO_HOME")
+	// ~/.theboringoffice/sessions.
+	home := config.HomeOverride() // THEBORINGOFFICE_HOME, GRAFEIO_HOME fallback
 	if home == "" {
 		if !demo {
-			fmt.Fprintln(os.Stderr, "GRAFEIO_HOME is required for --persist-restore / --persist-new (export the [persist-home] path printed by run 1)")
+			fmt.Fprintln(os.Stderr, "THEBORINGOFFICE_HOME is required for --persist-restore / --persist-new (export the [persist-home] path printed by run 1)")
 			os.Exit(2)
 		}
 		var err error
-		home, err = os.MkdirTemp("", "grafeio-persist-home")
+		home, err = os.MkdirTemp("", "theboringoffice-persist-home")
 		if err != nil {
 			fail("persist home", err)
 		}
-		if err := os.Setenv("GRAFEIO_HOME", home); err != nil {
+		if err := os.Setenv("THEBORINGOFFICE_HOME", home); err != nil {
 			fail("persist home env", err)
 		}
 	}
@@ -889,7 +890,7 @@ func persistRunSave(cfg *config.Config, dir string) {
 func persistRunRestore(cfg *config.Config, dir string) {
 	sf, ok := app.LoadSession(dir)
 	if !ok {
-		fmt.Fprintf(os.Stderr, "PERSIST: FAIL — no session.json for %s under %s (run --persist-demo first)\n", dir, os.Getenv("GRAFEIO_HOME"))
+		fmt.Fprintf(os.Stderr, "PERSIST: FAIL — no session.json for %s under %s (run --persist-demo first)\n", dir, config.HomeOverride())
 		os.Exit(1)
 	}
 	if !sf.Fresh() {
@@ -1013,8 +1014,9 @@ func persistRunNew(cfg *config.Config, dir string) {
 var probeHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 // probeEnv is os.Environ() minus everything the probe must not inherit:
-// GRAFEIO_* (the strip rule) and OPENCODE_SERVER (must not redirect the
-// spawned-child resolution; serve reads it, ditto GRAFEIO_SERVER).
+// THEBORINGOFFICE_* and the pre-rename GRAFEIO_* (the strip rule) and
+// OPENCODE_SERVER (must not redirect the spawned-child resolution; serve
+// reads it, ditto THEBORINGOFFICE_SERVER).
 func probeEnv() []string {
 	var out []string
 	for _, kv := range os.Environ() {
@@ -1022,7 +1024,7 @@ func probeEnv() []string {
 		if i := strings.IndexByte(kv, '='); i >= 0 {
 			k = kv[:i]
 		}
-		if strings.HasPrefix(k, "GRAFEIO_") || k == "OPENCODE_SERVER" {
+		if strings.HasPrefix(k, "THEBORINGOFFICE_") || strings.HasPrefix(k, "GRAFEIO_") || k == "OPENCODE_SERVER" {
 			continue
 		}
 		out = append(out, kv)
@@ -1167,7 +1169,7 @@ func probePrompt(baseURL, dir, sessionID, text string, timeout time.Duration) (s
 //  3. run EnsureCharter a SECOND time: changed must be false and the bytes
 //     must be identical (idempotence);
 //  4. spawn a REAL opencode serve rooted in the scratch dir (fresh clean
-//     env for the child: OPENCODE_SERVER + GRAFEIO_* stripped — the probe
+//     env for the child: OPENCODE_SERVER + THEBORINGOFFICE_*/GRAFEIO_* stripped — the probe
 //     proves the WIRING, not the user's machine), create a session, and
 //     prompt: "in 2 sentences: who are you supposed to be and how many
 //     sub-agents minimum for real work";
@@ -1194,7 +1196,7 @@ func charterProbeMain() int {
 	}
 
 	// 1-3: the EnsureCharter pass + idempotence, in a scratch dir.
-	scratch, err := os.MkdirTemp("", "grafeio-charter-probe")
+	scratch, err := os.MkdirTemp("", "theboringoffice-charter-probe")
 	if err != nil {
 		fmt.Printf("[fatal] scratch dir: %v\n", err)
 		return 1
@@ -1236,7 +1238,7 @@ func charterProbeMain() int {
 		"charter subset probe: manager + oikonomos + MINIMUM 3 all present")
 
 	// 4: the ground-truth serve pass. A fresh child env strips
-	// OPENCODE_SERVER and every GRAFEIO_* so the probe measures ONLY what
+	// OPENCODE_SERVER and every THEBORINGOFFICE_*/GRAFEIO_* so the probe measures ONLY what
 	// the wiring itself does (the user's OPENCODE_SERVER could point at a
 	// serve that loaded other instructions).
 	if failures > 0 {
@@ -1381,7 +1383,7 @@ func runDocAbortExcerpt(dir string) {
 // outlives the watch window, wait 2s for the turn to engage, call
 // AbortSessions via the additive state.SessionAborter seam, then watch 6s.
 // PASS requires: the seam exists, the abort round-trip returned nil, a
-// stopped marker landed (the "[grafeio] stopped (turn aborted)" placeholder
+// stopped marker landed (the "[theboringoffice] stopped (turn aborted)" placeholder
 // close or an interrupted-stream flush — the serve does NOT forward
 // primary session.idle as a state.Event, so the marker is the
 // app-observable abort proof), and no boss-bubble stream growth past a
@@ -1426,7 +1428,7 @@ func runAbortProbe(cfg *config.Config) int {
 				growthAfter = append(growthAfter, time.Since(abortAt).Seconds())
 			}
 		case e.Kind == state.EvChatBoss && !e.Msg.Pending && !abortAt.IsZero():
-			if strings.Contains(e.Msg.Text, "[grafeio] stopped") || strings.Contains(e.Msg.Text, "[grafeio] stream interrupted") {
+			if strings.Contains(e.Msg.Text, "[theboringoffice] stopped") || strings.Contains(e.Msg.Text, "[theboringoffice] stream interrupted") {
 				if marker == "" {
 					marker = e.Msg.Text
 				}
@@ -1516,7 +1518,7 @@ func runAbortProbe(cfg *config.Config) int {
 	if ok {
 		check(abortErr == nil, "AbortSessions round-trip returned nil (all sessions aborted)")
 	}
-	check(mk != "", "stopped marker within the watch window ([grafeio] stopped / stream interrupted)")
+	check(mk != "", "stopped marker within the watch window ([theboringoffice] stopped / stream interrupted)")
 	late := 0
 	for _, g := range growth {
 		if g > 1.5 { // in-flight delta grace: a delta already on the wire may land
@@ -1644,7 +1646,7 @@ func runConciergeProbe(cfg *config.Config) int {
 		if questionNow != "" {
 			qid := questionNow
 			time.AfterFunc(100*time.Millisecond, func() {
-				fmt.Printf("[concierge-probe] auto-answer question %s -> %v\n", qid, b.AnswerQuestion(qid, []string{"yes, proceed"}))
+				fmt.Printf("[concierge-probe] auto-answer question %s -> %v\n", qid, b.AnswerQuestion(qid, [][]string{{"yes, proceed"}}))
 			})
 		}
 	}
@@ -1872,7 +1874,7 @@ func (s *sseSimServer) handleEvent(w http.ResponseWriter, r *http.Request) {
 func runSSESim() int {
 	sim := newSSESimServer()
 	defer sim.close()
-	scratch, err := os.MkdirTemp("", "grafeio-sse-sim")
+	scratch, err := os.MkdirTemp("", "theboringoffice-sse-sim")
 	if err != nil {
 		fmt.Printf("[fatal] scratch dir: %v\n", err)
 		return 1
@@ -1992,7 +1994,7 @@ func (s *sseSimServer) evaluate(streamNotes []string) int {
 			break
 		}
 	}
-	check(recIdx >= 0, "recovery note '[grafeio] event stream: reconnected' emitted")
+	check(recIdx >= 0, "recovery note '[theboringoffice] event stream: reconnected' emitted")
 	if recIdx >= 0 {
 		before := streamNotes[:recIdx]
 		check(len(before) == 2,

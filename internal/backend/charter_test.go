@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/theboringhumane/grafeio/internal/charter"
+	"github.com/theboringhumane/theboringoffice/internal/charter"
 )
 
 // charterProbePhrases is the live-probe subset contract: the charter must
@@ -175,13 +175,13 @@ func TestEnsureCharterAcceptedSpellings(t *testing.T) {
 }
 
 func TestEnsureCharterEnvOptOut(t *testing.T) {
-	t.Setenv("GRAFEIO_NO_AUTOCHARTER", "1")
+	t.Setenv("THEBORINGOFFICE_NO_AUTOCHARTER", "1")
 	dir := t.TempDir()
 	changed, notes := EnsureCharter(dir)
 	if changed {
 		t.Fatal("opt-out: changed=true, want false")
 	}
-	if !containsNote(notes, "disabled (GRAFEIO_NO_AUTOCHARTER)") {
+	if !containsNote(notes, "disabled (THEBORINGOFFICE_NO_AUTOCHARTER)") {
 		t.Fatalf("opt-out notes: %v", notes)
 	}
 	// Nothing written at all.

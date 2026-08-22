@@ -32,8 +32,8 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/theboringhumane/grafeio/internal/chrome"
-	"github.com/theboringhumane/grafeio/internal/office"
+	"github.com/theboringhumane/theboringoffice/internal/chrome"
+	"github.com/theboringhumane/theboringoffice/internal/office"
 )
 
 // slashCommand — one row of the popover: the command, its one-line
@@ -55,6 +55,7 @@ var slashCommands = []slashCommand{
 	{"/thinking", "show/hide thinking blocks", "/thinking on|off"},
 	{"/tools", "show/hide tool one-liners", "/tools on|off"},
 	{"/status", "office status", ""},
+	{"/mcp", "mcp servers + reconnect", "/mcp [reconnect <name>]"},
 	{"/clear", "empty the chat", ""},
 	{"/queue", "show the backlog (clear drops it)", ""},
 	{"/route", "force-dispatch the backlog now", ""},
@@ -70,7 +71,7 @@ var slashCommands = []slashCommand{
 	{"/focus", "alias of /zen", "/focus floor"},
 	{"/stop", "abort current work (boss + workers)", ""},
 	{"/new", "fresh office (transcript archived)", ""},
-	{"/quit", "exit grafeio", ""},
+	{"/quit", "exit theboringoffice", ""},
 }
 
 // slash popover modes.

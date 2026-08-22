@@ -1,4 +1,4 @@
-// Package backend — the two state.Backend implementations for Grafeio:
+// Package backend — the two state.Backend implementations for theboringoffice:
 // a scripted demo (demo.go) and the live opencode+agentmemory backend
 // (opencode.go, events.go, agentmemory.go). Ports of node-legacy/src/backend/*.
 package backend
@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/theboringhumane/grafeio/internal/config"
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/config"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 // cfgOrDefault guards every factory: a nil config (tests, embedded use)

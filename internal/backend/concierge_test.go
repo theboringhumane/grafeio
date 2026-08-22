@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 func TestChildOfConciergeHiresLikePrimaryChild(t *testing.T) {
@@ -111,7 +111,7 @@ func TestInterruptedConciergeStreamFlushesOfficeLane(t *testing.T) {
 	mapTextPart(ocPart{ID: "prt-2", SessionID: "ses-primary", MessageID: "msg-2", Type: "text"}, ctx, 60)
 	mapTextDelta(ocPartDelta{SessionID: "ses-primary", MessageID: "msg-2", PartID: "prt-2", Field: "text", Delta: "essay"}, ctx)
 
-	evs := interruptedStreamEvents(ctx, "[grafeio] stream interrupted")
+	evs := interruptedStreamEvents(ctx, "[theboringoffice] stream interrupted")
 	if len(evs) != 2 {
 		t.Fatalf("both open streams must flush, got %v", evs)
 	}

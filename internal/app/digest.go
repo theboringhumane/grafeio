@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"hash/fnv"
 	"time"
+
+	"github.com/theboringhumane/theboringoffice/internal/projinfo"
 )
 
 // governor — the power/caching bookkeeping, pointer-shared across the
@@ -30,7 +32,7 @@ type governor struct {
 func (m *Model) frameDigest() uint64 {
 	h := fnv.New64a()
 	fmt.Fprintf(h, "%d|%d|%d|%d|%d|%d", m.width, m.height, m.sidebar, m.floorW, m.tabs.ActiveIndex(), m.frameNonce)
-	fmt.Fprintf(h, "|%s|%s|%d|%d|%t|%t|%t|%t", m.st.Mode, m.st.StatusLine, len(m.queue), m.st.Tick, m.st.BossThinking, m.st.BossDelegating, m.perm != nil, m.question != nil)
+	fmt.Fprintf(h, "|%s|%s|%d|%d|%t|%t|%t|%t", m.st.Mode, m.st.StatusLine, len(m.queue), m.st.Tick, m.st.BossThinking, m.st.BossDelegating, m.permQ.front() != nil, m.question != nil)
 	for _, e := range m.st.Employees {
 		fmt.Fprintf(h, "|%s%s%s%s", e.ID, e.Sprite, e.Seat, e.Task)
 	}
@@ -48,9 +50,20 @@ func (m *Model) frameDigest() uint64 {
 	}
 	// activity lines are appended per processed event even when the event
 	// leaves OfficeState untouched (child permissions/questions) — count them.
-	// zen (sidebar-hidden fullscreen) and the compact layout change pixels
-	// the digest's geometry terms (sidebar/floorW) only see AFTER a resize —
-	// fold the mode flags in directly so the first toggled frame re-renders.
-	fmt.Fprintf(h, "|%d|%s|%s|%t|%t", m.activityAdds, m.bossName, PowerMode(m.cfg), m.zen, m.compact())
+	// The permission queue is model-owned UI state too: the popover shows
+	// pending[0] ("1 of N"), and answers/esc's/resolutions swap the front
+	// or shrink the piles WITHOUT any state-owned term above moving — hash
+	// front id + both pile depths (pending AND esc'd children included).
+	frontID := ""
+	if p := m.permQ.front(); p != nil {
+		frontID = p.ID
+	}
+	fmt.Fprintf(h, "|%d|%s|%s|%t|%t|%s|%d|%d", m.activityAdds, m.bossName, PowerMode(m.cfg), m.zen, m.compact(),
+		frontID, len(m.permQ.pending), len(m.permQ.escd))
+	// Top bar's project+branch segment: a `git checkout` must repaint the
+	// bar even when no office term above moved (TTL-bounded by projinfo).
+	if pj := m.projInfo(); pj != (projinfo.Info{}) {
+		fmt.Fprintf(h, "|%s|%s", pj.Project, pj.Branch)
+	}
 	return h.Sum64()
 }

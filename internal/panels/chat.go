@@ -2,71 +2,104 @@
 //
 // Layout inside the tab panel (top → bottom):
 //
-//		viewport  — the whole conversation, glamour-rendered markdown.
-//		            user turns are plain-wrapped and prefixed cyan "you › ";
-//		            boss turns are rendered THROUGH GLAMOUR as markdown
-//		            (**bold**, lists, fences format + wrap) with a yellow
-//		            "boss › " hanging indent, then HARD-FOLDED to the panel
-//		            width (glamour's wrap misses code fences and unbreakable
-//		            URLs — foldStyledLines refolds those, ANSI-aware).
-//		            Kind "think" entries render as dim-italic thinking blocks —
-//		            LIVE while their CallID streams (spinner header, growing
-//		            tail, always expanded), then COLLAPSED to
-//		            "thinking · N lines" until ctrl+t expands all;
-//		            Kind "tool" entries (BOSS/primary) render as dim one-liners
-//		            merged by CallID (wrapped with a hanging indent, never
-//		            clipped); Kind "wtool" entries (EMPLOYEE tools)
-//		            group into one thread per agent, and the thread joins
-//		            the SAME timeline as every other entry —
-//		            mergeChatTimeline places it at its birth timestamp
-//		            (creation time), so threads scroll with the
-//		            conversation instead of docking after it. EVERY
-//		            thread renders as a rounded bordered CARD (dim
-//		            lipgloss.RoundedBorder, full panel width), COLLAPSED
-//		            BY DEFAULT — live threads included — as
-//		            "▾ <agent> · <task> (· N tool calls ✓ done)";
-//		            a per-agent click or the ctrl+g baseline expands the
-//		            card to its "▴ ┌ <agent> · <task>" header over
-//		            indented "│ [tool] …" rows (long rows WRAP with
-//		            "│ " continuations, never truncate), with ctrl+g
-//		            expanding/collapsing all threads at once;
-//		            /stop force-collapses to a "✗ stopped" summary card;
-//		            Kind "office" entries (the concierge's EvChatOffice seam)
-//		            render as INFO-cyan "office ›" markdown bubbles — a real
-//		            turn, streamed replace-by-ID like the boss, with a dim
-//		            "office is answering…" placeholder while pending-empty;
-//		            From "office" entries with no Kind render as dim local
-//		            notices (red when Meta == "error").
-//		divider
-//		spinner   — the typing row, shown for the WHOLE pending period:
-//		            while ANY boss reply is outstanding (" <boss> is
-//		            typing…", named from brain.json boss.name) — with or
-//		            without streamed text. A pending boss bubble WITH text
-//		            keeps rendering in the viewport as a streaming "boss ›"
-//		            turn (glamour markdown re-rendered per delta); the row
-//		            below is the liveness signal now — there is NO caret.
-//		            While BossDelegating holds (boss quiet, workers busy)
-//		            the row swaps to a settled dim " <boss>: delegating ·
-//		            N busy" — no spinner.
-//		textarea  — multiline input; Enter sends, Shift+Enter (or Ctrl+J) is a
-//		            newline, placeholder "talk to the boss…". NEVER locked: while
-//		            the boss is busy, Enter FREE-SENDS (the app routes the prompt
-//		            straight to the backend, which queues it server-side and
-//		            drains it after the current turn — no client queue, nothing
-//		            hides); the placeholder reads "<boss> is typing…", and from
-//		            the second direct send on "<boss>: turn N · your message
-//		            rides next" while the status line carries "busy · N queued
-//		            (server)". A client-side backlog item is created ONLY for
-//		            roadblocks: a permission prompt or a question hold
-//		            outstanding. While a permission prompt is open, the prompt
-//		            MODAL replaces this region: y/a/n answers, esc defers; every
-//		            other key still types into the (hidden) textarea.
-//		question  — while a boss question hold is open, the QUESTION MODAL
-//		            replaces this region: a free-text input (enter submits via
-//		            AnswerQuestion, esc defers → /question re-opens); the
-//		            textarea is DISABLED. While the hold is outstanding
-//		            (open or deferred) the placeholder reads "boss is waiting
-//		            for your answer… · N queued" and Enter still enqueues.
+//	viewport  — the whole conversation, glamour-rendered markdown.
+//	            user turns are plain-wrapped and prefixed cyan "you › ";
+//	            boss turns are rendered THROUGH GLAMOUR as markdown
+//	            (**bold**, lists, fences format + wrap) with a yellow
+//	            "boss › " hanging indent, then HARD-FOLDED to the panel
+//	            width (glamour's wrap misses code fences and unbreakable
+//	            URLs — foldStyledLines refolds those, ANSI-aware).
+//	            Kind "think" entries render as dim-italic thinking blocks —
+//	            LIVE while their CallID streams (spinner header, growing
+//	            tail, always expanded), then COLLAPSED to
+//	            "thinking · N lines" until ctrl+t expands all;
+//	            Kind "tool" entries (BOSS/primary) render as dim one-liners
+//	            merged by CallID (wrapped with a hanging indent, never
+//	            clipped); Kind "wtool" entries (EMPLOYEE tools)
+//	            group into one thread per agent, and the thread joins
+//	            the SAME timeline as every other entry —
+//	            mergeChatTimeline places it at its birth timestamp
+//	            (creation time), so threads scroll with the
+//	            conversation instead of docking after it. Threads
+//	            render opencode-style (threads_opencode.go) — flat
+//	            frame lines, no boxing: the HEADER row is the 2-cell
+//	            glyph field plus the "<Kind> Task — <task>" title
+//	            (Kind from the roster role — scout = "Explore" —
+//	            fallback "Subagent Task — <agent>"), ONE row elided
+//	            to the panel width with clipPlain (tabs.go), never
+//	            wrapped. The glyph is the animated braille spinner
+//	            (dot frames incl. ⠿, house accent — one shared
+//	            model, every live thread pulses the same frame)
+//	            while the thread is LIVE, and a live header carries
+//	            NO rollup text; a DONE head swaps to a dim "✓" with
+//	            the dim trailing rollup "(· N tool calls[ · M
+//	            think] ✓ done)", a /stop-stopped head to a dim-red
+//	            "✗" with "✗ stopped". The row under the header is
+//	            the sneak peek — dim "  ↳ <Verb> <rest>", the
+//	            thread's NEWEST TOOL entry BARE: one row,
+//	            clipPlain-elided like the header, NO state suffix,
+//	            and a trailing thought never steals it (a
+//	            think-ONLY thread sneaks "thinking · N lines"
+//	            instead); the raw "read · x" meta text is shaped
+//	            into "Read x" display-side inside
+//	            threads_opencode.go. A per-agent click on the
+//	            header row or the sneak row (the only rows the
+//	            threadRows hit-map registers) or the ctrl+g
+//	            baseline expands the thread to its merged
+//	            "[tool] …"/think rows 2-cell indented (long CONTENT
+//	            rows wrap with hanging continuations), then the ↳
+//	            sneak again as the "current task" line and a dim
+//	            closing rollup ("  · N tool calls ✓ done"); ctrl+g
+//	            expands/collapses all threads at once, /stop
+//	            force-collapses to the "✗ … ✗ stopped" header, and
+//	            while ≥1 thread is live a dim-italic "ctrl+g · view
+//	            subagents" hint row trails the last thread block;
+//	            Kind "office" entries (the concierge's EvChatOffice seam)
+//	            render as INFO-cyan "office ›" markdown bubbles — a real
+//	            turn, streamed replace-by-ID like the boss, with a dim
+//	            "office is answering…" placeholder while pending-empty;
+//	            From "office" entries with no Kind render as dim local
+//	            notices (red when Meta == "error").
+//	divider
+//	spinner   — the typing row, shown for the WHOLE pending period:
+//	            while ANY boss reply is outstanding (a breathing
+//	            block-glyph bar — threads_opencode.go's
+//	            pendingBlockBar — + " <boss> is typing…", named from
+//	            brain.json boss.name) — with or
+//	            without streamed text. A pending boss bubble WITH text
+//	            keeps rendering in the viewport as a streaming "boss ›"
+//	            turn (glamour markdown re-rendered per delta); the row
+//	            below is the liveness signal now — there is NO caret.
+//	            While BossDelegating holds (boss quiet, workers busy)
+//	            the row swaps to a settled dim " <boss>: delegating ·
+//	            N busy" — no spinner.
+//	textarea  — multiline input; Enter sends, Shift+Enter (or Ctrl+J) is a
+//	            newline, placeholder "talk to the boss…". NEVER locked: while
+//	            the boss is busy, Enter FREE-SENDS (the app routes the prompt
+//	            straight to the backend, which queues it server-side and
+//	            drains it after the current turn — no client queue, nothing
+//	            hides); the placeholder reads "<boss> is typing…", and from
+//	            the second direct send on "<boss>: turn N · your message
+//	            rides next" while the status line carries "busy · N queued
+//	            (server)". A client-side backlog item is created ONLY for
+//	            roadblocks: a permission popover or a question hold
+//	            outstanding. The permission popover FLOATS centered over
+//	            the whole chat view as an amber bordered card (textarea
+//	            keeps rendering + typing under it — see perm_modal.go):
+//	            up/down/tab walk the menu cursor, enter confirms the
+//	            highlighted option, y/a/n quick-answer, esc defers; every
+//	            other key still types into the textarea below.
+//	question  — while a boss question page is open, a QUESTION POPOVER
+//	            FLOATS over this view (yellow card, same splice as the
+//	            permission popover — question_modal.go): four kinds —
+//	            radio/checkbox/confirm option pages and a free-text
+//	            textarea box — plus a "Type your own answer…" row on
+//	            option pages. The popover OWNS every key while open
+//	            (enter/ctrl+enter submits → AnswerQuestion, esc defers
+//	            → /question re-opens); the textarea underneath is
+//	            DISABLED. While the hold is outstanding (open or
+//	            deferred) the placeholder reads "boss is waiting
+//	            for your answer… · N queued" and Enter still enqueues.
 //
 // Scroll: mouse wheel + PgUp/PgDn always scroll the conversation; ↑/↓ move
 // inside a multi-line draft and scroll the conversation otherwise. ctrl+t
@@ -97,8 +130,8 @@ import (
 	chstyles "github.com/alecthomas/chroma/v2/styles"
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/theboringhumane/grafeio/internal/chrome"
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/chrome"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 const (
@@ -120,13 +153,15 @@ const (
 // errMeta — chat entry markers the app reducer tags onto state.ChatMsg so
 // this panel can style them without touching the user/boss turn paths.
 // wtoolKind is the EMPLOYEE tool line: grouped into a per-agent thread that
-// renders INLINE in the conversation timeline (see mergeChatTimeline), as a
-// rounded bordered card, collapsed by default.
+// renders INLINE in the conversation timeline (see mergeChatTimeline), as an
+// opencode-style spinner+sneak thread, collapsed by default.
 // wthinkKind is
 // the EMPLOYEE EvThought line (the app reducer merges one per agent+CallID,
 // same stream mechanics as the boss's thinkKind): it joins the SAME worker
-// thread — a dim-italic "thinking · N lines" row inside the expanded card,
-// a "· N think" count in the collapsed summary, a full body under ctrl+g.
+// thread — a dim-italic "thinking · N lines" row inside the expanded entry
+// list, a "· M think" count in the rollup summaries, the ↳ sneak's
+// fallback only when a thread has NO tool line yet, a full body under
+// ctrl+g.
 const (
 	thinkKind    = "think"
 	toolKind     = "tool"
@@ -147,8 +182,8 @@ const (
 // wtoolStaleTicks — the staleness horizon that decides whether a workers
 // thread counts as LIVE (busy sprite + tool activity inside the window).
 // It drives the "team is working" loading row (chat_loading.go) and the
-// per-tick re-render gate in SetState — thread CARDS no longer expand on
-// it: every card is collapsed by default, live ones included, on the
+// per-tick re-render gate in SetState — thread EXPANSION no longer rides
+// it: every thread is collapsed by default, live ones included, on the
 // ctrl+g / per-agent baseline alone.
 const wtoolStaleTicks = 120
 
@@ -167,30 +202,32 @@ const diffMetaSep = "\x1f"
 // "+N more" truncation.
 const diffClip = 30
 
-// PermissionView is the open permission prompt the chat panel renders in
-// place of the textarea (set/cleared by the app via SetPermission).
+// PermissionView is the open permission popover the chat panel floats
+// over the chat region (set/cleared by the app via SetPermission).
 type PermissionView struct {
-	ID       string
-	ToolName string
-	Summary  string
+	ID       string // pending wire request id
+	ToolName string // permission name, e.g. "Write", "external_directory"
+	Summary  string // one-liner, e.g. "/tmp/x"
+	Agent    string // display name of the requesting agent ("boss" or child)
+	Index    int    // 1-based position in the pending queue
+	Total    int    // total pending permissions
 }
 
-// QuestionView is the open boss question modal the chat panel renders in
-// place of the textarea (set/cleared by the app via SetQuestion). Unlike
-// the permission prompt — choice keys, text stays live — the question
-// modal OWNS every typed key into its own free-text input line: the turn
-// is parked at the question reply API, so the textarea is disabled until
-// the answer goes through AnswerQuestion (or esc defers).
-type QuestionView struct {
-	ID      string // pending wire request id ("que-…")
-	Text    string // the boss's question
-	Options string // dim options list ("a | b | c"), may be empty
-}
+// QuestionView / QuestionAnswer / QuestionKind along with the whole
+// question popover live in question_modal.go — the boss question is a
+// FLOATING yellow card over the assembled chat view now (the old
+// region-replacing modal is gone; the row budget never budges).
 
 // Chat is the chat tab panel.
 type Chat struct {
-	vp     viewport.Model
-	ta     textarea.Model
+	vp viewport.Model
+	ta textarea.Model
+	// sp — the braille spinner (spinner.MiniDot, magenta) whose frame
+	// renders as the glyph of every LIVE worker-thread header. Advanced
+	// by the spinner.TickMsg arm below; pre-tick it renders the first
+	// frame ("⠋"), which the tests pin. The pending typing row does NOT
+	// read it — that row's block bar breathes off the office tick
+	// (pendingBlockBar).
 	sp     spinner.Model
 	onSend func(text string, atts []state.Attachment) tea.Cmd
 
@@ -204,17 +241,32 @@ type Chat struct {
 	onBusySend   func(text string, atts []state.Attachment) tea.Cmd
 	onPermAnswer func(response string) tea.Cmd
 	onPermLater  func() tea.Cmd // esc defers the prompt
-	perm         *PermissionView
-	queueLen     int
+	// Permission popover state: perm is the open ask (set/cleared by the
+	// app; overlapping asks queue app-side and swap here one at a time),
+	// permSel the menu cursor (0=Allow once, 1=Allow always, 2=Reject).
+	// The popover is a floating OVERLAY, not a region — the textarea
+	// keeps rendering + typing under it (see perm_modal.go).
+	perm     *PermissionView
+	permSel  int
+	queueLen int
 
-	// Question modal — open boss question hold replaces the textarea
-	// entirely (questionWaiting survives esc-defer: the turn stays parked
-	// and typed text ENQUEUES until the resolved + completed boss reply).
+	// Question popover — the open boss question page FLOATS over the
+	// view (question_modal.go — same card mechanics as the permission
+	// popover) and OWNS every key while open: the turn is parked at the
+	// question reply API, so the main textarea is disabled until the
+	// answer goes through onQuestionAnswer (questionWaiting survives
+	// esc-defer: the turn stays parked and typed text ENQUEUES until
+	// the resolved + completed boss reply). qSel is the menu cursor on
+	// option pages, qPicked the checkbox toggles (sized to
+	// len(question.Options)), qText the multi-line buffer of the TEXT
+	// page AND the 1-line custom-answer input of the option pages.
 	question         *QuestionView
-	onQuestionAnswer func(text string) tea.Cmd
+	onQuestionAnswer func(a QuestionAnswer) tea.Cmd
 	onQuestionLater  func() tea.Cmd
-	qInput           string // the modal's own free-text input buffer
-	questionWaiting  bool   // question hold outstanding (open or deferred)
+	qSel             int
+	qPicked          []bool
+	qText            string
+	questionWaiting  bool // question hold outstanding (open or deferred)
 
 	// Double-esc interrupt (the panic-key): in the MAIN chat input — no
 	// modal or picker consumed the key — two esc presses inside
@@ -305,15 +357,19 @@ type Chat struct {
 
 	// click/expansion bookkeeping for the workers-thread region:
 	// threadExpand holds PER-AGENT explicit expansion (double-click an
-	// agent on the floor / click a thread card — a set entry wins the
-	// ctrl+g default outright: every thread is COLLAPSED BY DEFAULT,
-	// live ones included); threadRows maps rendered content line →
-	// agent name for the thread-card header/hit rows (mouse hit lookup).
+	// agent on the floor / click a thread's header row — a set entry
+	// wins the ctrl+g default outright: every thread is COLLAPSED BY
+	// DEFAULT, live ones included); threadRows maps rendered content
+	// line → agent name for the header row + the ↳ sneak row (the
+	// mouse hit lookup, in BOTH collapsed and expanded states —
+	// each is a SINGLE clipPlain-elided row, never a wrapped block;
+	// expanded tool rows and the closing summary never register, so
+	// they can't toggle).
 	// threadStop holds the /stop markers: a stopped thread force-collapses
-	// and its summary reads "✗ stopped" until an explicit expand re-opens
-	// the rows. threadExpandOrder is the expansion-ORDER ledger (oldest
-	// first) the esc/↑ "back one" collapse walks: ExpandThread appends,
-	// collapseLastThread pops.
+	// and its header reads "✗ … · stopped" until an explicit expand
+	// re-opens the rows. threadExpandOrder is the expansion-ORDER ledger
+	// (oldest first) the esc/↑ "back one" collapse walks: ExpandThread
+	// appends, collapseLastThread pops.
 	threadExpand      map[string]bool
 	threadRows        map[int]string
 	threadStop        map[string]bool
@@ -346,9 +402,11 @@ func NewChat(onSend func(text string, atts []state.Attachment) tea.Cmd) *Chat {
 	applyTextareaStyles(&ta)
 	ta.Focus()
 
+	// the braille thread spinner — ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ in the
+	// theme's magenta accent — the LIVE worker-thread glyph field
 	sp := spinner.New(
-		spinner.WithSpinner(spinner.Line),
-		spinner.WithStyle(chrome.AccentText),
+		spinner.WithSpinner(spinner.MiniDot),
+		spinner.WithStyle(threadSpinnerStyle()),
 	)
 
 	c := &Chat{vp: vp, ta: ta, sp: sp, onSend: onSend, follow: true,
@@ -375,7 +433,7 @@ func applyTextareaStyles(ta *textarea.Model) {
 // lazily at the next boss turn). Called by the app on /theme switches.
 func (c *Chat) RefreshTheme() {
 	applyTextareaStyles(&c.ta)
-	c.sp.Style = chrome.AccentText
+	c.sp.Style = threadSpinnerStyle() // the magenta braille thread glyph
 	c.md = nil
 	c.diffCache = map[string]diffCacheEntry{} // syntax colours are theme-bound
 	c.forceRender()
@@ -399,18 +457,19 @@ func (c *Chat) ToggleDiffs() {
 // (ctrl+g, routed by the app keymap) — the only GLOBAL expand baseline:
 // threads are collapsed by default, live ones included, so the opens are
 // this baseline and the per-agent click override (a /stop stopped thread
-// stays folded to its "✗ stopped" card under both until an explicit
-// per-agent expand). Independent of the thinking toggles.
+// stays folded to its "✗ stopped" header frame under both until an
+// explicit per-agent expand). Independent of the thinking toggles.
 func (c *Chat) ToggleThreads() {
 	c.threadsExpanded = !c.threadsExpanded
 	c.forceRender()
 }
 
 // ExpandThread sets ONE agent's work-thread expansion explicitly (mouse:
-// double-click the agent's floor sprite / click the thread card's header
-// rows). A set per-agent override wins the ctrl+g default outright until
-// the next call (a mouse-collapsed live thread stays collapsed until
-// re-clicked) — ctrl+g still moves the global baseline underneath it.
+// double-click the agent's floor sprite / click the thread's header or
+// sneak row). A set per-agent override wins the ctrl+g default outright
+// until the next call (a mouse-collapsed live thread stays collapsed
+// until re-clicked) — ctrl+g still moves the global baseline underneath
+// it.
 // Every call also moves the agent inside threadExpandOrder (expand →
 // newest tail, collapse → out) — the ledger esc/↑ "back one" pops from.
 func (c *Chat) ExpandThread(agent string, expanded bool) {
@@ -433,10 +492,10 @@ func (c *Chat) ToggleThread(agent string) {
 
 // threadExpandedNow — the thread's effective expansion under the same
 // rule renderWorkerGroup applies: COLLAPSED BY DEFAULT (a live, busy
-// thread folds to its summary card like any other — the live half is
-// gone); a set per-agent override wins outright, a /stop stopped thread
-// force-collapses until an explicit expand re-opens it, else the ctrl+g
-// baseline decides.
+// thread folds to its collapsed header + sneak frame like any other —
+// the live half is gone); a set per-agent override wins outright, a /stop
+// stopped thread force-collapses until an explicit expand re-opens it,
+// else the ctrl+g baseline decides.
 func (c *Chat) threadExpandedNow(name string) bool {
 	if v, ok := c.threadExpand[name]; ok {
 		return v
@@ -517,9 +576,9 @@ func removeString(slice []string, s string) []string {
 }
 
 // collapseLastThread is the esc/↑ "back one" gesture: fold the MOST
-// RECENTLY expanded worker thread back to its collapsed summary card and
+// RECENTLY expanded worker thread back to its collapsed header frame and
 // report true (the key is spent). The fold is the same mutation as
-// clicking the thread's card header — a per-agent ExpandThread(false)
+// clicking the thread's header row — a per-agent ExpandThread(false)
 // override — so a ctrl+g-expanded thread folds exactly like an explicitly
 // opened one, every other thread keeps its rendering, and a later click
 // re-opens it as always. The ledger knows the explicit expands; a thread
@@ -558,10 +617,33 @@ func (c *Chat) collapseLastThread() bool {
 
 // ClickRow handles a mouse click at (x, y) IN CHAT CONTENT COORDS
 // (viewport row 0 at the top of the chat panel; the app translated the
-// screen coords over the tab/border chrome). A hit on a worker thread
-// card's TOP rows (its border cap or the "▴ ┌"/"▾" header line) toggles
-// that agent's thread. Returns true when the click was claimed.
+// screen coords over the tab/border chrome). While a QUESTION popover is
+// open its card claims every click inside its frame FIRST (option rows
+// answer/toggle via PermClick → questionClick — the question owns the
+// float slot, so no permission can be visible under it); when the
+// permission popover is visible its hit-map wins next: the card is a
+// fixed (scroll-independent) overlay, so its rows are plain content-row
+// absolutes off the same geometry the View splices with — every click
+// inside the card frame is claimed here (swallowed: option rows answer
+// via PermClick) so a click can never leak through to a thread
+// underneath. A hit on a worker thread's HEADER row (the spinner/✓/✗
+// title line — a single clipPlain-elided row, no wrapped continuations)
+// or its ↳ sneak row — collapsed or expanded, the rows threadRows
+// registers — toggles that agent's thread.
+// Returns true when the click was claimed.
 func (c *Chat) ClickRow(x, y int) bool {
+	if c.question != nil {
+		top, left, cardW, rows, _ := c.questCardGeom()
+		if y >= top && y < top+len(rows) && x >= left && x < left+cardW {
+			return true // the question card swallows every click in its frame
+		}
+	}
+	if c.permVisible() {
+		top, left, cardW, rows, _ := c.permCardGeom()
+		if y >= top && y < top+len(rows) && x >= left && x < left+cardW {
+			return true // the card swallows every click inside its frame
+		}
+	}
 	if y < 0 || y >= c.vp.Height() {
 		return false
 	}
@@ -624,27 +706,37 @@ func (c *Chat) MarkThreadStopped(name string) {
 	c.forceRender()
 }
 
-// SetPermissionHandlers wires the app's permission answer/defer callbacks
-// for the y/a/n/esc keys captured while a prompt is open.
+// SetPermissionHandlers wires the app's permission answer/defer
+// callbacks: onPermAnswer fires for the popover's option rows (click),
+// enter-confirmed selection, and the y/a/n quick keys — with the strings
+// "once"|"always"|"reject"; onPermLater fires for the esc defer.
 func (c *Chat) SetPermissionHandlers(answer func(response string) tea.Cmd, later func() tea.Cmd) {
 	c.onPermAnswer, c.onPermLater = answer, later
 }
 
-// SetPermission opens (non-nil) or closes (nil) the permission prompt that
-// replaces the textarea region. Opening closes the @ picker (the modal owns
-// the region now); staged chips stay — they belong to the draft.
+// SetPermission opens (non-nil) or closes (nil) the permission popover —
+// a floating, centered card spliced over the assembled chat view (the
+// textarea keeps rendering + typing underneath; see perm_modal.go).
+// Opening closes the @ picker + slash popover (their nav keys would
+// otherwise fight the popover's arrows/enter) and resets the menu
+// cursor to the first option; staged chips stay — they belong to the
+// draft. While a question modal is open the popover stays QUEUED here
+// (it renders once the question closes) — the question owns the keys.
 func (c *Chat) SetPermission(p *PermissionView) {
 	if p != nil {
 		c.closeAttachPicker()
-		c.closeSlashPicker(true) // the modal owns the region now
+		c.closeSlashPicker(true) // the popover owns the choice keys now
+		c.permSel = 0            // a fresh ask opens on "Allow once"
 	}
 	c.perm = p
 }
 
 // SetQuestionHandlers wires the app's question answer/defer callbacks:
-// Enter submits the modal input (→ AnswerQuestion), esc defers (/question
-// re-opens).
-func (c *Chat) SetQuestionHandlers(answer func(text string) tea.Cmd, later func() tea.Cmd) {
+// the popover submits a QuestionAnswer per page (Picks for option rows
+// — one label for radio/confirm, every toggle for checkbox — Text for
+// the TEXT page and the custom-answer row; → AnswerQuestion), esc
+// defers (/question re-opens).
+func (c *Chat) SetQuestionHandlers(answer func(a QuestionAnswer) tea.Cmd, later func() tea.Cmd) {
 	c.onQuestionAnswer, c.onQuestionLater = answer, later
 }
 
@@ -654,17 +746,24 @@ func (c *Chat) SetQuestionHandlers(answer func(text string) tea.Cmd, later func(
 // harmless no-op.
 func (c *Chat) SetStopHandler(fn func() tea.Cmd) { c.onStopEsc = fn }
 
-// SetQuestion opens (non-nil) or closes (nil) the boss question modal that
-// replaces the textarea region. Opening clears the modal's input buffer;
-// the modal height differs from the textarea's, so the layout splits again.
+// SetQuestion opens (non-nil) or closes (nil) the boss question popover —
+// a floating, centered yellow card spliced over the assembled chat view
+// (question_modal.go; the textarea keeps rendering UNDER it but is
+// disabled — the popover owns every key while open). Opening closes the
+// @ picker + slash popover (their nav/typing keys would otherwise fight
+// the popover's) and resets the page state: the menu cursor lands on the
+// first option, checkbox toggles size to the option count, the text
+// buffer empties. NO row-budget change: the card splices at render time,
+// SetSize needs no re-run (unlike the old region-replacing modal).
 func (c *Chat) SetQuestion(q *QuestionView) {
 	c.question = q
 	if q != nil {
-		c.qInput = ""
-		c.closeAttachPicker()     // the modal owns the region now (chips stay)
-		c.closeSlashPicker(true) // same for the slash popover
+		c.qSel = 0
+		c.qText = ""
+		c.qPicked = make([]bool, len(q.Options))
+		c.closeAttachPicker()
+		c.closeSlashPicker(true)
 	}
-	c.SetSize(c.w, c.h)
 }
 
 // SetQuestionWaiting marks whether a boss question hold is outstanding
@@ -805,15 +904,23 @@ func (c *Chat) Title() string { return "chat" }
 // Pending reports whether a boss reply is outstanding.
 func (c *Chat) Pending() bool { return c.pending }
 
-// SpinnerKick returns the cmd that starts the typing animation. The app
-// calls this when pending flips false → true.
+// SpinnerKick returns the cmd that starts the braille-spin animation. The
+// app fires it on the BOSS-PENDING flip: applyEvent (internal/app/
+// model.go) calls it exactly when the office state goes from NO pending
+// boss bubble to one (!prevPending && hasPendingBoss) — the moment a
+// delegation burst's first LIVE worker-thread header appears too. The
+// returned c.sp.Tick schedules the first spinner.TickMsg; the panel's own
+// Update arm answers each one with sp.Update + the next Tick, so once
+// kicked the chain self-perpetuates and live thread glyphs animate for
+// the rest of the session.
 func (c *Chat) SpinnerKick() tea.Cmd { return c.sp.Tick }
 
 // inputRows is the textarea's visible height: textareaH normally, trimmed
-// to 2 rows in the /compact layout. The permission modal always renders
-// textareaH rows (it is sized for them), so it keeps the full region.
+// to 2 rows in the /compact layout. The permission popover is a floating
+// overlay now (not a region), so it no longer bumps the input rows when
+// it opens.
 func (c *Chat) inputRows() int {
-	if c.compactRows && c.perm == nil {
+	if c.compactRows {
 		return 2
 	}
 	return textareaH
@@ -832,12 +939,12 @@ func (c *Chat) SetCompact(on bool) {
 
 // SetSize implements Tab: splits content height across viewport / divider /
 // spinner / bottom region. The typing (spinner) row sits BELOW the divider,
-// one row while pendingSpin. The bottom region is the textarea, permission
-// modal, or question modal (the question modal is the one region with a
-// DIFFERENT row count) — PLUS the attachment surfaces above it: the chips
-// row(s) when files are staged, and the @ picker box while open. Chips and
-// picker consume rows exactly like questionModalH does, so the viewport
-// shrinks for them instead of overlapping.
+// one row while pendingSpin. The bottom region is ALWAYS the textarea now
+// — BOTH the permission popover and the question popover are overlays:
+// they budget no rows, they splice over the assembled view at render time
+// instead — PLUS the attachment surfaces above it: the chips row(s) when
+// files are staged, and the @ picker box while open. Chips and picker
+// consume rows, so the viewport shrinks for them instead of overlapping.
 func (c *Chat) SetSize(w, h int) {
 	if w < 4 {
 		w = 4
@@ -848,9 +955,6 @@ func (c *Chat) SetSize(w, h int) {
 		spH = 1
 	}
 	regionH := c.inputRows()
-	if c.question != nil {
-		regionH = c.questionModalH()
-	}
 	regionH += c.chipsH() + c.popoverH() + c.slashH()
 	// the "team is working" row takes one line while any worker thread is
 	// live — zero otherwise (the row self-hides, so vpH must follow suit)
@@ -891,7 +995,7 @@ func (c *Chat) SetState(st state.OfficeState) {
 		if e.Role == state.RoleManager {
 			continue
 		}
-		av := agentView{task: e.Task, active: workerSpriteActive(e.Sprite)}
+		av := agentView{task: e.Task, active: workerSpriteActive(e.Sprite), role: e.Role}
 		agents[e.Name] = av
 		if av.active {
 			busy++
@@ -951,8 +1055,8 @@ func (c *Chat) SetState(st state.OfficeState) {
 	// streams DO still animate per tick — see len(c.streamingThink) below.
 	// a worker thread within its staleness horizon re-renders every tick —
 	// the liveness horizon the loading row reads is tick-relative and
-	// invisible to rev (the cards themselves are stable per rev now:
-	// collapsed-by-default killed the tick-relative expand boundary).
+	// invisible to rev (the thread frames themselves are stable per rev
+	// now: collapsed-by-default killed the tick-relative expand boundary).
 	wtoolRecent := false
 	for _, m := range st.Chat {
 		if m.Kind != wtoolKind && m.Kind != wthinkKind {
@@ -1015,58 +1119,38 @@ func (c *Chat) SetState(st state.OfficeState) {
 func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
-		// While a boss question modal is open, the normal textarea is
-		// DISABLED entirely: typed text edits the modal's OWN input line,
-		// enter submits the answer, esc defers. Scrolling still works.
+		// While a boss question popover is open it OWNS EVERY KEY: the
+		// turn is parked at the question reply API, so the main textarea
+		// is DISABLED entirely — the popover's card edits its own inputs
+		// (arrow/tab cursor, option toggles, free-text and custom-answer
+		// buffers), enter/ctrl+enter submits the page's QuestionAnswer,
+		// esc defers. PgUp/PgDn still scroll the transcript. (The old
+		// region-replacing modal's key gate is question_modal.go's
+		// questKey now — the arm is one line because the popover
+		// carries its own per-kind switch.)
 		if c.question != nil {
-			switch msg.String() {
-			case "enter":
-				text := strings.TrimSpace(c.qInput)
-				if text == "" {
-					return nil
-				}
-				c.follow = true
-				c.vp.GotoBottom()
-				if c.onQuestionAnswer != nil {
-					return c.onQuestionAnswer(text)
-				}
-				return nil
-			case "esc":
-				if c.onQuestionLater != nil {
-					return c.onQuestionLater()
-				}
-				return nil
-			case "backspace":
-				if r := []rune(c.qInput); len(r) > 0 {
-					c.qInput = string(r[:len(r)-1])
-				}
-				return nil
-			case "ctrl+u":
-				c.qInput = ""
-				return nil
-			case "up", "down", "pgup", "pgdown":
-				var cmd tea.Cmd
-				c.vp, cmd = c.vp.Update(msg)
-				if msg.String() == "down" || msg.String() == "pgdown" {
-					if c.vp.AtBottom() {
-						c.follow = true
-					}
-				} else {
-					c.follow = false
-				}
-				return cmd
-			default:
-				if msg.Text != "" {
-					c.qInput += msg.Text
-				}
-				return nil
-			}
+			return c.questKey(msg)
 		}
-		// While a permission prompt is open, y/a/n/esc are RESERVED (they
-		// never reach the textarea); every other key keeps typing normally
-		// — the prompt is non-modal to text.
+		// While a permission popover is open its choice keys are RESERVED
+		// (they never reach the textarea): up/down/tab walk the menu
+		// cursor, enter confirms the highlighted option, y/a/n are the
+		// quick answers regardless of the cursor, esc defers. Every OTHER
+		// key keeps typing into the visible textarea below — the popover
+		// floats, it does not lock. (The question modal above claims its
+		// own keys first, so a queued permission can't steal here.)
 		if c.perm != nil {
 			switch msg.String() {
+			case "up":
+				c.permMove(-1)
+				return nil
+			case "down", "tab": // both walk the cursor forward
+				c.permMove(1)
+				return nil
+			case "enter":
+				if c.onPermAnswer != nil {
+					return c.onPermAnswer(permOptions[c.permSel].response)
+				}
+				return nil
 			case "y":
 				if c.onPermAnswer != nil {
 					return c.onPermAnswer("once")
@@ -1343,9 +1427,13 @@ func (c *Chat) Update(msg tea.Msg) tea.Cmd {
 // View implements Tab. Below the divider (top → bottom): the typing row
 // (while a boss reply is pending — spinner + "… is typing…", or the dim
 // delegating line), the dim attachment chips row (when files are staged),
-// the @ picker box (while open), then the input region — the question
-// modal, permission modal, or textarea. SetSize budgets exactly the rows
-// this writes.
+// the @ picker box (while open), then the input region — ALWAYS the
+// textarea. The permission popover and the question popover are NOT
+// regions: after everything assembles, each SPLICES its card rows over
+// the result, cell by cell (perm_modal.go / question_modal.go), so the
+// row budget SetSize computed never changes. A question popover hides
+// the permission popover (permVisible) — it owns the float slot and
+// every key; its textarea underneath keeps rendering but is disabled.
 func (c *Chat) View() string {
 	var b strings.Builder
 	b.WriteString(c.vp.View())
@@ -1360,14 +1448,17 @@ func (c *Chat) View() string {
 	b.WriteString(chrome.DimText.Render(fitPlain(strings.Repeat("─", c.w), c.w)))
 	if c.pendingSpin {
 		// the typing row — glued to the input, not the transcript: the
-		// viewport holds the words, this row holds the pulse
+		// viewport holds the words, this row holds the pulse. ONE row
+		// exactly: the breathing block-glyph bar (opencode's "Build · …"
+		// vibe, pendingBlockBar — height blocks only, "▌" would be the
+		// retired caret) + the same busy text as ever.
 		b.WriteString("\n")
 		if c.delegating {
 			// P3 — the boss dispatched out and went quiet: a settled dim
 			// delegation row, NO spinner blinking for minutes
 			b.WriteString(chrome.DimText.Render(" " + c.delegatingText()))
 		} else {
-			b.WriteString(c.sp.View())
+			b.WriteString(threadSpinnerStyle().Render(pendingBlockBar(c.tick)))
 			b.WriteString(chrome.AccentText.Render(" " + c.typingText()))
 		}
 	}
@@ -1385,84 +1476,23 @@ func (c *Chat) View() string {
 		b.WriteString(c.renderSlashPopover())
 		b.WriteString("\n")
 	}
-	if c.question != nil {
-		// the question modal REPLACES the textarea region, full width
-		b.WriteString(c.renderQuestionModal())
-	} else if c.perm != nil {
-		// the permission modal REPLACES the textarea region, full width
-		b.WriteString(c.renderPermission())
-	} else {
-		b.WriteString(c.ta.View())
-	}
-	return b.String()
-}
-
-// questionModalH — rows the open question modal occupies: header + dim
-// options (when present) + 2 input rows (wrap budget) + footer hint.
-func (c *Chat) questionModalH() int {
-	n := 2 + 2 // header + footer hint + input budget
-	if c.question != nil && c.question.Options != "" {
-		n++
-	}
-	return n
-}
-
-// renderQuestionModal draws the boss question modal in the textarea region
-// (questionModalH rows, full width): yellow bold "boss asks: <question>"
-// header with a dim options list, then the free-text input line (2-row
-// wrap budget — longer answers scroll to their tail), then the hint.
-func (c *Chat) renderQuestionModal() string {
-	lines := make([]string, 0, c.questionModalH())
-	lines = append(lines, chrome.QuestionText.Bold(true).Render(
-		fitPlain("boss asks: "+c.question.Text, c.w)))
-	if c.question.Options != "" {
-		lines = append(lines, chrome.DimText.Render(
-			fitPlain("  "+c.question.Options, c.w)))
-	}
-	wrapped := strings.Split(strings.TrimRight(wrapPlain(c.qInput, c.w-2), "\n"), "\n")
-	if len(wrapped) > 2 {
-		// over budget: keep the tail visible (the caret end)
-		wrapped = wrapped[len(wrapped)-2:]
-	}
-	for i := 0; i < 2; i++ {
-		row := ""
-		if i < len(wrapped) {
-			row = wrapped[i]
+	b.WriteString(c.ta.View())
+	out := b.String()
+	if c.permVisible() || c.question != nil {
+		// each open FLOAT splices its card rows over the assembled lines
+		// (textarea rows included): cells are replaced, never lines —
+		// the layout never jumps. Only one float renders at a time:
+		// permVisible is false while a question owns the slot.
+		bg := strings.Split(out, "\n")
+		if c.permVisible() {
+			bg = c.permOverlay(bg)
 		}
-		prefix := chrome.Fg(chrome.Accent, "› ")
-		if i == 1 {
-			prefix = "  " // wrap continuation hangs under the prompt
-			if row == "" {
-				prefix = ""
-			}
+		if c.question != nil {
+			bg = c.questOverlay(bg)
 		}
-		lines = append(lines, fitPlain(prefix+row, c.w))
+		out = strings.Join(bg, "\n")
 	}
-	lines = append(lines, chrome.DimText.Italic(true).Render(
-		fitPlain("enter: answer · esc: answer later", c.w)))
-	return strings.Join(lines, "\n")
-}
-
-// renderPermission draws the permission prompt modal in the textarea
-// region (textareaH rows, full width): amber bold header with the tool
-// request, then the key hint wrapped over the remaining rows.
-func (c *Chat) renderPermission() string {
-	head := "PERMISSION: boss wants " + c.perm.ToolName
-	if c.perm.Summary != "" {
-		head += " · " + c.perm.Summary
-	}
-	lines := [textareaH]string{}
-	lines[0] = chrome.WarnBold.Render(fitPlain(head, c.w))
-	hint := strings.Split(strings.TrimRight(wrapPlain(
-		"[y] allow once  [a] always  [n] reject  [esc] later", c.w), "\n"), "\n")
-	for i := 1; i < textareaH; i++ {
-		if i-1 < len(hint) {
-			lines[i] = chrome.DimText.Render(fitPlain(hint[i-1], c.w))
-		} else {
-			lines[i] = fitPlain("", c.w)
-		}
-	}
-	return strings.Join(lines[:], "\n")
+	return out
 }
 
 // renderConversation rebuilds the full glamour-rendered transcript as ONE
@@ -1515,12 +1545,32 @@ func (c *Chat) renderConversation() string {
 	}
 	var b strings.Builder
 	first := true
-	for _, item := range mergeChatTimeline(visible, workers) {
+	items := mergeChatTimeline(visible, workers)
+	// the opencode hint row trails the LAST thread block of the timeline
+	// while ≥1 RENDERED thread is live (visibility-aware: /tools off
+	// builds no tool threads, so none can be live on screen)
+	lastGroup := -1
+	for i, item := range items {
+		if item.Group >= 0 {
+			lastGroup = i
+		}
+	}
+	anyLive := false
+	for _, g := range workers {
+		if c.threadLive(g) {
+			anyLive = true
+			break
+		}
+	}
+	for i, item := range items {
 		if item.Group >= 0 {
 			// a subagent thread joins the flow HERE, at its timeline
 			// slot — its rows carry their own leading "\n", the same
 			// glue the old end-of-chat dock used
 			c.renderWorkerGroup(&b, workers[item.Group])
+			if i == lastGroup && anyLive {
+				b.WriteString("\n" + chrome.DimText.Italic(true).Render(threadHintText))
+			}
 			first = false
 			continue
 		}
@@ -1580,11 +1630,13 @@ func (c *Chat) renderConversation() string {
 }
 
 // agentView — a roster rollup entry for the workers-thread decoration:
-// the agent's dispatch task (header) and sprite-liveness (the loading
-// row's live/hide rule — thread cards no longer expand on it).
+// the agent's dispatch task (thread title), sprite-liveness (the thread's
+// live/done glyph + the loading row's live/hide rule), and roster role
+// (the title's "<Kind>" label — see threads_opencode.go).
 type agentView struct {
 	task   string
 	active bool
+	role   state.EmployeeRole
 }
 
 // workerGroup — one agent's merged wtool entries (chat order) plus the
@@ -1615,171 +1667,10 @@ func parseWtoolMeta(meta string) (toolState string, tick int) {
 	return meta, 0
 }
 
-// workerToolLine renders one merged employee tool entry, same shape as
-// the boss's inline one-liner ("[tool] read · x ✓/✗/✗ aborted/… running").
-func workerToolLine(m state.ChatMsg) string {
-	toolState, _ := parseWtoolMeta(m.Meta)
-	line := "[tool] " + m.Text
-	switch toolState {
-	case "done":
-		return line + " ✓"
-	case "error":
-		return line + " ✗"
-	case "aborted": // /stop unwind swung a running call here
-		return line + " ✗ aborted"
-	default: // running (or anything unexpected)
-		return line + " … running"
-	}
-}
-
-// renderWorkerGroup draws ONE agent's thread INLINE at its timeline slot
-// (mergeChatTimeline interleaves threads with the conversation — there is
-// no docked region any more). EVERY thread renders as a rounded bordered
-// CARD — chrome.PanelBox-shaped (lipgloss.RoundedBorder) with a dim
-// border, full panel width — so a subagent thread is visually distinct
-// from the flat conversation rows around it. Threads are COLLAPSED BY
-// DEFAULT, live ones included: one dim summary line that carries the "▾"
-// caret and KEEPS the think count ("▾ <agent> · <task> (· 9 tools · 3
-// think ✓ done)") while tools/thinks accumulate quietly underneath. A
-// per-agent click or the ctrl+g baseline expands the card: an "▴ ┌"
-// header over the merged tool lines, with employee thoughts riding the
-// SAME card as dim-italic "│ thinking · N lines" rows (one per merged
-// CallID) in natural chat order — and a full expand (ctrl+g or a
-// per-agent mouse override) shows the think bodies too. A /stop stopped
-// thread force-collapses to a "✗ stopped" card until an explicit expand
-// re-opens it. The card's top rows (border cap + header) are recorded in
-// threadRows for the mouse hit-map (click toggles that agent's thread).
-func (c *Chat) renderWorkerGroup(b *strings.Builder, g workerGroup) {
-	task := c.workerTasks[g.name] // sticky: a returned agent keeps its task
-	if av, ok := c.agents[g.name]; ok {
-		if av.task != "" {
-			task = av.task
-		}
-	}
-	// expanded = whether the thread renders its rows at all; full =
-	// whether think entries show their BODIES (ctrl+g / a full mouse
-	// expand). A set per-agent override wins the ctrl+g baseline OUTRIGHT
-	// (a mouse-collapsed live thread stays collapsed until re-clicked).
-	// A /stop stopped thread force-collapses — only an explicit per-agent
-	// gesture re-opens it. NO auto-expand: the live rule no longer opens
-	// anything — every thread is collapsed by default.
-	stopped := c.threadStop[g.name]
-	expanded := c.threadsExpanded
-	full := c.threadsExpanded
-	if v, ok := c.threadExpand[g.name]; ok {
-		expanded = v
-		full = v
-	}
-	if stopped {
-		if _, ok := c.threadExpand[g.name]; !ok {
-			expanded = false
-		}
-	}
-	head := g.name
-	if task != "" {
-		head += " · " + task
-	}
-	// Card content width: lipgloss v2's Width is BORDER-BOX (the border
-	// columns count inside it), so the frame draws at exactly c.w cells
-	// and the content budget folds at c.w-2 — the same foldStyledRows
-	// hanging-indent math the flat rows used, minus the border pair.
-	innerW := c.w - 2
-	if innerW < 1 {
-		innerW = 1
-	}
-	var rows []string
-	if expanded {
-		// long threads WRAP with aligned continuations — never
-		// truncate a path the user might need to read
-		for j, ln := range foldStyledRows("▴ ┌ "+head, innerW, innerW-2) {
-			if j > 0 {
-				ln = "  " + ln
-			}
-			rows = append(rows, chrome.DimText.Render(ln))
-		}
-		for _, m := range g.lines {
-			if m.Kind == wthinkKind {
-				rows = append(rows, c.wthinkRows(m, full, innerW)...)
-				continue
-			}
-			for j, ln := range foldStyledRows("│ "+workerToolLine(m), innerW, innerW-2) {
-				if j > 0 {
-					ln = "│ " + ln
-				}
-				rows = append(rows, chrome.ToolStyle.Render(ln))
-			}
-		}
-	} else {
-		tools, thinks := 0, 0
-		for _, m := range g.lines {
-			if m.Kind == wthinkKind {
-				thinks++
-			} else {
-				tools++
-			}
-		}
-		unit := "tool calls"
-		if tools == 1 {
-			unit = "tool call"
-		}
-		summary := "▾ " + head + " (· " + itoa(tools) + " " + unit
-		if thinks > 0 {
-			// the collapsed summary KEEPS the think count ("· 3 think")
-			summary += " · " + itoa(thinks) + " think"
-		}
-		summaryStyle := chrome.DimText
-		if stopped {
-			// /stop unwind: the thread collapsed because the sessions
-			// were aborted, not because the work returned
-			summary += " ✗ stopped)"
-			summaryStyle = chrome.ErrText.Faint(true)
-		} else {
-			summary += " ✓ done)"
-		}
-		for j, ln := range foldStyledRows(summary, innerW, innerW-2) {
-			if j > 0 {
-				ln = "  " + ln
-			}
-			rows = append(rows, summaryStyle.Render(ln))
-		}
-	}
-	if c.threadRows != nil {
-		// the card's top border cap AND its header/summary row (the NEXT
-		// lines of b, in that order) are the toggle click target
-		base := strings.Count(b.String(), "\n")
-		c.threadRows[base+1] = g.name
-		c.threadRows[base+2] = g.name
-	}
-	// PanelBox carries the house rounded border; the border ink is Dim so
-	// the card frames read as quiet chrome, not conversation text.
-	b.WriteString("\n" + chrome.PanelBox.BorderForeground(chrome.Dim).Width(c.w).Render(strings.Join(rows, "\n")))
-}
-
-// wthinkRows renders one merged employee thinking entry as CARD CONTENT
-// rows (innerW cells each — the card's border columns are the caller's).
-// While the card shows tool rows it is a single dim-italic "│ thinking ·
-// N lines" row; on a FULL expand (ctrl+g / per-agent mouse override) the
-// body renders too — the same collapsed-vs-expanded shape as the boss's
-// thinking blocks, capped to the stream tail (the freshest
-// thinkStreamLines lines).
-func (c *Chat) wthinkRows(m state.ChatMsg, full bool, innerW int) []string {
-	think := chrome.DimText.Italic(true)
-	// fold at the FULL body budget ("│   " is 4 cells) so no row clips
-	lines := foldStyledRows(m.Text, innerW-4, innerW-4)
-	if !full {
-		return []string{think.Render(clipPlain("│ thinking · "+countLines(lines)+" lines", innerW))}
-	}
-	rows := []string{think.Render(clipPlain("│ thinking", innerW))}
-	shown := lines
-	if more := len(lines) - thinkStreamLines; more > 0 {
-		rows = append(rows, think.Render(clipPlain("│   … "+itoa(more)+" more above", innerW)))
-		shown = lines[more:]
-	}
-	for _, ln := range shown {
-		rows = append(rows, chrome.DimText.Render("│   "+ln))
-	}
-	return rows
-}
+// The worker-thread renderer itself (renderWorkerGroup, the header/sneak
+// /expanded row builders, wthinkRows, workerToolLine, the role→Kind
+// labels, the pending block bar) lives in threads_opencode.go — the
+// opencode-style spinner+sneak design replaced the old bordered cards.
 
 // thinkStreamLines caps the visible body of a STREAMING think block —
 // the tail of the accumulated text (the freshest lines) stays visible.

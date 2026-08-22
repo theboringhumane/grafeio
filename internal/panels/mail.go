@@ -10,8 +10,8 @@ import (
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 
-	"github.com/theboringhumane/grafeio/internal/chrome"
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/chrome"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 // Mail is the mailbox tab panel.
@@ -124,6 +124,9 @@ func (m *Mail) render() string {
 // clipped plain row.
 func styleMailRow(it state.MailItem, row string, styleFn func(string) string) string {
 	letter := kindLetter(it.Kind)
+	if len(row) < len(letter)+2 {
+		return row // clipped into the "[K] " prefix (width 0 before first SetSize)
+	}
 	rest := row[len(letter)+2:] // strip "[K] " — machine layout, not NL
 	styled := "[" + styleFn(letter) + "] "
 	if strings.HasPrefix(rest, it.From) && it.From != "" {

@@ -21,7 +21,7 @@ import (
 
 	"charm.land/lipgloss/v2"
 
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 // LEGEND — role legend line (kept for parity with the TS shell).
@@ -370,7 +370,7 @@ func cellKey(x, y int) string { return strconv.Itoa(x) + "," + strconv.Itoa(y) }
 
 // machine-format seat ids, not natural language:
 // POD_SEAT  = /^(?:dev|scout)-\d+$/               (monitors can light up)
-// CHAIR_SEAT = /^(?:hr|cabin-\d+|dev-\d+|scout-\d+)$/ (anchors are "(_)" chairs)
+// CHAIR_SEAT = "cto" | /^(?:hr|cabin-\d+|dev-\d+|scout-\d+)$/ (anchors are "(_)" chairs)
 func podSeatMatch(seat string) bool {
 	if devSeatRE.MatchString(seat) {
 		return true
@@ -379,7 +379,7 @@ func podSeatMatch(seat string) bool {
 }
 
 func chairSeatMatch(seat string) bool {
-	if seat == "hr" || devSeatRE.MatchString(seat) || matchCabin(seat) {
+	if seat == "hr" || seat == "cto" || devSeatRE.MatchString(seat) || matchCabin(seat) {
 		return true
 	}
 	return matchNumSeat(seat, "scout-")
@@ -450,10 +450,12 @@ func BuildRows(st state.OfficeState, width, height int) []Row {
 	}
 	put(g, W, H, plan.Hot.Clock.X, plan.Hot.Clock.Y, TickClock(st.Tick), &style{fg: "white"})
 
-	// boss nameplate is a STATUS line: typing when a boss chat answer is
-	// pending, meetin while anyone is at the boss desk, delegat while the
-	// boss delegated to busy workers (BossDelegating — still a pending
-	// placeholder, but managing not generating), awaiting otherwise
+	// boss nameplate is a STATUS line: OFFLINE takes TOP precedence (the
+	// connectivity watcher — the office is parked waiting for internet, so
+	// nothing below can be true), then meetin while anyone is at the boss
+	// desk, delegat while the boss delegated to busy workers (BossDelegating
+	// — still a pending placeholder, but managing not generating), typing
+	// when a boss chat answer is pending, awaiting otherwise
 	plate := "[awaiting]"
 	pendingBoss := false
 	for _, m := range st.Chat {
@@ -470,6 +472,8 @@ func BuildRows(st state.OfficeState, width, height int) []Row {
 		}
 	}
 	switch {
+	case st.Offline:
+		plate = "[offline]"
 	case meeting:
 		plate = "[meetin]"
 	case st.BossDelegating: // implies pendingBoss — the stricter branch first
@@ -477,7 +481,11 @@ func BuildRows(st state.OfficeState, width, height int) []Row {
 	case pendingBoss:
 		plate = "[typing]"
 	}
-	put(g, W, H, plan.Nameplate.X, plan.Nameplate.Y, padEnd(plate, 10), &style{fg: "yellow", bold: true})
+	plateStyle := style{fg: "yellow", bold: true}
+	if st.Offline {
+		plateStyle = style{fg: "red", bold: true} // an alarm, not a status hint
+	}
+	put(g, W, H, plan.Nameplate.X, plan.Nameplate.Y, padEnd(plate, 10), &plateStyle)
 
 	// degrade badge (drawn once, centered)
 	if plan.Tiny {
@@ -550,6 +558,13 @@ func BuildRows(st state.OfficeState, width, height int) []Row {
 		a := SeatAnchor(e.Seat) // pod chair; the "[=]" monitor sits 1 right, 2 up
 		restyle(g, W, H, a.X+1, a.Y-2, 3, style{fg: "cyan", bold: true})
 	}
+
+	// ambient fixture motion (floor_ambient.go) — steam off the tea machine,
+	// blinking rack LEDs, the uplink ripple on the server-room north wall.
+	// Tick-keyed cell churn confined to the fixtures + the rows above the
+	// machine; walls, doors and sprite cells are never overwritten, and
+	// bubbles drawn after still win any overlap.
+	stampAmbient(g, plan, W, H, st.Tick, occupied)
 
 	// speech bubbles above sprites (live ones only, one per employee)
 	byID := map[string]state.Employee{}

@@ -23,7 +23,8 @@ const watchdog = 2 * time.Second
 //	"bell" — print the terminal bell (\a) to stdout, no files needed
 //	"off"  — silence
 //
-// Env override: GRAFEIO_MUTE=1 forces "off" above whatever config asked for.
+// Env override: THEBORINGOFFICE_MUTE=1 (pre-rename: GRAFEIO_MUTE=1) forces
+// "off" above whatever config asked for.
 type Bus struct {
 	mode   string
 	dir    string
@@ -56,9 +57,21 @@ func ResolvePlayer() string {
 	return ""
 }
 
+// envOrLegacy reads the THEBORINGOFFICE_* env var, falling back to the
+// pre-rename GRAFEIO_* name (whole-product rename: grafeio ->
+// theboringoffice; old dotfiles and CI exports keep working). Same dup-on-
+// purpose as cmd's envOr — sound imports no sibling packages.
+func envOrLegacy(key, legacyKey string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return os.Getenv(legacyKey)
+}
+
 // NewBus builds a Bus for the given config mode ("on"|"bell"|""|"off") and
-// home dir ("" = GRAFEIO_HOME, then $HOME). Wav paths live at
-// <home>/.grafeio/sounds/<name>.wav. The player lookup happens once here.
+// home dir ("" = THEBORINGOFFICE_HOME, then GRAFEIO_HOME, then $HOME). Wav
+// paths live at <home>/.theboringoffice/sounds/<name>.wav. The player lookup
+// happens once here.
 func NewBus(cfgSound, home string) *Bus {
 	mode := cfgSound
 	if mode == "" {
@@ -69,11 +82,11 @@ func NewBus(cfgSound, home string) *Bus {
 	default:
 		mode = "off"
 	}
-	if os.Getenv("GRAFEIO_MUTE") == "1" {
+	if envOrLegacy("THEBORINGOFFICE_MUTE", "GRAFEIO_MUTE") == "1" {
 		mode = "off"
 	}
 	if home == "" {
-		if h := os.Getenv("GRAFEIO_HOME"); h != "" {
+		if h := envOrLegacy("THEBORINGOFFICE_HOME", "GRAFEIO_HOME"); h != "" {
 			home = h
 		} else {
 			home = os.Getenv("HOME")
@@ -81,7 +94,7 @@ func NewBus(cfgSound, home string) *Bus {
 	}
 	return &Bus{
 		mode:   mode,
-		dir:    filepath.Join(home, ".grafeio", "sounds"),
+		dir:    filepath.Join(home, ".theboringoffice", "sounds"),
 		player: ResolvePlayer(),
 		last:   make(map[string]time.Time),
 		now:    time.Now,

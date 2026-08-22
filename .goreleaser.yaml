@@ -1,0 +1,47 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+project_name: theboringoffice
+
+builds:
+  - id: theboringoffice
+    main: ./cmd/theboringoffice
+    binary: theboringoffice
+    # windows excluded: internal/term uses unix-only syscalls (syscall.Kill via PTY deps)
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - >-
+        -s -w
+        -X github.com/theboringhumane/theboringoffice/internal/version.Version={{ .Version }}
+        -X github.com/theboringhumane/theboringoffice/internal/version.Commit={{ .Commit }}
+        -X github.com/theboringhumane/theboringoffice/internal/version.Date={{ .Date }}
+
+archives:
+  - id: theboringoffice
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
+
+snapshot:
+  version_template: "{{ .Version }}-snapshot"
+
+changelog:
+  use: git
+  sort: asc
+  groups:
+    - title: Features
+      regexp: "^feat"
+      order: 0
+    - title: Fixes
+      regexp: "^fix"
+      order: 1
+    - title: Other
+      order: 999

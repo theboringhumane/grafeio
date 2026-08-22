@@ -10,10 +10,11 @@ import (
 	"strings"
 	"testing"
 
+	"charm.land/bubbles/v2/cursor"
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
 
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 // recBackend — a recording state.Backend WITH the attachment seam (the
@@ -21,6 +22,15 @@ import (
 type recBackend struct {
 	sentTexts []string
 	sentAtts  [][]state.Attachment
+	// qAnswers records every AnswerQuestion call (request id + the full
+	// per-page answer set it carried).
+	qAnswers []qAnswerCall
+}
+
+// qAnswerCall — one recorded AnswerQuestion request.
+type qAnswerCall struct {
+	id      string
+	answers [][]string
 }
 
 func (r *recBackend) Mode() state.Mode                      { return state.ModeDemo }
@@ -28,8 +38,13 @@ func (r *recBackend) Start(func(state.Event)) error         { return nil }
 func (r *recBackend) Stop() error                           { return nil }
 func (r *recBackend) Send(text string) error                { return nil } // untouched: the seam wins
 func (r *recBackend) AnswerPermission(string, string) error { return nil }
-func (r *recBackend) AnswerQuestion(string, []string) error { return nil }
-func (r *recBackend) RejectQuestion(string) error           { return nil }
+func (r *recBackend) AnswerQuestion(id string, answers [][]string) error {
+	r.qAnswers = append(r.qAnswers, qAnswerCall{id: id, answers: answers})
+	return nil
+}
+func (r *recBackend) RejectQuestion(string) error            { return nil }
+func (r *recBackend) MCPServers() ([]state.MCPServer, error) { return nil, nil }
+func (r *recBackend) ReconnectMCP(string) error              { return nil }
 func (r *recBackend) SendWith(text string, atts []state.Attachment) error {
 	r.sentTexts = append(r.sentTexts, text)
 	r.sentAtts = append(r.sentAtts, atts)
@@ -38,8 +53,11 @@ func (r *recBackend) SendWith(text string, atts []state.Attachment) error {
 
 // runMsg feeds one msg through Update (the model value copies — keep the
 // returned one) and executes the returned cmd tree breadth-first (the
-// flush's send closure hides inside a tea.Batch). Spinner ticks are
-// DROPPED: they sleep ~80ms and re-arm forever — not send results.
+// flush's send closure hides inside a tea.Batch). Spinner ticks and cursor
+// blinks are DROPPED: both are self-re-arming heartbeats (each executed cmd
+// sleeps a full period, then its msg re-arms the next cmd forever) — not
+// send results. A raw keypress into the chat textarea (boot-gate skip)
+// arms the wait loop this way without a cursor.BlinkMsg drop.
 func runMsg(t *testing.T, m Model, msg tea.Msg) Model {
 	t.Helper()
 	nm, cmd := m.Update(msg)
@@ -60,6 +78,9 @@ func runMsg(t *testing.T, m Model, msg tea.Msg) Model {
 			queue = append(queue, out...)
 		case spinner.TickMsg:
 			// the typing-row spinner's self-re-arm — ignore
+		case cursor.BlinkMsg:
+			// the chat textarea cursor's blink heartbeat re-arms forever
+			// (each cmd sleeps full BlinkSpeed first) — same deal, ignore
 		default:
 			nm, next := m.Update(out)
 			m = nm.(Model)

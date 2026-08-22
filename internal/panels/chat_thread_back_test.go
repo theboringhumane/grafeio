@@ -20,7 +20,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
 
-	state "github.com/theboringhumane/grafeio/internal/state"
+	state "github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 // tbAssertExpanded pins ONE thread's effective expansion (the exact rule
@@ -37,12 +37,15 @@ func tbAssertExpanded(t *testing.T, c *Chat, name string, want bool, walk string
 // back-one test: bossTurns boss replies padding the conversation, then one
 // completed 2-tool thread per agent — X (tekton-1, "Fix Portuguese proof")
 // born at At 1000, Y (tekton-2, "Wire the tests") born at At 3000.
-// Collapsed summaries read "… (· 2 tool calls ✓ done)". Callers pick the
-// size + padding: the back-one tests use a short conversation in a tall
-// panel (every thread row inside the viewport, so the whole backstack is
-// on screen at once); the fall-through scroll test uses a long one that
-// OUTGROWS the viewport (so ↑ has an offset to move). No clocks, no
-// sleeps: every timestamp is a literal.
+// Collapsed threads read "✓ Developer Task — <task> (· 2 tool calls ✓
+// done)" (single row, clipped when narrow) over the dim BARE
+// "  ↳ <Verb> <rest>" sneak (the reducer's "edit · proof.go" shaped to
+// "Edit proof.go", no state mark). Callers pick the size + padding: the
+// back-one tests use a short conversation in a tall panel (every thread
+// row inside the viewport, so the whole backstack is on screen at once);
+// the fall-through scroll test uses a long one that OUTGROWS the viewport
+// (so ↑ has an offset to move). No clocks, no sleeps: every timestamp is
+// a literal.
 func newBackTestChat(t *testing.T, bossTurns, w, h int) *Chat {
 	t.Helper()
 	c := NewChat(nil)
@@ -79,25 +82,29 @@ func newBackTestChat(t *testing.T, bossTurns, w, h int) *Chat {
 }
 
 // tbAssertTwoCollapsed pins BOTH completed threads collapsed at the state
-// seam AND in the render: both "✓ done" summaries on screen, no "┌"
-// expanded header anywhere. Use only on the SHORT fixture — a padded
-// (scrollable) conversation keeps the early thread above the viewport
-// window, and off-screen is not collapsed.
+// seam AND in the render: both "✓ Developer Task — <task>" headers with
+// the dim trailing rollup (single row — Y's fits whole at 60 cols, X's
+// longer one clips inside its own row) + their shaped BARE ↳ sneaks on
+// screen, no expanded ("[tool] ") row anywhere. Use only on the SHORT
+// fixture — a padded (scrollable) conversation keeps the early thread
+// above the viewport window, and off-screen is not collapsed.
 func tbAssertTwoCollapsed(t *testing.T, c *Chat, walk string) {
 	t.Helper()
 	tbAssertExpanded(t, c, "tekton-1", false, walk)
 	tbAssertExpanded(t, c, "tekton-2", false, walk)
 	view := ansi.Strip(c.View())
 	for _, want := range []string{
-		"tekton-1 · Fix Portuguese proof (· 2 tool calls ✓ done)",
-		"tekton-2 · Wire the tests (· 2 tool calls ✓ done)",
+		"✓ Developer Task — Fix Portuguese proof",
+		"✓ Developer Task — Wire the tests (· 2 tool calls ✓ done)", // Y's rollup fits the single row at 60 cols
+		"  ↳ Edit proof.go", // the reducer's "edit · proof.go", shaped
+		"  ↳ Bash go test",  // the reducer's "bash · go test", shaped
 	} {
 		if !strings.Contains(view, want) {
-			t.Fatalf("state walk %s: collapsed summary %q missing:\n%s", walk, want, view)
+			t.Fatalf("state walk %s: collapsed header/sneak %q missing:\n%s", walk, want, view)
 		}
 	}
-	if strings.Contains(view, "┌") {
-		t.Fatalf("state walk %s: an expanded thread header leaked into the collapsed render:\n%s", walk, view)
+	if strings.Contains(view, "[tool] ") {
+		t.Fatalf("state walk %s: an expanded tool row leaked into the collapsed render:\n%s", walk, view)
 	}
 }
 
@@ -116,7 +123,7 @@ func TestThreadBackEscCollapsesMostRecentFirst(t *testing.T) {
 	tbAssertExpanded(t, c, "tekton-2", true, "[X,Y]")
 
 	// esc #1: Y (most recent) collapses, X survives — rendered as X's
-	// expanded "┌" header beside Y's collapsed summary
+	// expanded tool rows beside Y's collapsed header+sneak pair
 	c.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEscape}))
 	tbAssertExpanded(t, c, "tekton-2", false, "[X,Y] --esc--> [X]")
 	tbAssertExpanded(t, c, "tekton-1", true, "[X,Y] --esc--> [X]")
@@ -124,14 +131,15 @@ func TestThreadBackEscCollapsesMostRecentFirst(t *testing.T) {
 	fmt.Println("---- CHAT PANEL (60 cols, after esc #1: X expanded, Y collapsed) ----")
 	fmt.Print(view)
 	fmt.Println("---- END PANEL ----")
-	if !strings.Contains(view, "┌ tekton-1") {
-		t.Fatalf("esc #1: X's expanded header must survive:\n%s", view)
+	if !strings.Contains(view, "  [tool] Read proof.go ✓") {
+		t.Fatalf("esc #1: X's expanded tool rows must survive:\n%s", view)
 	}
-	if strings.Contains(view, "┌ tekton-2") {
-		t.Fatalf("esc #1: Y must be collapsed, still shows an expanded header:\n%s", view)
+	if strings.Contains(view, "  [tool] Bash go test") {
+		t.Fatalf("esc #1: Y must be collapsed, still shows an expanded row:\n%s", view)
 	}
-	if !strings.Contains(view, "tekton-2 · Wire the tests (· 2 tool calls ✓ done)") {
-		t.Fatalf("esc #1: Y must render its collapsed summary:\n%s", view)
+	if !strings.Contains(view, "✓ Developer Task — Wire the tests") ||
+		!strings.Contains(view, "  ↳ Bash go test") {
+		t.Fatalf("esc #1: Y must render its collapsed header+sneak pair:\n%s", view)
 	}
 
 	// esc #2: X collapses too — the backstack is empty
@@ -156,11 +164,11 @@ func TestThreadBackUpCollapsesMostRecentFirst(t *testing.T) {
 	tbAssertExpanded(t, c, "tekton-2", false, "[X,Y] --up--> [X]")
 	tbAssertExpanded(t, c, "tekton-1", true, "[X,Y] --up--> [X]")
 	view := ansi.Strip(c.View())
-	if !strings.Contains(view, "┌ tekton-1") {
-		t.Fatalf("up #1: X's expanded header must survive:\n%s", view)
+	if !strings.Contains(view, "  [tool] Read proof.go ✓") {
+		t.Fatalf("up #1: X's expanded tool rows must survive:\n%s", view)
 	}
-	if strings.Contains(view, "┌ tekton-2") {
-		t.Fatalf("up #1: Y must be collapsed, still shows an expanded header:\n%s", view)
+	if strings.Contains(view, "  [tool] Bash go test") {
+		t.Fatalf("up #1: Y must be collapsed, still shows an expanded row:\n%s", view)
 	}
 
 	// up #2: X collapses too
@@ -201,7 +209,7 @@ func TestThreadBackFallThroughWhenNoExpandedThreads(t *testing.T) {
 	// threads are still collapsed and no expanded header appeared anywhere
 	tbAssertExpanded(t, c, "tekton-1", false, "[] --up--> (scroll up one line)")
 	tbAssertExpanded(t, c, "tekton-2", false, "[] --up--> (scroll up one line)")
-	if view := ansi.Strip(c.View()); strings.Contains(view, "┌") {
+	if view := ansi.Strip(c.View()); strings.Contains(view, "[tool] ") {
 		t.Fatalf("up with no expanded threads must open nothing:\n%s", view)
 	}
 	if got := c.ta.Value(); got != "" {

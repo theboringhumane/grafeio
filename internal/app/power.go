@@ -8,8 +8,8 @@ package app
 import (
 	"time"
 
-	"github.com/theboringhumane/grafeio/internal/config"
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/config"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 const (
@@ -109,6 +109,6 @@ func powerDescribe(mode config.PowerMode) string {
 // (slash/readout display; the same signals tickCmd feeds).
 func (m *Model) currentTick() time.Duration {
 	return TickDelay(m.st, m.cfg,
-		len(m.activeThink) > 0, m.perm != nil || m.question != nil,
+		len(m.activeThink) > 0, m.permQ.front() != nil || m.question != nil,
 		time.Since(m.gov.lastBusy))
 }

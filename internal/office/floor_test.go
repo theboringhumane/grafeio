@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 func emp(id, name string, role state.EmployeeRole, seat string, sprite state.SpriteState) state.Employee {
@@ -133,6 +133,39 @@ func TestNameplate(t *testing.T) {
 			t.Fatalf("got %q", plate)
 		}
 	})
+	t.Run("offline takes TOP precedence, in red", func(t *testing.T) {
+		st := state.OfficeState{
+			Tick:           0,
+			Offline:        true,
+			BossDelegating: true, // stacked badges…
+			Employees:      []state.Employee{emp("t1", "tekton", state.RoleDeveloper, "dev-1", state.SpriteMeeting)},
+			Chat:           []state.ChatMsg{{ID: "m1", From: "boss", Pending: true}}, // …offline still wins
+		}
+		if plate := nameplateRow(t, st); plate != "[offline] " {
+			t.Fatalf("got %q", plate)
+		}
+		// red bold — a connectivity alarm, not a status hint.
+		plan := ComputePlan(120, 25)
+		rows := BuildRows(st, 120, 25)
+		for dx := 0; dx < len("[offline]"); dx++ {
+			c := rows[plan.Nameplate.Y][plan.Nameplate.X+dx]
+			if c.FG != "red" || !c.Bold {
+				t.Fatalf("offline plate cell (%d,%d) = {Ch:%q FG:%q Bold:%v}, want red bold",
+					plan.Nameplate.X+dx, plan.Nameplate.Y, c.Ch, c.FG, c.Bold)
+			}
+		}
+	})
+	t.Run("healthy plate stays yellow (positive control)", func(t *testing.T) {
+		plan := ComputePlan(120, 25)
+		rows := BuildRows(state.OfficeState{Tick: 0}, 120, 25)
+		for dx := 0; dx < len("[awaiting]"); dx++ {
+			c := rows[plan.Nameplate.Y][plan.Nameplate.X+dx]
+			if c.FG != "yellow" || !c.Bold {
+				t.Fatalf("ordinary plate cell (%d,%d) = {FG:%q Bold:%v}, want yellow bold",
+					plan.Nameplate.X+dx, plan.Nameplate.Y, c.FG, c.Bold)
+			}
+		}
+	})
 }
 
 // Blink frame: z floats one row above the right shoulder, never glued ("zMz").
@@ -242,5 +275,105 @@ func TestAdvanceSprites(t *testing.T) {
 	plan := CurrentPlan()
 	if !ok || p != plan.Hot.Meet {
 		t.Fatalf("walker parked at %v (ok=%v), want meet hotspot %v", p, ok, plan.Hot.Meet)
+	}
+}
+
+// cropRows — plain text of the cell window rows[y0:y1+1] x cols[x0:x1+1]
+// (floorshot-style proof crops; machine layout, not NL).
+func cropRows(rows []Row, x0, y0, x1, y1 int) string {
+	var b strings.Builder
+	for y := y0; y <= y1; y++ {
+		if y > y0 {
+			b.WriteByte('\n')
+		}
+		for x := x0; x <= x1; x++ {
+			b.WriteRune(rows[y][x].Ch)
+		}
+	}
+	return b.String()
+}
+
+// The CTO exec suite renders at 120x30: his name plate follows the 10-col
+// boss-plate convention ("theboringcto" -> "theboringc"), his desk and
+// chair sit inside the boss office right of the mug, and the seated
+// sprite stamps a white 'C' over the chair anchor.
+func TestCTOSuiteRenders120x30(t *testing.T) {
+	plan := ComputePlan(120, 30)
+	anchor, ok := plan.Anchor["cto"]
+	if !ok {
+		t.Fatalf("120x30 plan has no cto anchor (bw>=28 && topH>=7 must carry the suite)")
+	}
+	st := state.OfficeState{
+		Tick: 3,
+		Employees: []state.Employee{
+			emp("theboringcto", "theboringcto", state.RoleCTO, "cto", state.SpriteAtDesk),
+		},
+	}
+	rows := BuildRows(st, 120, 30)
+	plain := Styleless(rows)
+
+	// name plate: exactly the 10-col clip, yellow bold like the boss plate
+	for dx := 0; dx < len("theboringc"); dx++ {
+		c := rows[3][17+dx]
+		if c.Ch != rune("theboringc"[dx]) {
+			t.Fatalf("plate cell (%d,3) = %q, want %q", 17+dx, c.Ch, "theboringc"[dx:dx+1])
+		}
+		if c.FG != "yellow" || !c.Bold {
+			t.Fatalf("plate cell (%d,3) = {FG:%q Bold:%v}, want yellow bold", 17+dx, c.FG, c.Bold)
+		}
+	}
+	if !strings.Contains(plain, "theboringc") || strings.Contains(plain, "theboringcto") {
+		t.Fatalf("plate must render the 10-col clip \"theboringc\" and never spill the full name")
+	}
+	// desk + chair props (machine layout)
+	if got := cropRows(rows, 17, 4, 24, 4); got != "[=CTO==]" {
+		t.Fatalf("CTO desk row = %q, want %q", got, "[=CTO==]")
+	}
+	// seated sprite: white 'C' centered over the chair anchor, never dim
+	c := rows[anchor.Y][anchor.X+1]
+	if c.Ch != 'C' {
+		t.Fatalf("chair center (%d,%d) = %q, want 'C'", anchor.X+1, anchor.Y, c.Ch)
+	}
+	if c.FG != "white" || c.Dim {
+		t.Fatalf("seated CTO cell = {FG:%q Dim:%v}, want lit white", c.FG, c.Dim)
+	}
+	for dx := 0; dx < 3; dx++ {
+		if rows[anchor.Y][anchor.X+dx].Dim {
+			t.Fatalf("staffed cto chair cell (%d,%d) is dim, want lit", anchor.X+dx, anchor.Y)
+		}
+	}
+	// seat routing: the role lands on his exec-suite desk, overflow stands
+	if got := AssignSeat(map[string]bool{}, state.RoleCTO); got != "cto" {
+		t.Fatalf("AssignSeat(RoleCTO) = %q, want \"cto\"", got)
+	}
+	if got := AssignSeat(map[string]bool{"cto": true}, state.RoleCTO); got != "floor-0" {
+		t.Fatalf("AssignSeat(RoleCTO, taken) = %q, want overflow \"floor-0\"", got)
+	}
+	// panel/paint lookups stay on the roster conventions
+	if got := NameColor("theboringcto"); got != "white" {
+		t.Fatalf("NameColor(theboringcto) = %q, want white", got)
+	}
+	if got := ROLE_GLYPH[state.RoleCTO]; got != 'C' {
+		t.Fatalf("ROLE_GLYPH[RoleCTO] = %q, want 'C'", got)
+	}
+	// floorshot-style proof crop: the exec corner with the CTO seated.
+	t.Logf("CTO exec suite at 120x30 (boss office, rows 0-10 x cols 0-31):\n%s",
+		cropRows(rows, 0, 0, 31, 10))
+
+	// Same renderer, wider frame (the floorshot 120x34 size): the seated
+	// exec corner, plain text, for shot-review crops.
+	rows34 := BuildRows(st, 120, 34)
+	if got := cropRows(rows34, 17, 3, 26, 3); got != "theboringc" {
+		t.Fatalf("120x34 plate row = %q, want %q", got, "theboringc")
+	}
+	t.Logf("CTO exec suite at 120x34, seated (rows 0-10 x cols 0-31):\n%s",
+		cropRows(rows34, 0, 0, 31, 10))
+
+	// 84x24 degrades like the cabins do: no anchor, he stands overflow.
+	// (ComputePlan re-pins CurrentPlan; rebuild the big plan first so the
+	// assertions above stay anchored.)
+	plan84 := ComputePlan(84, 24)
+	if _, ok := plan84.Anchor["cto"]; ok {
+		t.Fatalf("84x24 must not carry the CTO suite (bw<28) — it degrades to overflow")
 	}
 }

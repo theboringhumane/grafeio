@@ -157,10 +157,10 @@ func TestEnsureWavUnknownName(t *testing.T) {
 }
 
 func TestBusMuteEnvOverridesConfig(t *testing.T) {
-	t.Setenv("GRAFEIO_MUTE", "1")
+	t.Setenv("THEBORINGOFFICE_MUTE", "1")
 	b := NewBus("on", t.TempDir())
 	if b.Mode() != "off" {
-		t.Fatalf("GRAFEIO_MUTE=1 should force off, got %q", b.Mode())
+		t.Fatalf("THEBORINGOFFICE_MUTE=1 should force off, got %q", b.Mode())
 	}
 	if err := b.Play("done"); err != nil {
 		t.Fatalf("off-mode Play should never error: %v", err)
@@ -223,7 +223,7 @@ func TestBusPlayWithoutPlayerDegradesSilent(t *testing.T) {
 func TestDefaultDirShape(t *testing.T) {
 	home := t.TempDir()
 	b := NewBus("on", home)
-	want := filepath.Join(home, ".grafeio", "sounds")
+	want := filepath.Join(home, ".theboringoffice", "sounds")
 	if b.Dir() != want {
 		t.Fatalf("Dir() = %q, want %q", b.Dir(), want)
 	}

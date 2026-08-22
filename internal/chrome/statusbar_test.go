@@ -8,10 +8,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/charmbracelet/x/ansi"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 func TestHumanTokens(t *testing.T) {

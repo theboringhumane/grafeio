@@ -11,8 +11,8 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/theboringhumane/grafeio/internal/config"
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/config"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 // ---------------- opencode wire shapes ----------------
@@ -44,7 +44,7 @@ type ocMessage struct {
 	// Cost/Tokens — the AssistantMessage usage counters. REQUIRED fields on
 	// the wire (opencode serve 1.18.19 GET /doc, AssistantMessage schema:
 	// required [..., "cost", "tokens"]): cost is the message's USD total as
-	// computed by opencode ITSELF — grafeio never prices anything. Numbers
+	// computed by opencode ITSELF — theboringoffice never prices anything. Numbers
 	// decode as float64 (the wire type is "number"); token counters are
 	// integral in practice and convert at emit time.
 	Cost   float64  `json:"cost"`
@@ -117,6 +117,10 @@ type ocQuestionReq struct {
 type ocQuestionInfo struct {
 	Question string `json:"question"`
 	Header   string `json:"header"`
+	// Multiple marks a checkbox page (several picks allowed); absent
+	// means radio (exactly one). Tolerant parse: older serves simply
+	// omit it.
+	Multiple bool `json:"multiple"`
 	Options  []struct {
 		Label       string `json:"label"`
 		Description string `json:"description"`
@@ -188,7 +192,7 @@ type normCtx struct {
 	// cfg.Roles[<rolekey>].NamePrefix replaces the stock Greek base when
 	// set. RoleConfig.Model is intentionally NOT applied here:
 	// per-sub-agent model dispatch is decided by opencode (the agent that
-	// spawned the child session), grafeio cannot override it — it is
+	// spawned the child session), theboringoffice cannot override it — it is
 	// documented as best-effort in internal/config.
 	cfg              *config.Config
 	employees        map[string]state.Employee // child session id -> employee
@@ -299,8 +303,9 @@ func (ctx *normCtx) dismissConcierge() {
 // Greek-desk naming per role (state canon). brain.json
 // (cfg.Roles[rolekey].NamePrefix) overrides the seed when set — role keys
 // are the role's string value ("developer", "scout", "reviewer", "runner",
-// "hr"). Stocks match the historic roster (tekton/skopos/dikastes/
-// hemerodromos/mnemosyne), so a default brain.json renames nothing.
+// "hr", "cto"). Stocks match the historic roster (tekton/skopos/dikastes/
+// hemerodromos/mnemosyne/theboringcto), so a default brain.json renames
+// nothing.
 func (ctx *normCtx) nameBase(role state.EmployeeRole) string {
 	if rc, ok := ctx.cfg.Roles[string(role)]; ok && rc.NamePrefix != "" {
 		return rc.NamePrefix
@@ -321,6 +326,8 @@ func nameBase(role state.EmployeeRole) string {
 		return "hr"
 	case state.RoleManager:
 		return "manager"
+	case state.RoleCTO:
+		return "theboringcto"
 	default:
 		return "tekton"
 	}
@@ -328,9 +335,15 @@ func nameBase(role state.EmployeeRole) string {
 
 // roleFromSession guesses a role from the child session's title (plus an
 // optional agent hint). Machine-generated titles, not member language —
-// plain substring rules are the right tool here.
+// plain substring rules are the right tool here. Architecture briefs land
+// FIRST: the CTO owns them (state.IsArchitectureBrief is the ONE matcher;
+// it already covers "review", so a review-titled child seats at his exec
+// suite rather than the dikastes cabin).
 func roleFromSession(title, agentHint string) state.EmployeeRole {
 	hay := strings.ToLower(agentHint + " " + title)
+	if state.IsArchitectureBrief(hay) {
+		return state.RoleCTO
+	}
 	if strings.Contains(hay, "explore") || strings.Contains(hay, "scout") || strings.Contains(hay, "skopos") {
 		return state.RoleScout
 	}
@@ -870,7 +883,11 @@ func mapPermissionReplied(p ocPermissionReq, ctx *normCtx, primaryID string, now
 }
 
 // mapQuestionAsked: question.asked, for ANY session. The full question text
-// rides in Text; options collapse into ToolSummary ("a | b | c").
+// rides in Text; options collapse into ToolSummary ("a | b | c") — that
+// flattening is KEPT verbatim (history/list views and tests lean on it) and
+// the STRUCTURED pages additionally ride in Questions (one QuestionItem per
+// asked question with its header/options/multiple), so the popover can
+// render real radio/checkbox/textarea kinds.
 func mapQuestionAsked(p ocQuestionReq, ctx *normCtx, primaryID string) []state.Event {
 	empID, empName, ok := actorFor(p.SessionID, ctx, primaryID)
 	if !ok {
@@ -881,9 +898,27 @@ func mapQuestionAsked(p ocQuestionReq, ctx *normCtx, primaryID string) []state.E
 		id = p.RequestID
 	}
 	var texts, options []string
+	var items []state.QuestionItem
 	for _, q := range p.Questions {
 		if s := strings.TrimSpace(q.Question); s != "" {
 			texts = append(texts, s)
+			// Structured page: whitespace-only questions drop here too
+			// (never a blank popover page); a request with NO real
+			// question leaves Questions nil.
+			item := state.QuestionItem{
+				Question: s,
+				Header:   strings.TrimSpace(q.Header),
+				Multiple: q.Multiple,
+			}
+			for _, opt := range q.Options {
+				if s := strings.TrimSpace(opt.Label); s != "" {
+					item.Options = append(item.Options, state.QuestionOption{
+						Label:       s,
+						Description: strings.TrimSpace(opt.Description),
+					})
+				}
+			}
+			items = append(items, item)
 		}
 		for _, opt := range q.Options {
 			if s := strings.TrimSpace(opt.Label); s != "" {
@@ -912,6 +947,7 @@ func mapQuestionAsked(p ocQuestionReq, ctx *normCtx, primaryID string) []state.E
 		Text:         shortTitle(text, 240),
 		ToolSummary:  shortTitle(summary, 120),
 		ToolState:    "pending",
+		Questions:    items,
 	}}
 }
 
@@ -1007,7 +1043,7 @@ type ocUsageLast struct {
 //   - TokensIn = wire input; TokensOut = wire output + reasoning. Cache
 //     read/write stay OUT of the headline counts (provider-billing
 //     overlap); the $ figure is authoritative anyway — opencode computed
-//     it, grafeio never prices anything;
+//     it, theboringoffice never prices anything;
 //   - an all-zero delta (the typical first frame, counters still 0)
 //     emits nothing.
 func mapUsage(info ocMessage, ctx *normCtx, primaryID string) []state.Event {
@@ -1279,14 +1315,14 @@ func mapOCEvent(raw ocSSEEvent, ctx *normCtx, primaryID string, now int64) []sta
 			if p.Error != nil && p.Error.Data.Message != "" {
 				message = p.Error.Data.Message
 			}
-			evs := interruptedStreamEvents(ctx, "[grafeio] stream interrupted")
+			evs := interruptedStreamEvents(ctx, "[theboringoffice] stream interrupted")
 			return append(evs, state.Event{
 				Kind: state.EvChatOffice,
 				Msg: state.ChatMsg{
 					ID:      "office-error-" + itoa64(now),
 					From:    "office",
 					Kind:    "office",
-					Text:    "[grafeio] office error: " + shortTitle(message, 120),
+					Text:    "[theboringoffice] office error: " + shortTitle(message, 120),
 					At:      now,
 					Pending: false,
 				},
@@ -1299,13 +1335,13 @@ func mapOCEvent(raw ocSSEEvent, ctx *normCtx, primaryID string, now int64) []sta
 		// Any boss text still streaming dies with the run: flush whatever
 		// accumulated as a final Pending=false bubble (update-in-place on
 		// the same ID), then the error line.
-		evs := interruptedStreamEvents(ctx, "[grafeio] stream interrupted")
+		evs := interruptedStreamEvents(ctx, "[theboringoffice] stream interrupted")
 		return append(evs, state.Event{
 			Kind: state.EvChatBoss,
 			Msg: state.ChatMsg{
 				ID:      "boss-error-" + itoa64(now),
 				From:    "boss",
-				Text:    "[grafeio] boss error: " + shortTitle(message, 120),
+				Text:    "[theboringoffice] boss error: " + shortTitle(message, 120),
 				At:      now,
 				Pending: false,
 			},

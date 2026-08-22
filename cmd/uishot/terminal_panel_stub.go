@@ -15,7 +15,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 // terminalPanelStub — fake TermPanel for the --terminal frame.
@@ -81,9 +81,9 @@ func (t *terminalPanelStub) View() string {
 		return s
 	}
 	lines := []string{
-		"$ echo grafeio",
-		"grafeio",
-		"(uisshot STUB shell — the real panels.TermPanel lands from the terminal dev)",
+		"$ echo theboringoffice",
+		"theboringoffice",
+		"(uisshot STUB shell — the real panels.TermPanel is wired by cmd/theboringoffice)",
 		fmt.Sprintf("$ keys received: %d █", t.received),
 	}
 	for i := range lines {

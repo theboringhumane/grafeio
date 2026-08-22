@@ -1,10 +1,10 @@
-// soundtest — verification binary for the Grafeio sound layer.
+// soundtest — verification binary for the theboringoffice sound layer.
 //
-//	grafeio-soundtest                   play every sound serially (350ms gaps)
-//	grafeio-soundtest --only queued,done
+//	theboringoffice-soundtest                   play every sound serially (350ms gaps)
+//	theboringoffice-soundtest --only queued,done
 //	                                    play just these sounds
-//	grafeio-soundtest --bell-mode       bell mode: print \a per sound, no files
-//	grafeio-soundtest --list            list name/wav size only, no playback
+//	theboringoffice-soundtest --bell-mode       bell mode: print \a per sound, no files
+//	theboringoffice-soundtest --list            list name/wav size only, no playback
 //
 // Exit code is 0 even when no player exists (prints
 // "player: none — file check only"); this is a verification harness, not a
@@ -19,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/theboringhumane/grafeio/internal/sound"
+	"github.com/theboringhumane/theboringoffice/internal/sound"
 )
 
 func main() {
@@ -30,7 +30,11 @@ func main() {
 	)
 	flag.Parse()
 
-	home := os.Getenv("GRAFEIO_HOME")
+	// THEBORINGOFFICE_HOME canonical, pre-rename GRAFEIO_HOME fallback.
+	home := os.Getenv("THEBORINGOFFICE_HOME")
+	if home == "" {
+		home = os.Getenv("GRAFEIO_HOME")
+	}
 	if home == "" {
 		home = os.Getenv("HOME")
 	}

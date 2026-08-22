@@ -62,7 +62,7 @@ func TestChatDoubleEscWindow(t *testing.T) {
 }
 
 // TestChatEscConsumedBySurfaces pins the precedence contract: an esc that
-// closes the @ picker (or defers the question modal) is consumed THERE
+// closes the @ picker (or defers the question popover) is consumed THERE
 // and never feeds the double-esc tracker in the main input.
 func TestChatEscConsumedBySurfaces(t *testing.T) {
 	fired := 0
@@ -87,9 +87,9 @@ func TestChatEscConsumedBySurfaces(t *testing.T) {
 		t.Fatalf("esc-esc after a picker close must fire exactly once (fired=%d)", fired)
 	}
 
-	// question modal open: esc defers (consumed by the modal arm), and
-	// a following pair in the main input still needs two of its own.
-	c.SetQuestion(&QuestionView{ID: "que-1", Text: "which branch?"})
+	// question popover open: esc defers (consumed by the popover arm),
+	// and a following pair in the main input still needs two of its own.
+	c.SetQuestion(&QuestionView{ID: "que-1", Question: "which branch?", Kind: QuestionKindText, Index: 1, Total: 1})
 	esc()
 	if !c.lastEscAt.IsZero() {
 		t.Fatal("a modal-consumed esc must not feed the double-esc tracker")

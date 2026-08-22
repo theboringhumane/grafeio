@@ -1,4 +1,4 @@
-// uishot — deterministic UI shot harness for Grafeio v2.
+// uishot — deterministic UI shot harness for theboringoffice v2.
 //
 // Runs the REAL app model against a scripted stub backend (fixed event
 // script: hires/dispatches/working/returned+mail/blocked/bubbles, boss
@@ -121,11 +121,11 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/theboringhumane/grafeio/internal/app"
-	"github.com/theboringhumane/grafeio/internal/chrome"
-	"github.com/theboringhumane/grafeio/internal/config"
-	"github.com/theboringhumane/grafeio/internal/office"
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/app"
+	"github.com/theboringhumane/theboringoffice/internal/chrome"
+	"github.com/theboringhumane/theboringoffice/internal/config"
+	"github.com/theboringhumane/theboringoffice/internal/office"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 const (
@@ -158,7 +158,7 @@ const bossDiffBody = "--- a/README.md\n" +
 	"- Native single binary. The **Ink/Node** v0.1 app is preserved under\n" +
 	"   [`node-legacy/`](node-legacy/) (tagged `node-v0.1.0`).\n" +
 	"+ Native single binary. Themes: `--theme noir|paper|mono|dracula`\n" +
-	"+ (also `/theme` in-app, persisted to `~/.config/grafeio/theme`).\n" +
+	"+ (also `/theme` in-app, persisted to `~/.config/theboringoffice/theme`).\n" +
 	" \n" +
 	"   ## Behind the glass\n" +
 	"@@ -49,6 +50,10 @@ renders **bold**, *italic*, `code` and lists.\n" +
@@ -170,11 +170,11 @@ const bossDiffBody = "--- a/README.md\n" +
 	" \n" +
 	"   ### Run it\n" +
 	"-```sh\n" +
-	"-cd grafeio && go build ./...\n" +
+	"-cd theboringoffice && go build ./...\n" +
 	"-```\n" +
 	"+```sh\n" +
-	"+go run ./cmd/grafeio --theme dracula\n" +
-	"+grafeio --theme paper\n" +
+	"+go run ./cmd/theboringoffice --theme dracula\n" +
+	"+theboringoffice --theme paper\n" +
 	"+```\n" +
 	" \n" +
 	" | Key | Action |\n" +
@@ -209,7 +209,7 @@ const employeeDiffBody = "--- /dev/null\n" +
 	"+package main\n" +
 	"+\n" +
 	"+func main() {\n" +
-	"+\tprintln(\"hello, grafeio\")\n" +
+	"+\tprintln(\"hello, theboringoffice\")\n" +
 	"+run()\n" +
 	"+}"
 
@@ -286,7 +286,7 @@ func (b *stubBackend) script() {
 		return
 	}
 
-	at(50, state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — stub backend online"})
+	at(50, state.Event{Kind: state.EvStatus, Text: "[theboringoffice] demo — stub backend online"})
 	at(100, state.Event{Kind: state.EvHire, Employee: state.Employee{
 		ID: "dev-1", Name: "tekton-1", Role: state.RoleDeveloper, Sprite: state.SpriteAtDesk}})
 	at(250, state.Event{Kind: state.EvHire, Employee: state.Employee{
@@ -412,7 +412,7 @@ func (b *stubBackend) scriptThink(at func(ms int, ev state.Event)) {
 		"backlog: per-team leaderboards.\n" +
 		"keep the ghost rule — nice touch."
 
-	at(50, state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — think-stream stub online"})
+	at(50, state.Event{Kind: state.EvStatus, Text: "[theboringoffice] demo — think-stream stub online"})
 	at(150, state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
 		"sketch the leaderboard flow", false)})
 	at(200, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-1", "boss", "", true)})
@@ -438,7 +438,7 @@ func (b *stubBackend) scriptThink(at func(ms int, ev state.Event)) {
 // a completed boss reply (scriptAsk's server-resume leg lives in
 // AnswerQuestion, like the real opencode round trip).
 func (b *stubBackend) scriptAsk(at func(ms int, ev state.Event)) {
-	at(50, state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — question-hold stub online"})
+	at(50, state.Event{Kind: state.EvStatus, Text: "[theboringoffice] demo — question-hold stub online"})
 	at(150, state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
 		"summarize the flagged rows", false)})
 	at(200, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-1", "boss", "", true)})
@@ -490,7 +490,7 @@ func (b *stubBackend) scriptStream(at func(ms int, ev state.Event)) {
 			b.trace(line)
 		}
 	}
-	at(50, state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — chat-stream stub online"})
+	at(50, state.Event{Kind: state.EvStatus, Text: "[theboringoffice] demo — chat-stream stub online"})
 	at(150, state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
 		"tell me about honey", false)})
 	at(200, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-1", "boss", "", true)})
@@ -514,7 +514,7 @@ func (b *stubBackend) scriptStream(at func(ms int, ev state.Event)) {
 // ONE composed [BATCH DISPATCH] send — the batch-dispatch contract is
 // unchanged, only the roadblock fills the queue now.
 func (b *stubBackend) scriptBatch(at func(ms int, ev state.Event)) {
-	at(50, state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — backlog-batch stub online"})
+	at(50, state.Event{Kind: state.EvStatus, Text: "[theboringoffice] demo — backlog-batch stub online"})
 	at(150, state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
 		"start the standup notes", false)})
 	at(200, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-1", "boss", "", true)})
@@ -538,7 +538,7 @@ func (b *stubBackend) scriptFree(at func(ms int, ev state.Event)) {
 			b.trace(line)
 		}
 	}
-	at(50, state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — free-queuing stub online"})
+	at(50, state.Event{Kind: state.EvStatus, Text: "[theboringoffice] demo — free-queuing stub online"})
 	at(150, state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
 		"start the standup notes", false)})
 	at(200, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-1", "boss", "", true)})
@@ -671,8 +671,12 @@ func (b *stubBackend) AnswerPermission(permissionID, response string) error {
 // AnswerQuestion records the reply (capture proof for --ask-*) and plays
 // the resumed server: the matching "resolved" event a beat later, then a
 // COMPLETED boss reply — the contract leg that unblocks the parked queue.
-func (b *stubBackend) AnswerQuestion(requestID string, answers []string) error {
-	line := fmt.Sprintf("AnswerQuestion(%s, [%s])", requestID, strings.Join(answers, ", "))
+func (b *stubBackend) AnswerQuestion(requestID string, answers [][]string) error {
+	pages := make([]string, len(answers))
+	for i, a := range answers {
+		pages[i] = strings.Join(a, ", ")
+	}
+	line := fmt.Sprintf("AnswerQuestion(%s, [%s])", requestID, strings.Join(pages, "; "))
 	b.answerLog = append(b.answerLog, line)
 	if b.trace != nil {
 		b.trace("[ask] " + line)
@@ -717,6 +721,21 @@ func (b *stubBackend) RejectQuestion(requestID string) error {
 }
 
 func (b *stubBackend) Stop() error { return nil }
+
+// MCPServers serves a tiny static fixture so the /mcp slash command has
+// something to render in shots; ReconnectMCP records the call like the
+// other capture proofs.
+func (b *stubBackend) MCPServers() ([]state.MCPServer, error) {
+	return []state.MCPServer{
+		{Name: "local-memory", Status: "connected", Detail: "12 tools"},
+		{Name: "postgres", Status: "failed", Detail: "connection refused"},
+	}, nil
+}
+
+func (b *stubBackend) ReconnectMCP(name string) error {
+	b.answerLog = append(b.answerLog, "ReconnectMCP("+name+")")
+	return nil
+}
 
 // AbortSessions is the /stop seam (the parallel backend contract: abort
 // the primary session AND every live child session). The stub only records
@@ -1212,7 +1231,7 @@ func runStopProof() error {
 		}
 	}
 
-	d.send(state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — stop stub online"})
+	d.send(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] demo — stop stub online"})
 	d.send(state.Event{Kind: state.EvHire, Employee: state.Employee{
 		ID: "dev-1", Name: "tekton-1", Role: state.RoleDeveloper, Sprite: state.SpriteAtDesk}})
 	d.send(state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
@@ -1269,13 +1288,13 @@ func runStopProof() error {
 		return fail("expected exactly 1 AbortSessions call, got %d", len(stub.abortLog))
 	}
 	for _, want := range []string{
-		"stopped by user",             // (a) the staged boss-2 placeholder collapsed
-		"SSE stream",                  // (b) the streamed text survived…
-		"(stopped)",                   // …with the appendix
+		"stopped by user",                     // (a) the staged boss-2 placeholder collapsed
+		"SSE stream",                          // (b) the streamed text survived…
+		"(stopped)",                           // …with the appendix
 		"[tool] write · handler.go ✗ aborted", // (c) boss inline tool swung
-		"tekton-1 · Wire the SSE stream (· 2 tool calls ✗ stopped)", // (d) thread collapsed stopped
-		"stopped current work — queue intact", // (e) statusband notice (the "(N items)" tail can clip under the bar's right segments)
-		"q1", // the client queue badge survived
+		"Developer Task — Wire the SSE stream (· 2 tool calls ✗ stopped)", // (d) thread collapsed stopped
+		"stopped current work — queue intact",                             // (e) statusband notice (the "(N items)" tail can clip under the bar's right segments)
+		"q1",                                                              // the client queue badge survived
 	} {
 		if !strings.Contains(frameA, want) {
 			return fail("stop A: frame missing %q", want)
@@ -1386,7 +1405,7 @@ func runConciergeProof() error {
 	}
 
 	// setup: the boss is BUSY mid-turn (send + pending placeholder staged)
-	d.send(state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — concierge stub online"})
+	d.send(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] demo — concierge stub online"})
 	d.send(state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user", "plan the api", false)})
 	d.send(state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-1", "boss", "", true)})
 
@@ -1589,7 +1608,7 @@ func runManualLoop(cfg *config.Config, b *stubBackend, tab string, dur time.Dura
 // window, so the busy placeholder ("jorge is typing…") and the slash
 // notices share the final frame.
 func (b *stubBackend) scriptPowerDemo(at func(ms int, ev state.Event)) {
-	at(50, state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — power-governor stub online"})
+	at(50, state.Event{Kind: state.EvStatus, Text: "[theboringoffice] demo — power-governor stub online"})
 	at(150, state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
 		"ship the power governor", false)})
 	at(200, state.Event{Kind: state.EvChatBoss, Msg: chatMsg("boss-1", "boss", "", true)})
@@ -1653,17 +1672,17 @@ type powerWindow struct {
 }
 
 func runPowerProof(mode string) error {
-	// brain.json write-through lands in a scratch GRAFEIO_HOME — the user's
+	// brain.json write-through lands in a scratch THEBORINGOFFICE_HOME — the user's
 	// real config is never touched by shots.
-	home, err := os.MkdirTemp("", "grafeio-power")
+	home, err := os.MkdirTemp("", "theboringoffice-power")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(home)
-	if err := os.Setenv("GRAFEIO_HOME", home); err != nil {
+	if err := os.Setenv("THEBORINGOFFICE_HOME", home); err != nil {
 		return err
 	}
-	fmt.Printf("--- scratch GRAFEIO_HOME: %s ---\n", home)
+	fmt.Printf("--- scratch THEBORINGOFFICE_HOME: %s ---\n", home)
 
 	var modes []config.PowerMode
 	switch config.PowerMode(mode) {
@@ -2087,7 +2106,7 @@ func runLayoutProof() error {
 
 // --- terminal-tab proof (--terminal) ----------------------------------------
 // The stub TermPanel (uisshot ONLY) wires through app.SpawnTerminal — the
-// production wiring point where cmd/grafeio will plug panels.NewTerminal.
+// production wiring point where cmd/theboringoffice will plug panels.NewTerminal.
 
 func runTerminalShot() (app.Model, *terminalPanelStub, int, error) {
 	var zero app.Model
@@ -2160,7 +2179,7 @@ func runTerminalProof() error {
 	if stub.closed {
 		return fail("stub already closed before CloseTerminal — quit hook ran early")
 	}
-	// quit hook: cmd/grafeio calls CloseTerminal after p.Run returns (the
+	// quit hook: cmd/theboringoffice calls CloseTerminal after p.Run returns (the
 	// runtime intercepts tea.QuitMsg before Update, so p.Quit() never
 	// reached handleKey here — the explicit close is the leak guard)
 	fm.CloseTerminal()
@@ -2319,7 +2338,7 @@ func assertTypingRowBelowDivider(tag, frame, needle string) error {
 func runFocusProof() error {
 	fail := func(format string, args ...any) error { return fmt.Errorf(format, args...) }
 	d := newFocusDriver()
-	d.send(state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — focus stub online"})
+	d.send(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] demo — focus stub online"})
 	d.send(state.Event{Kind: state.EvHire, Employee: state.Employee{
 		ID: "dev-1", Name: "tekton-1", Role: state.RoleDeveloper, Sprite: state.SpriteAtDesk}})
 	d.send(state.Event{Kind: state.EvHire, Employee: state.Employee{
@@ -2406,22 +2425,27 @@ func runFocusProof() error {
 	if err := assertChatLayout("focus B", frameB); err != nil {
 		return err
 	}
-	// asserts — frame C
+	// asserts — frame C (both threads COLLAPSED, the default: head + ↳
+	// sneak; the merged tool rows themselves sit under ctrl+g)
+	strippedC := ansi.Strip(frameC)
 	for _, want := range []string{
-		"┌ tekton-1 · Wire the SSE stream",           // per-agent thread header (task from dispatch)
-		"┌ skopos-1 · Scan the repo",                 // second agent, newer at the bottom
-		"│ [tool] read · internal/room/manager.go ✓", // merged running→done, one row
-		"│ [tool] grep · SSE, 12 hits ✓",
-		"[tool] write · static/sse.html ✓", // boss's own tool stays INLINE (no thread)
-		"delegating · 2 busy",              // settled placeholder text (no spinner)
-		"[delegat]",                        // floor nameplate
-		"reconnect backoff",                // round-2 user turn survived the storm
+		"Developer Task — Wire the SSE stream", // per-agent thread head (task from dispatch)
+		"Explore Task — Scan the repo",         // second agent, newer at the bottom
+		"↳ Edit internal/room/handler.go",      // tekton-1 sneak: newest merged call (bare, opencode form)
+		"↳ Read internal/api/room.go",          // skopos-1 sneak: newest merged call
+		"[tool] write · static/sse.html ✓",     // boss's own tool stays INLINE (no thread)
+		"delegating · 2 busy",                  // settled placeholder text (no spinner)
+		"[delegat]",                            // floor nameplate
+		"reconnect backoff",                    // round-2 user turn survived the storm
 	} {
-		if !strings.Contains(frameC, want) {
+		if !strings.Contains(strippedC, want) {
 			return fail("focus C: frame missing %q", want)
 		}
 	}
-	if strings.Contains(frameC, "│ [tool] write") {
+	// thread tool rows are 2-space indented under their header and shaped
+	// "<Verb> <rest>"; an indented shaped row carrying the BOSS's write
+	// target would prove the boss line got captured into a worker thread.
+	if strings.Contains(strippedC, "  [tool] Write static/sse.html") {
 		return fail("focus C: boss tool line was captured into a worker thread (must stay inline)")
 	}
 	// the delegating row rides the SAME below-divider slot as the typing
@@ -2432,50 +2456,51 @@ func runFocusProof() error {
 	if err := assertChatLayout("focus C", frameC); err != nil {
 		return err
 	}
-	// collapse leg: tekton-1 returns (sprite leaves the busy set) → its
-	// thread AUTO-COLLAPSES to the one-line summary; ctrl+g expands ALL
-	// completed threads again.
+	// settle leg: tekton-1 returns (sprite leaves the busy set) → its head
+	// swaps to the dim ✓ glyph with the "(· N tool calls ✓ done)" rollup;
+	// skopos-1, still working, keeps the animated braille glyph. ctrl+g
+	// expands ALL threads: the merged tool rows reappear.
 	d.send(state.Event{Kind: state.EvReturned, EmployeeID: "dev-1", TaskID: "t1",
 		Mail: mail("m1", "tekton-1", "boss", "return: sse stream", "stream is live.", state.MailReturn)})
 	d.pump(1)
-	frameCollapse := d.m.Frame()
-	if !strings.Contains(frameCollapse, "tekton-1 · Wire the SSE stream (· 2 tool calls ✓ done)") {
-		return fail("focus collapse: missing auto-collapsed thread summary for tekton-1")
+	strippedCollapse := ansi.Strip(d.m.Frame())
+	if !strings.Contains(strippedCollapse, "✓ Developer Task — Wire the SSE stream (· 2 tool calls ✓ done)") {
+		return fail("focus settle: missing settled ✓ thread head for tekton-1")
 	}
-	if strings.Contains(frameCollapse, "┌ tekton-1") {
-		return fail("focus collapse: tekton-1 thread still expanded after EvReturned")
+	if !strings.Contains(strippedCollapse, "Explore Task — Scan the repo") {
+		return fail("focus settle: skopos-1's thread went missing — only the RETURNED agent settles")
 	}
-	if !strings.Contains(frameCollapse, "┌ skopos-1") {
-		return fail("focus collapse: skopos-1 thread collapsed too — only the RETURNED agent should collapse")
+	if strings.Contains(strippedCollapse, "✓ Explore Task — Scan the repo") {
+		return fail("focus settle: skopos-1 settled too — only the RETURNED agent's head swaps to the ✓ glyph")
 	}
 	d.send(tea.KeyPressMsg(tea.Key{Code: 'g', Mod: tea.ModCtrl}))
-	frameExpanded := d.m.Frame()
-	if !strings.Contains(frameExpanded, "┌ tekton-1 · Wire the SSE stream") ||
-		!strings.Contains(frameExpanded, "│ [tool] read · internal/room/manager.go ✓") {
+	strippedExpanded := ansi.Strip(d.m.Frame())
+	if !strings.Contains(strippedExpanded, "Developer Task — Wire the SSE stream") ||
+		!strings.Contains(strippedExpanded, "  [tool] Read internal/room/manager.go ✓") {
 		return fail("focus expand: ctrl+g did not re-expand the completed thread")
 	}
-	fmt.Println("asserts: OK — no caret in any state; typing row sits below the divider (above the input) for the WHOLE pending period; delegating row swaps into the same slot; every chat row inside the divider's width budget; worker threads grouped + CallID-merged, boss tool inline, [delegat] nameplate, EvReturned auto-collapses, ctrl+g re-expands completed threads")
+	fmt.Println("asserts: OK — no caret in any state; typing row sits below the divider (above the input) for the WHOLE pending period; delegating row swaps into the same slot; every chat row inside the divider's width budget; worker threads grouped (collapsed heads + ↳ sneaks) + CallID-merged, boss tool inline, [delegat] nameplate, EvReturned settles the head to the ✓ glyph, ctrl+g re-expands the merged rows")
 	return nil
 }
 
 // runPersistDemoSkipProof (--persist) — the office-session DEMO regression:
 // restore + persist are LIVE-only by ruling (demo restore = confusing).
-// Seeds a FRESH session.json for cwd in a scratch GRAFEIO_HOME (so the
+// Seeds a FRESH session.json for cwd in a scratch THEBORINGOFFICE_HOME (so the
 // "skip" cannot be a missing-file false pass), runs the standard scripted
 // demo shot, then asserts: (1) LoadSession DOES find the seeded file
 // (the gate is the mode check, not the file lookup), (2) NO "restored
 // office session" notice ever surfaces in the office state chat, (3) the
 // demo boot never OVERWRITES the seeded file (SavedAt byte-identical).
 func runPersistDemoSkipProof() error {
-	home, err := os.MkdirTemp("", "grafeio-persist-demo-skip")
+	home, err := os.MkdirTemp("", "theboringoffice-persist-demo-skip")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(home)
-	if err := os.Setenv("GRAFEIO_HOME", home); err != nil {
+	if err := os.Setenv("THEBORINGOFFICE_HOME", home); err != nil {
 		return err
 	}
-	fmt.Printf("--- scratch GRAFEIO_HOME: %s ---\n", home)
+	fmt.Printf("--- scratch THEBORINGOFFICE_HOME: %s ---\n", home)
 
 	dir, err := os.Getwd()
 	if err != nil {
@@ -2701,7 +2726,7 @@ func runSlashPopProof() error {
 func runThreadsThinkProof() error {
 	fail := func(format string, args ...any) error { return fmt.Errorf(format, args...) }
 	d := newFocusDriver()
-	d.send(state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — threads-think stub online"})
+	d.send(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] demo — threads-think stub online"})
 	d.send(state.Event{Kind: state.EvHire, Employee: state.Employee{
 		ID: "dev-1", Name: "tekton-1", Role: state.RoleDeveloper, Sprite: state.SpriteAtDesk}})
 	d.send(state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
@@ -2724,41 +2749,46 @@ func runThreadsThinkProof() error {
 	d.send(state.Event{Kind: state.EvThought, EmployeeID: "dev-1", EmployeeName: "tekton-1", CallID: "tk-1",
 		Text: "scanning options\nchoosing approach\nwriting the patch", Done: true})
 	d.pump(4)
-	fmt.Println("===== UI SHOT · THINK A — live thread: employee thought merged per CallID as \"thinking · N lines\" =====")
+	fmt.Println("===== UI SHOT · THINK A — live thread COLLAPSED (the default): NO rollup while running; the count surfaces once settled =====")
 	frameA := d.m.Frame()
 	fmt.Println(frameA)
 	fmt.Println("===== UI SHOT =====")
+	strippedA := ansi.Strip(frameA)
 	for _, want := range []string{
-		"┌ tekton-1 · Wire the SSE stream",           // thread header
-		"│ [tool] read · internal/room/manager.go ✓", // tool row, unchanged
-		"│ thinking · 3 lines",                       // employee thought, one merged row
+		"Developer Task — Wire the SSE stream", // live thread head (RoleDeveloper → "Developer")
+		"↳ Edit internal/room/handler.go",      // sneak: the thread's NEWEST tool, opencode-shaped + bare
 	} {
-		if !strings.Contains(frameA, want) {
+		if !strings.Contains(strippedA, want) {
 			return fail("threads-think A: frame missing %q", want)
 		}
 	}
-	if !strings.Contains(ansi.Strip(frameA), "thinking · 2 lines") {
+	if strings.Contains(strippedA, "stream (· 2 tool calls") {
+		return fail("threads-think A: the LIVE head trailed the settled rollup — running heads carry NO rollup")
+	}
+	if !strings.Contains(strippedA, "thinking · 2 lines") {
 		return fail("threads-think A: boss thought missing its collapsed flow row (style-split raw text)")
 	}
-	if strings.Contains(ansi.Strip(frameA), "│ thinking · 2 lines") {
-		return fail("threads-think A: the BOSS's thought leaked into a worker thread")
+	if strings.Count(strippedA, "thinking ·") != 1 {
+		return fail("threads-think A: the BOSS's thought leaked into a worker thread (only the boss flow row may read \"thinking ·\" — the employee's think rolls up into the summary count)")
 	}
-	if strings.Contains(frameA, "writing the patch") {
-		return fail("threads-think A: live view must show the one-line count, not the body")
+	if strings.Contains(strippedA, "writing the patch") {
+		return fail("threads-think A: collapsed view must show the one-line count, not the body")
 	}
 
-	// EvReturned → collapsed summary KEEPS the think count
+	// EvReturned → the head settles to the dim ✓ glyph; the rollup KEEPS
+	// the think count
 	d.send(state.Event{Kind: state.EvReturned, EmployeeID: "dev-1", TaskID: "t1",
 		Mail: mail("m1", "tekton-1", "boss", "return: sse stream", "stream is live.", state.MailReturn)})
 	d.pump(1)
-	fmt.Println("===== UI SHOT · THINK B — collapsed thread: \"· 2 tool calls · 1 think ✓ done\" =====")
+	fmt.Println("===== UI SHOT · THINK B — settled thread: \"✓ … (· 2 tool calls · 1 think ✓ done)\" =====")
 	frameB := d.m.Frame()
 	fmt.Println(frameB)
 	fmt.Println("===== UI SHOT =====")
-	if !strings.Contains(frameB, "tekton-1 · Wire the SSE stream (· 2 tool calls · 1 think ✓ done)") {
+	strippedB := ansi.Strip(frameB)
+	if !strings.Contains(strippedB, "✓ Developer Task — Wire the SSE stream (· 2 tool calls · 1 think ✓ done)") {
 		return fail("threads-think B: collapsed summary with the think count missing")
 	}
-	if strings.Contains(frameB, "│ thinking") {
+	if strings.Contains(strippedB, "thinking · 3 lines") {
 		return fail("threads-think B: think row visible under a collapsed thread")
 	}
 
@@ -2768,23 +2798,113 @@ func runThreadsThinkProof() error {
 	frameC := d.m.Frame()
 	fmt.Println(frameC)
 	fmt.Println("===== UI SHOT =====")
+	strippedC := ansi.Strip(frameC)
 	for _, want := range []string{
-		"┌ tekton-1 · Wire the SSE stream",
-		"│ [tool] edit · internal/room/handler.go ✓",
-		"│ thinking",
-		"writing the patch", // body renders on full expand
+		"✓ Developer Task — Wire the SSE stream",   // expanded head: done glyph, no trailing rollup
+		"  [tool] Edit internal/room/handler.go ✓", // tool row, 2-cell indent under the head
+		"  thinking",                        // employee thought, expanded
+		"writing the patch",                 // body renders on full expand
+		"  · 2 tool calls · 1 think ✓ done", // bare closing summary line
 	} {
-		if !strings.Contains(frameC, want) {
+		if !strings.Contains(strippedC, want) {
 			return fail("threads-think C: frame missing %q", want)
 		}
 	}
 	// natural order: read row < think body < edit row (chat arrival order —
 	// the thought merged in place between the two tool calls)
-	if strings.Index(frameC, "│ [tool] read") > strings.Index(frameC, "writing the patch") ||
-		strings.Index(frameC, "writing the patch") > strings.Index(frameC, "│ [tool] edit") {
+	if strings.Index(strippedC, "[tool] Read") > strings.Index(strippedC, "writing the patch") ||
+		strings.Index(strippedC, "writing the patch") > strings.Index(strippedC, "[tool] Edit") {
 		return fail("threads-think C: think body must sit in natural chat order (between the read and edit rows)")
 	}
-	fmt.Println("asserts: OK — employee EvThought merges per CallID into the agent's thread (live one-liner), collapsed summary keeps the count, ctrl+g expands tools + thoughts in natural order, boss path byte-identical")
+	fmt.Println("asserts: OK — employee EvThought merges per CallID into the agent's thread (collapsed rollup keeps the \"· 1 think\" count), ctrl+g expands tools + thoughts in natural order, boss path byte-identical")
+	return nil
+}
+
+// --- opencode-style thread rendering (--threads) ------------------------------
+// ONE chat frame carrying BOTH thread states of the opencode-style worker
+// renderer (internal/panels/threads_opencode.go): skopos-1's scout thread
+// LIVE (animated braille glyph — the roster sprite is still working and the
+// group's freshest wtool meta-tick sits inside the staleness horizon — with
+// NO rollup while running, the BARE ↳ sneak at the newest merged tool call,
+// and the live-only "ctrl+g · view subagents" hint row trailing the last
+// thread block) beside tekton-1's COMPLETED thread (dim "✓" glyph after
+// EvReturned fed the same timeline, "(· N tool calls ✓ done)" rollup).
+// Every chat message is REDUCER-SHAPED: focusTool events flow through the
+// REAL app reducer, which stamps Kind "wtool", Text "<verb> · <summary>"
+// ("read · internal/panels/chat.go") and Meta "<state>␟<tick>" exactly like
+// production — and the DISPLAY layer (shapeToolText) alone turns that into
+// opencode's "<Verb> <rest>" form ("Read internal/panels/chat.go"). The
+// fixture is never pre-shaped into the target text.
+
+func runThreadsProof() error {
+	fail := func(format string, args ...any) error { return fmt.Errorf(format, args...) }
+	d := newFocusDriver()
+	d.send(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] demo — threads stub online"})
+	d.send(state.Event{Kind: state.EvHire, Employee: state.Employee{
+		ID: "dev-1", Name: "tekton-1", Role: state.RoleDeveloper, Sprite: state.SpriteAtDesk}})
+	d.send(state.Event{Kind: state.EvHire, Employee: state.Employee{
+		ID: "sco-1", Name: "skopos-1", Role: state.RoleScout, Sprite: state.SpriteAtDesk}})
+	d.send(state.Event{Kind: state.EvChatUser, Msg: chatMsg("u1", "user",
+		"scout the question kinds, then patch the chat panel", false)})
+	d.send(state.Event{Kind: state.EvChatBoss, Msg: chatMsg("bossmsg-m1", "boss",
+		"Delegating — skopos-1 recons first; tekton-1 already wired the patch.", false)})
+
+	// tekton-1's COMPLETED thread: dispatch → two tools (each running →
+	// done merged per CallID) → EvReturned settles the roster sprite.
+	d.send(state.Event{Kind: state.EvDispatch, EmployeeID: "dev-1",
+		Task: state.BoardTask{ID: "t1", Title: "Patch the chat panel", At: time.Now().UnixMilli()}})
+	d.send(state.Event{Kind: state.EvWorking, EmployeeID: "dev-1", TaskID: "t1"})
+	d.send(focusTool("dev-1", "tekton-1", "call-t1", "read", "internal/panels/chat.go", "running"))
+	d.send(focusTool("dev-1", "tekton-1", "call-t1", "read", "internal/panels/chat.go", "done"))
+	d.send(focusTool("dev-1", "tekton-1", "call-t2", "edit", "internal/panels/chat.go", "running"))
+	d.send(focusTool("dev-1", "tekton-1", "call-t2", "edit", "internal/panels/chat.go", "done"))
+	d.send(state.Event{Kind: state.EvReturned, EmployeeID: "dev-1", TaskID: "t1",
+		Mail: mail("m1", "tekton-1", "boss", "return: chat panel", "the patch is in.", state.MailReturn)})
+
+	// skopos-1's LIVE thread: dispatched + still at the desk — the newest
+	// tool call never resolves before the frame, so the braille glyph
+	// carries the running state (the sneak itself stays BARE).
+	d.send(state.Event{Kind: state.EvDispatch, EmployeeID: "sco-1",
+		Task: state.BoardTask{ID: "t2", Title: "Scout question kinds recon", At: time.Now().UnixMilli()}})
+	d.send(state.Event{Kind: state.EvWorking, EmployeeID: "sco-1", TaskID: "t2"})
+	d.send(focusTool("sco-1", "skopos-1", "call-s1", "list", "internal/panels", "done"))
+	d.send(focusTool("sco-1", "skopos-1", "call-s2", "read", "internal/panels/chat.go", "running"))
+	d.pump(4) // tick 4 — inside the staleness horizon: skopos-1 stays LIVE
+	fmt.Println("===== UI SHOT · THREADS — one LIVE thread (animated braille glyph, NO rollup while running, bare ↳ sneak) beside one COMPLETED thread (dim ✓ glyph, ✓ done rollup) =====")
+	frame := d.m.Frame()
+	fmt.Println(frame)
+	fmt.Println("===== UI SHOT =====")
+
+	stripped := ansi.Strip(frame)
+	for _, want := range []string{
+		"Explore Task — Scout question kinds recon",                       // scout head: RoleScout → "Explore"
+		"✓ Developer Task — Patch the chat panel (· 2 tool calls ✓ done)", // settled head: dim ✓ + rollup
+		"↳ Edit internal/panels/chat.go",                                  // done sneak: newest merged tool, opencode-shaped, bare
+		"↳ Read internal/panels/chat.go",                                  // live sneak: newest call, opencode-shaped, bare
+		"ctrl+g · view subagents",                                         // hint row trails the last thread block (≥1 live)
+	} {
+		if !strings.Contains(stripped, want) {
+			return fail("threads: frame missing %q", want)
+		}
+	}
+	// the live head carries the running state in its animated braille
+	// glyph ALONE: NEVER the done "✓", and NEVER a trailing rollup
+	if strings.Contains(stripped, "✓ Explore Task") {
+		return fail("threads: the LIVE scout thread drew the done ✓ glyph")
+	}
+	if strings.Contains(stripped, "recon (· 2 tool calls") {
+		return fail("threads: the LIVE scout head trailed the settled rollup — running heads carry NO rollup")
+	}
+	// no relics from the retired bordered-card renderer may survive
+	for _, banned := range []string{"┌ tekton-1", "┌ skopos-1", "│ [tool]"} {
+		if strings.Contains(stripped, banned) {
+			return fail("threads: retired bordered-card relic %q in the frame", banned)
+		}
+	}
+	if err := assertChatLayout("threads", frame); err != nil {
+		return err
+	}
+	fmt.Println("asserts: OK — ONE frame carries both thread states: LIVE scout (animated braille glyph, \"Explore Task\" title, NO rollup while running, bare ↳ sneak, ctrl+g hint row) beside COMPLETED developer (dim ✓ glyph, \"✓ done\" rollup, bare ↳ sneak) — every row reducer-shaped in data (Kind wtool, \"<verb> · <summary>\" text), opencode \"<Verb> <rest>\" form applied by the display layer, no pre-shaped fixture text, no bordered-card relics, every chat row inside the divider budget")
 	return nil
 }
 
@@ -2802,7 +2922,7 @@ const clickPairGap = 400 * time.Millisecond
 func runClickProof() error {
 	fail := func(format string, args ...any) error { return fmt.Errorf(format, args...) }
 	d := newFocusDriver()
-	d.send(state.Event{Kind: state.EvStatus, Text: "[grafeio] demo — click stub online"})
+	d.send(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] demo — click stub online"})
 	d.send(state.Event{Kind: state.EvHire, Employee: state.Employee{
 		ID: "dev-1", Name: "tekton-1", Role: state.RoleDeveloper, Sprite: state.SpriteAtDesk}})
 	d.send(state.Event{Kind: state.EvHire, Employee: state.Employee{
@@ -2873,7 +2993,7 @@ func runClickProof() error {
 	d.send(state.Event{Kind: state.EvReturned, EmployeeID: "dev-1", TaskID: "t1",
 		Mail: mail("m1", "tekton-1", "boss", "return: sse stream", "stream is live.", state.MailReturn)})
 	d.pump(1)
-	if !strings.Contains(d.m.Frame(), "tekton-1 · Wire the SSE stream (· 2 tool calls ✓ done)") {
+	if !strings.Contains(d.m.Frame(), "Developer Task — Wire the SSE stream (· 2 tool calls ✓ done)") {
 		return fail("click D setup: tekton-1 thread did not collapse after EvReturned")
 	}
 	time.Sleep(clickPairGap + 100*time.Millisecond) // out of the double-click window
@@ -2885,22 +3005,22 @@ func runClickProof() error {
 	frameD := d.m.Frame()
 	fmt.Println(frameD)
 	fmt.Println("===== UI SHOT =====")
-	if !strings.Contains(frameD, "┌ tekton-1 · Wire the SSE stream") {
-		return fail("click D: double-click did not re-expand tekton-1's thread (chat should show the ┌ header)")
+	if !strings.Contains(frameD, "Developer Task — Wire the SSE stream") {
+		return fail("click D: double-click did not re-expand tekton-1's thread (chat should show its header line)")
 	}
-	if !strings.Contains(frameD, "│ [tool] read · internal/room/manager.go ✓") {
+	if !strings.Contains(frameD, "  [tool] Read internal/room/manager.go ✓") {
 		return fail("click D: expanded thread missing its tool rows")
 	}
 	if d.m.ActiveTabIndex() != 0 {
 		return fail("click D: double-click must jump to the chat tab")
 	}
 
-	// (H) click the skopos-1 "┌" header row in chat → its thread collapses
+	// (H) click the skopos-1 header row in chat → its thread collapses
 	// (find the header's actual screen row in the rendered frame)
 	_, _, _, floorW := d.m.LayoutInfo()
 	headerY := -1
 	for i, ln := range strings.Split(frameD, "\n") {
-		if strings.Contains(ln, "┌ skopos-1") {
+		if strings.Contains(ln, "Explore Task — Scan the repo") {
 			headerY = i
 			break
 		}
@@ -2909,32 +3029,35 @@ func runClickProof() error {
 		return fail("click H setup: skopos-1 header row not found in the frame")
 	}
 	d.send(tea.MouseClickMsg(tea.Mouse{X: floorW + 5, Y: headerY, Button: tea.MouseLeft}))
-	fmt.Println("===== UI SHOT · CLICK H — chat click on the skopos-1 ┌ header: its thread collapses =====")
+	fmt.Println("===== UI SHOT · CLICK H — chat click on the skopos-1 header: its thread collapses =====")
 	frameH := d.m.Frame()
 	fmt.Println(frameH)
 	fmt.Println("===== UI SHOT =====")
-	if !strings.Contains(frameH, "skopos-1 · Scan the repo (· 2 tool calls ✓ done)") {
-		return fail("click H: header click did not collapse skopos-1's thread")
+	// threads collapse by default (live too), so the header click EXPANDS —
+	// the toggle round-trips back to collapsed on the next click.
+	if !strings.Contains(frameH, "  [tool] Grep SSE, 12 hits ✓") {
+		return fail("click H: header click did not expand skopos-1's collapsed thread")
 	}
-	if strings.Contains(frameH, "│ [tool] grep · SSE, 12 hits ✓") {
-		return fail("click H: tool rows still expanded after the header click")
-	}
-	// click the collapsed SUMMARY row → re-expands (the toggle round-trips;
-	// the summary is the thread's header while collapsed)
-	summaryY := -1
+	headerY2 := -1
 	for i, ln := range strings.Split(frameH, "\n") {
-		if strings.Contains(ln, "skopos-1 · Scan the repo (· 2 tool calls ✓ done)") {
-			summaryY = i
+		if strings.Contains(ln, "Explore Task — Scan the repo") {
+			headerY2 = i
 			break
 		}
 	}
-	if summaryY < 0 {
-		return fail("click H: collapsed summary row not found in the frame")
+	if headerY2 < 0 {
+		return fail("click H: expanded header row not found in the frame")
 	}
-	d.send(tea.MouseClickMsg(tea.Mouse{X: floorW + 5, Y: summaryY, Button: tea.MouseLeft}))
+	d.send(tea.MouseClickMsg(tea.Mouse{X: floorW + 5, Y: headerY2, Button: tea.MouseLeft}))
 	frameH2 := d.m.Frame()
-	if !strings.Contains(frameH2, "┌ skopos-1 · Scan the repo") {
-		return fail("click H: clicking the collapsed summary did not re-expand skopos-1's thread")
+	// skopos-1 is still LIVE here, so its re-collapsed header carries NO
+	// rollup (only settled threads trail "(· N tool calls ✓ done)") — the
+	// collapse proof is header still present + tool rows gone.
+	if !strings.Contains(frameH2, "Explore Task — Scan the repo") {
+		return fail("click H: second header click did not re-collapse skopos-1's thread")
+	}
+	if strings.Contains(frameH2, "  [tool] Grep SSE, 12 hits ✓") {
+		return fail("click H: tool rows still expanded after the second header click")
 	}
 	fmt.Println("asserts: OK — floor click selects (activity tab + ▸ marker + office notice), double-click toggles the thread + jumps to chat, thread-header clicks toggle round-trip, chrome rows ignore clicks")
 	return nil
@@ -2960,9 +3083,10 @@ func main() {
 	layout := flag.Bool("layout", false, "layout-modes proof: three frames over the same window — NORMAL (sidebar 44), compact (sidebar 30, short tab labels, 2-row chat input, compressed topbar), wide 56 — with computed width asserts per frame")
 	terminal := flag.Bool("terminal", false, "terminal-tab proof: the stub TermPanel wires through app.SpawnTerminal — lazy-spawn on first visit, keys routed into the shell surface, frame + asserts")
 	focus := flag.Bool("focus", false, "fix-wave proof, THREE synchronous-tick frames: (a) empty pending bubble — typing row below the divider (above the input), NO caret anywhere; (b) streaming partial bubble — text grows in the viewport while the typing row STAYS below the divider for the whole pending period (still no caret); (c) two concurrent agents — per-agent work threads grouped (headers + merged rows), boss tool line still inline, boss idle at the placeholder in delegating state (dim row in the same below-divider slot, [delegat] nameplate). Every frame: no \"▌\", every chat row inside the divider's width budget")
-	persist := flag.Bool("persist", false, "office-session DEMO regression: seed a fresh session.json for cwd in a scratch GRAFEIO_HOME, run the standard demo shot, assert NO restore notice surfaces and the file is untouched (restore is live-only) — prints PERSIST-DEMO-SKIP: OK|FAIL")
+	persist := flag.Bool("persist", false, "office-session DEMO regression: seed a fresh session.json for cwd in a scratch THEBORINGOFFICE_HOME, run the standard demo shot, assert NO restore notice surfaces and the file is untouched (restore is live-only) — prints PERSIST-DEMO-SKIP: OK|FAIL")
 	slashpop := flag.Bool("slashpop", false, "slash-popover proof: type \"/th\" → filtered menu (/theme /themes /thinking), Enter pre-fills \"/theme \" → theme picker, arrows preview LIVE (two states printed), esc cancels back, Enter commits + persists via the plain slash path")
-	threadsThink := flag.Bool("threads-think", false, "employee-thinking-in-threads proof: tekton-1 EvThought merges per CallID into its work thread (live \"thinking · N lines\" row), collapsed summary keeps the count (\"· 1 think\"), ctrl+g expands tools + thoughts — boss path byte-identical")
+	threadsThink := flag.Bool("threads-think", false, "employee-thinking-in-threads proof: tekton-1 EvThought merges per CallID into its work thread (collapsed rollup keeps the \"· 1 think\" count), ctrl+g expands tools + thoughts in natural order — boss path byte-identical")
+	threads := flag.Bool("threads", false, "thread-render fixture (opencode renderer): ONE chat frame with BOTH thread states — a LIVE collapsed thread (animated braille glyph, NO rollup while running, bare ↳ sneak, live-only ctrl+g hint row) beside a COMPLETED collapsed thread (dim ✓ glyph, \"✓ done\" rollup) — every message reducer-shaped (Kind wtool, \"<verb> · <summary>\" text, \"<state>␟<tick>\" meta stamped by the REAL app reducer; the display layer shapes it to \"<Verb> <rest>\")")
 	click := flag.Bool("click", false, "mouse proof: scripted clicks — floor sprite click selects the agent (activity tab + ▸ marker + office notice), double-click toggles its thread + jumps to chat, chat thread-header/summary clicks toggle round-trip, chrome rows ignore clicks")
 	stop := flag.Bool("stop", false, "/stop proof (synchronous): boss mid-stream with tools running + a staged second placeholder + a roadblock-queued item + delegating state; typing /stop must hit stub.AbortSessions and unwind in ONE frame — \"stopped by user\" placeholders, \" (stopped)\" stream appendix, tools ✗ aborted, thread ✗ stopped, BossThinking/Delegating cleared, queue intact; a /queue leg proves the item survived unsent")
 	freesend := flag.Bool("freesend", false, "free-queuing proof: boss busy 200–3000ms; two prompts sent DURING the window must hit backend.Send IMMEDIATELY (both ([stub] Send lines precede the turn-completed marker in the ordering trace) — frame 1 (t=2.2s) shows \"busy · 2 queued (server)\" + the \"turn 2 · your message rides next\" placeholder; frame 2 (t=3.6s) shows the drained FIFO pins + restored status line")
@@ -3092,6 +3216,14 @@ func main() {
 
 	if *threadsThink {
 		if err := runThreadsThinkProof(); err != nil {
+			fmt.Fprintf(os.Stderr, "uishot: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *threads {
+		if err := runThreadsProof(); err != nil {
 			fmt.Fprintf(os.Stderr, "uishot: %v\n", err)
 			os.Exit(1)
 		}

@@ -1,5 +1,5 @@
 // charter.go — bundles the oikonomos manager charter into whatever
-// directory grafeio's live backend serves. On Start (live only) it:
+// directory theboringoffice's live backend serves. On Start (live only) it:
 //
 //  1. writes the embedded charter text (internal/charter) byte-exact to
 //     <dir>/.opencode/oikonomos.md, and
@@ -14,7 +14,8 @@
 //
 // Hard guarantees: AGENTS.md / CLAUDE.md and every other opencode.json
 // field are never touched; a second run is byte-identical (changed=false,
-// "already wired"); GRAFEIO_NO_AUTOCHARTER=1 skips the whole pass. A fresh
+// "already wired"); THEBORINGOFFICE_NO_AUTOCHARTER=1 (pre-rename:
+// GRAFEIO_NO_AUTOCHARTER=1) skips the whole pass. A fresh
 // charter or a newly-added instructions entry reports changed=true so a
 // serve started earlier can be found stale and respawned (opencode spoils
 // its config at start — a running serve may not pick up a config it
@@ -28,8 +29,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/theboringhumane/grafeio/internal/charter"
-	"github.com/theboringhumane/grafeio/internal/state"
+	"github.com/theboringhumane/theboringoffice/internal/charter"
+	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
 // charterRelPath is the instructions entry as it appears in
@@ -53,11 +54,12 @@ var charterAcceptedPaths = []string{
 // written (callers that already spawned a serve should restart it; see the
 // header comment). notes are status-line text describing what happened.
 // The pass is idempotent: a follow-up run with everything already in place
-// returns changed=false and writes nothing. GRAFEIO_NO_AUTOCHARTER=1 opts
-// out entirely (changed=false, note explaining).
+// returns changed=false and writes nothing. THEBORINGOFFICE_NO_AUTOCHARTER=1
+// opts out entirely (changed=false, note explaining); the pre-rename
+// GRAFEIO_NO_AUTOCHARTER=1 is honored as a fallback.
 func EnsureCharter(dir string) (changed bool, notes []string) {
-	if os.Getenv("GRAFEIO_NO_AUTOCHARTER") == "1" {
-		return false, []string{"[grafeio] manager charter: disabled (GRAFEIO_NO_AUTOCHARTER)"}
+	if envOrLegacy("THEBORINGOFFICE_NO_AUTOCHARTER", "GRAFEIO_NO_AUTOCHARTER") == "1" {
+		return false, []string{"[theboringoffice] manager charter: disabled (THEBORINGOFFICE_NO_AUTOCHARTER)"}
 	}
 
 	ocDir := filepath.Join(dir, ".opencode")
@@ -68,10 +70,10 @@ func EnsureCharter(dir string) (changed bool, notes []string) {
 	want := []byte(charter.Text)
 	if got, err := os.ReadFile(chartPath); err != nil || !bytes.Equal(got, want) {
 		if err := os.MkdirAll(ocDir, 0o755); err != nil {
-			return changed, append(notes, "[grafeio] manager charter: failed (mkdir "+ocDir+": "+err.Error()+")")
+			return changed, append(notes, "[theboringoffice] manager charter: failed (mkdir "+ocDir+": "+err.Error()+")")
 		}
 		if err := os.WriteFile(chartPath, want, 0o644); err != nil {
-			return changed, append(notes, "[grafeio] manager charter: failed (write "+chartPath+": "+err.Error()+")")
+			return changed, append(notes, "[theboringoffice] manager charter: failed (write "+chartPath+": "+err.Error()+")")
 		}
 		changed = true
 	}
@@ -84,28 +86,28 @@ func EnsureCharter(dir string) (changed bool, notes []string) {
 	if err == nil {
 		merged, mergeChanged, mergeErr := mergeInstructions(cfgRaw)
 		if mergeErr != nil {
-			return changed, append(notes, "[grafeio] manager charter: failed (merge "+cfgPath+": "+mergeErr.Error()+")")
+			return changed, append(notes, "[theboringoffice] manager charter: failed (merge "+cfgPath+": "+mergeErr.Error()+")")
 		}
 		if mergeChanged {
 			if err := os.WriteFile(cfgPath, merged, 0o644); err != nil {
-				return changed, append(notes, "[grafeio] manager charter: failed (write "+cfgPath+": "+err.Error()+")")
+				return changed, append(notes, "[theboringoffice] manager charter: failed (write "+cfgPath+": "+err.Error()+")")
 			}
 			changed = true
 		}
 	} else if os.IsNotExist(err) {
 		fresh := []byte("{\n  \"$schema\": \"https://opencode.ai/config.json\",\n  \"instructions\": [\n    \"" + charterRelPath + "\"\n  ]\n}\n")
 		if err := os.WriteFile(cfgPath, fresh, 0o644); err != nil {
-			return changed, append(notes, "[grafeio] manager charter: failed (write "+cfgPath+": "+err.Error()+")")
+			return changed, append(notes, "[theboringoffice] manager charter: failed (write "+cfgPath+": "+err.Error()+")")
 		}
 		changed = true
 	} else {
-		return changed, append(notes, "[grafeio] manager charter: failed (read "+cfgPath+": "+err.Error()+")")
+		return changed, append(notes, "[theboringoffice] manager charter: failed (read "+cfgPath+": "+err.Error()+")")
 	}
 
 	if changed {
-		return true, append(notes, "[grafeio] manager charter: wired (.opencode/oikonomos.md)")
+		return true, append(notes, "[theboringoffice] manager charter: wired (.opencode/oikonomos.md)")
 	}
-	return false, append(notes, "[grafeio] manager charter: already wired (.opencode/oikonomos.md)")
+	return false, append(notes, "[theboringoffice] manager charter: already wired (.opencode/oikonomos.md)")
 }
 
 // charterOutcome is the two things Start needs out of a charter pass.
@@ -173,4 +175,14 @@ func mergeInstructions(cfg []byte) (merged []byte, changed bool, err error) {
 		return nil, false, err
 	}
 	return append(out, '\n'), true, nil
+}
+
+// envOrLegacy reads the THEBORINGOFFICE_* env var, falling back to the
+// pre-rename GRAFEIO_* name (whole-product rename: grafeio ->
+// theboringoffice; old dotfiles and CI exports keep working).
+func envOrLegacy(key, legacyKey string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return os.Getenv(legacyKey)
 }
