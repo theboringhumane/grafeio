@@ -34,6 +34,11 @@
 //	    an explicit per-agent expand (closing line "· … ✗ stopped");
 //	(j) shapeToolText is IDEMPOTENT: the reducer's "<verb> · <rest>"
 //	    shape maps to "<Verb> <rest>", target-shaped text rides through.
+//	(k) a thread group TOPPING the timeline (born before every chat
+//	    entry) registers its hit-map at the TRIMMED top — the header on
+//	    content row 0, not base+2 (renderConversation's TrimLeft eats
+//	    the block's "\n\n" lead there) — so a click on the visual header
+//	    row toggles, and no registration hijacks the next item's row.
 //
 // No clocks, no sleeps: every office tick and wtool meta-tick is a
 // literal (Meta carries "state␟tick" like the reducer writes —
@@ -42,6 +47,7 @@ package panels
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 
@@ -492,6 +498,96 @@ func TestThreadStoppedCheckAndRollup(t *testing.T) {
 			t.Fatalf("expanded stopped thread missing shape %q:\n%s", want, convo)
 		}
 	}
+}
+
+// TestThreadFirstGroupTopEdgeHitMap is proof (k): when the thread group
+// TOPS the merged timeline (its birth At earlier than every chat entry),
+// the loop writes nothing before it and renderConversation's TrimLeft
+// eats the block's own "\n\n" lead — the header is content row 0, no
+// blank row above it. The hit-map must register base+0 there, not
+// base+2 (registration runs BEFORE the block write, so b.Len()==0
+// uniquely marks the top edge): a base+2 registration puts every row 2
+// LOW — the visual header row answers no click, and the sneak's
+// registration lands on the NEXT timeline item's row (click-hijack).
+func TestThreadFirstGroupTopEdgeHitMap(t *testing.T) {
+	c := NewChat(nil)
+	c.SetSize(80, 24)
+	c.SetState(state.OfficeState{
+		Tick: 50,
+		Employees: []state.Employee{
+			{ID: "dev-1", Name: "tekton-1", Role: state.RoleDeveloper,
+				Sprite: state.SpriteAtDesk, Task: "Fix the lexer's top edge"},
+		},
+		Chat: []state.ChatMsg{
+			// the thread is born BEFORE the user's first word — it
+			// tops the merged timeline (mid-timeline slots keep the
+			// base+2 registration: their "\n\n" lead survives)
+			{ID: "x1", From: "tekton-1", Kind: wtoolKind, Text: "Read internal/panels/chat.go", Meta: "done\x1f5", At: 10},
+			{ID: "x2", From: "tekton-1", Kind: wtoolKind, Text: "edit · lex.go", Meta: "done\x1f6", At: 20},
+			{ID: "u1", From: "user", Kind: "user", Text: "now the follow-up", At: 30},
+		},
+	})
+	convo := ansi.Strip(c.renderConversation())
+	rows := strings.Split(convo, "\n")
+	wantHeader := "✓ Developer Task — Fix the lexer's top edge (· 2 tool calls ✓ done)"
+
+	// (a) NO leading blank row: the transcript TOP is the thread header
+	// itself — TrimLeft already ate the block's "\n\n" lead
+	if rows[0] != wantHeader {
+		t.Fatalf("the top-edge group must open the transcript with its header (row 0 = %q):\n%s", rows[0], convo)
+	}
+
+	// (b) the hit-map must land on the SAME rows the trimmed content
+	// shows: the LOWEST registered key IS the header's visual row
+	headerRow := -1
+	for i, r := range rows {
+		if r == wantHeader {
+			headerRow = i
+			break
+		}
+	}
+	if headerRow < 0 {
+		t.Fatalf("the header row is missing:\n%s", convo)
+	}
+	var keys []int
+	for k := range c.threadRows {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	if len(keys) != 2 {
+		t.Fatalf("the collapsed top-edge thread must register header + sneak (2 rows), got %v", keys)
+	}
+	t.Logf("top-edge hit-map: header visual row %d, registered rows %v (min %d)", headerRow, keys, keys[0])
+	if keys[0] != headerRow {
+		t.Fatalf("the lowest registered row must BE the header's visual row %d, got %v — the top-edge registration is riding low through the TrimLeft", headerRow, keys)
+	}
+
+	// (c) clicking the header's VISUAL row toggles the thread — both
+	// ways — and the following user message's row is NOT clickable
+	// (the pre-fix sneak registration hijacked exactly that row)
+	if !c.ClickRow(1, headerRow) {
+		t.Fatalf("click on the top-edge header row %d was not claimed", headerRow)
+	}
+	tbAssertExpanded(t, c, "tekton-1", true, "after top-edge header click")
+	if !c.ClickRow(1, headerRow) { // the header row stays 0 while expanded
+		t.Fatalf("second click on the top-edge header row %d was not claimed", headerRow)
+	}
+	tbAssertExpanded(t, c, "tekton-1", false, "after re-click (collapsed again)")
+	userRow := -1
+	for i, r := range strings.Split(ansi.Strip(c.renderConversation()), "\n") {
+		if strings.Contains(r, "now the follow-up") {
+			userRow = i
+			break
+		}
+	}
+	if userRow < 0 {
+		t.Fatalf("the user message row is missing:\n%s", convo)
+	}
+	t.Logf("user message visual row %d is unregistered (pre-fix the sneak registration hijacked it)", userRow)
+	if c.ClickRow(1, userRow) {
+		t.Fatalf("click on the following user message's row %d must fall through", userRow)
+	}
+	tbAssertExpanded(t, c, "tekton-1", false, "after user-row click (no-op)")
 }
 
 // TestThreadOpencodeFrame prints the canonical gallery frame — one LIVE

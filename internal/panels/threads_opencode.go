@@ -383,8 +383,8 @@ func (c *Chat) wthinkRows(m state.ChatMsg, full bool) []string {
 // explicit expand re-opens it. The threadRows hit-map registers the
 // ONE header row plus the ONE sneak row in BOTH states — clicking
 // either toggles the thread; expanded tool rows and the closing summary
-// never register. The block carries its OWN leading "\n" like every
-// other timeline row group.
+// never register. The block carries its OWN leading "\n\n" — the same
+// blank-row glue the render loop writes between message items.
 func (c *Chat) renderWorkerGroup(b *strings.Builder, g workerGroup) {
 	stopped := c.threadStop[g.name]
 	expanded := c.threadsExpanded
@@ -414,14 +414,25 @@ func (c *Chat) renderWorkerGroup(b *strings.Builder, g workerGroup) {
 	}
 	if c.threadRows != nil {
 		base := strings.Count(b.String(), "\n")
+		// +2, not +1: the block's own "\n\n" lead ends the previous
+		// item's last row (+1) and leaves the ONE blank separator row
+		// (+2) before the header lands — EXCEPT at the top edge, where
+		// there is no previous item and the lead never survives (see
+		// the b.Len()==0 case below), so every row lands at base+0
+		lead := 2
+		if b.Len() == 0 {
+			lead = 0 // the group tops the transcript: renderConversation's
+			// TrimLeft eats the block's own "\n\n" lead, shifting
+			// every displayed row up by exactly 2
+		}
 		for i := range header {
-			c.threadRows[base+1+i] = g.name
+			c.threadRows[base+lead+i] = g.name
 		}
 		for i := range sneak {
-			c.threadRows[base+1+sneakAt+i] = g.name
+			c.threadRows[base+lead+sneakAt+i] = g.name
 		}
 	}
-	b.WriteString("\n" + strings.Join(rows, "\n"))
+	b.WriteString("\n\n" + strings.Join(rows, "\n"))
 }
 
 // pendingRamp — the height-block ramp the pending bar walks: the head

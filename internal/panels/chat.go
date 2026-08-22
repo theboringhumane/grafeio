@@ -1565,17 +1565,20 @@ func (c *Chat) renderConversation() string {
 	for i, item := range items {
 		if item.Group >= 0 {
 			// a subagent thread joins the flow HERE, at its timeline
-			// slot — its rows carry their own leading "\n", the same
-			// glue the old end-of-chat dock used
+			// slot — its block carries the same leading "\n\n" glue as
+			// every other item pair: the loop owns ALL separation, so
+			// item bodies never write an edge newline
 			c.renderWorkerGroup(&b, workers[item.Group])
 			if i == lastGroup && anyLive {
-				b.WriteString("\n" + chrome.DimText.Italic(true).Render(threadHintText))
+				b.WriteString("\n\n" + chrome.DimText.Italic(true).Render(threadHintText))
 			}
 			first = false
 			continue
 		}
 		if !first {
-			b.WriteString("\n")
+			// the ONE separator between timeline items: exactly one
+			// blank row, owned here and by the thread block's lead
+			b.WriteString("\n\n")
 		}
 		first = false
 		m := item.Msg
@@ -1793,13 +1796,13 @@ func (c *Chat) renderQuestion(b *strings.Builder, m state.ChatMsg) {
 			optLines[i] = chrome.DimText.Render(optLines[i])
 		}
 		for _, ln := range foldStyledLines(optLines, wrapW) {
-			b.WriteString(indent + ln + "\n")
+			b.WriteString("\n" + indent + ln)
 		}
 	}
 	if answered {
-		b.WriteString(indent + chrome.DimText.Render("✓ answered") + "\n")
+		b.WriteString("\n" + indent + chrome.DimText.Render("✓ answered"))
 	} else {
-		b.WriteString(indent + chrome.DimText.Italic(true).Render("(answer by typing below)"))
+		b.WriteString("\n" + indent + chrome.DimText.Italic(true).Render("(answer by typing below)"))
 	}
 }
 
@@ -2215,7 +2218,6 @@ func (c *Chat) renderOffice(b *strings.Builder, m state.ChatMsg) {
 	if m.Pending && m.Text == "" {
 		b.WriteString(prefix)
 		b.WriteString(chrome.DimText.Render("office is answering…"))
-		b.WriteString("\n")
 		return
 	}
 	lines := cleanMarkdown(c.renderMarkdown(m.Text))
@@ -2275,15 +2277,19 @@ func cleanMarkdown(out string) []string {
 }
 
 // writePrefixed writes lines, prefixing the first with `prefix` and hanging
-// the rest under it with `indent`.
+// the rest under it with `indent`. Newlines go BETWEEN lines only, never
+// after the last: callers are timeline item bodies, which end on content
+// (the render loop owns all separation).
 func writePrefixed(b *strings.Builder, prefix, indent string, lines []string) {
 	for i, ln := range lines {
+		if i > 0 {
+			b.WriteString("\n")
+		}
 		if i == 0 {
 			b.WriteString(prefix + ln)
 		} else {
 			b.WriteString(indent + ln)
 		}
-		b.WriteString("\n")
 	}
 }
 
