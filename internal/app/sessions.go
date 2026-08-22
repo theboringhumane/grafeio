@@ -231,10 +231,14 @@ func (m *Model) hydrateSession(sf *SessionFile) {
 	}
 	m.st.Chat = chat
 	// Roster: the fixed seats (manager, hr) are re-seated by the backend's
-	// own Start hires / the initial state; every other agent returns as a
+	// own Start hires / the initial state — and so is the CTO's exec
+	// suite: live Start seats the idle pseudo-CTO there deterministically
+	// every boot, while a restored CTO row would pin seat "cto" to a
+	// child session the server deleted after its return (a dead desk
+	// that blocks every future swap). Every other agent returns as a
 	// SILENT hire — seated at their old desk, no dispatch, no task.
 	for _, e := range sf.Agents {
-		if e.Role == state.RoleManager || e.Role == state.RoleHR {
+		if e.Role == state.RoleManager || e.Role == state.RoleHR || e.Role == state.RoleCTO {
 			continue
 		}
 		if findEmployee(m.st, e.ID) != nil {

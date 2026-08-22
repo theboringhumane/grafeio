@@ -260,6 +260,17 @@ func (b *liveBackend) Start(emit func(state.Event)) error {
 		ID: "hr", Name: "hr", Role: state.RoleHR, Seat: "hr", Sprite: state.SpriteAtDesk,
 	}})
 
+	// The exec suite opens too: the idle pseudo-CTO ("theboringcto",
+	// seat "cto") holds the office CTO's chair from boot — demo parity
+	// (the scripted tour hires him at t0). He is a floor ghost: EvHire'd
+	// here but NEVER keyed into ctx.employees, so the session-id mappers
+	// stay blind to him. The first architecture child session swaps in
+	// for him, the last one's removal re-seats him — see
+	// normCtx.seatPseudoCTO/dropPseudoCTO in events.go.
+	for _, e := range b.ctx.seatPseudoCTO() {
+		b.fl.emit(e)
+	}
+
 	// Agentmemory base: the focused env override wins, else brain.json
 	// (which itself defaults to localhost:3111 — identical when absent).
 	amURL := os.Getenv("AGENTMEMORY_URL")
@@ -1410,7 +1421,12 @@ func (b *liveBackend) messageText(sessionID, messageID string) (text string, fin
 }
 
 // deleteChild best-effort deletes a returned child session; success fires
-// the employee unless session.deleted already did.
+// the employee unless session.deleted already did. When the departed was
+// the LAST real CTO on the floor, the idle pseudo-CTO is re-seated in the
+// exec suite right after the fire (mirror of the session.deleted mapper in
+// events.go — both fire paths share the seatPseudoCTO latch + the
+// liveCTOs guard, so overlapping architecture children re-seat exactly
+// once, on the final departure).
 func (b *liveBackend) deleteChild(sessionID string) {
 	b.mu.Lock()
 	if b.ctx.fired[sessionID] {
@@ -1429,9 +1445,17 @@ func (b *liveBackend) deleteChild(sessionID string) {
 		return
 	}
 	b.ctx.fired[sessionID] = true
+	emp, ok := b.ctx.employees[sessionID]
 	delete(b.ctx.employees, sessionID)
+	var reseat []state.Event
+	if ok && emp.Role == state.RoleCTO && !b.ctx.pseudoCTO && b.ctx.liveCTOs() == 0 {
+		reseat = b.ctx.seatPseudoCTO()
+	}
 	b.mu.Unlock()
 	b.fl.emit(state.Event{Kind: state.EvFire, EmployeeID: sessionID})
+	for _, e := range reseat {
+		b.fl.emit(e)
+	}
 }
 
 // ---------------------------------------------------------------- SSE

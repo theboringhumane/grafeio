@@ -262,10 +262,11 @@ func buildPlan(W, H int, tiny bool) Plan {
 		)
 	}
 	// CTO exec suite (the boss office's second desk): name plate, desk,
-	// chair. Wide plans only — at 120+ cols the office's right half (right
-	// of the mug, beside the bookshelf) is free; below that the CTO stands
-	// at an overflow spot like any unseated hire. The plate follows the
-	// boss-plate width convention (padEnd(plate,10) in floor.go):
+	// chair. Wide plans only — floor grid >= 108x23 (bw>=28 && topH>=7):
+	// the office's right half (right of the mug, beside the bookshelf) is
+	// free there; below that the CTO stands at an overflow spot like any
+	// unseated hire. The plate follows the boss-plate width convention
+	// (padEnd(plate,10) in floor.go):
 	// "theboringcto" clipped to its 10 cols reads "theboringc".
 	if bw >= 28 && topH >= 7 {
 		*props = append(*props,

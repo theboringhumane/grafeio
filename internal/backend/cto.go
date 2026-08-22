@@ -8,6 +8,12 @@
 // EvStatus activity note plus one EvMail (MailNotice) summarizing it. The
 // latch re-arms only on a NEW dispatch: a board that stays drained never
 // re-reviews, and repeated drains without new work post nothing.
+//
+// The chair: in LIVE mode the exec suite is never empty — an idle
+// pseudo-CTO (pseudoCTOEmployee) holds seat "cto" from boot (demo parity),
+// is swapped for the real session-backed theboringcto-N when an
+// architecture brief lands, and is re-seated when the last real one is
+// removed (see normCtx.seatPseudoCTO / dropPseudoCTO in events.go).
 package backend
 
 import (
@@ -18,6 +24,24 @@ import (
 
 // ctoName is the CTO's office identity (roster name + mail sender).
 const ctoName = "theboringcto"
+
+// pseudoCTOEmployee — the idle stand-in for the office CTO, seated at boot
+// in LIVE mode (demo parity: the scripted tour hires the CTO at t0). He
+// holds the exec-suite seat "cto" with zero tasks and zero dispatches
+// until a REAL architecture child session claims the chair — the live
+// session.created mapper then fires him FIRST so the reducer frees the
+// seat before AssignSeat runs for theboringcto-N, and the fire paths
+// (session.deleted / deleteChild) re-seat him when the last real CTO
+// leaves. He is NEVER keyed into ctx.employees: every session-id mapper
+// (actorFor, working pulses, perms, questions, diffs, usage), the abort
+// loop and promptModelOverride stay blind to him. Identity mirrors
+// demo.go's demoEmployee(ctoName, RoleCTO, "cto").
+func pseudoCTOEmployee() state.Employee {
+	return state.Employee{
+		ID: ctoName, Name: ctoName, Role: state.RoleCTO,
+		Seat: "cto", Sprite: state.SpriteAtDesk,
+	}
+}
 
 // reviewLatch — the once-per-drained-board latch. Arm on any dispatch;
 // beat spends it the moment the board reads drained.

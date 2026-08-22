@@ -1,10 +1,11 @@
 // floorshot — freeze-frame renderer for the office floor: prints styled +
 // plain frames for a scripted seed state at the standard shell sizes.
 //
-//	floorshot --size 120x26   (default; also 84x22, 140x30)
+//	floorshot --size 120x26   (default; also 84x22, 140x30, 150x28)
 //
 // Shots: A = steady frame (one dev working, lit monitor), B = blink frame
-// (floating sleep-z's), C = meeting at the boss desk (nameplate [meetin]).
+// (floating sleep-z's), C = meeting at the boss desk (nameplate [meetin]),
+// D = exec frame (A's steady seed + the CTO seated in his suite).
 package main
 
 import (
@@ -62,7 +63,7 @@ func seed(tick int) state.OfficeState {
 }
 
 func main() {
-	size := flag.String("size", "120x26", "grid size: 120x26 | 84x22 | 140x30")
+	size := flag.String("size", "120x26", "grid size: 120x26 | 84x22 | 140x30 | 150x28")
 	flag.Parse()
 	W, H, err := parseSize(*size)
 	if err != nil {
@@ -83,6 +84,13 @@ func main() {
 					st.Employees[i].Sprite = state.SpriteMeeting
 				}
 			}
+			return st
+		}()},
+		{"D", func() state.OfficeState { // exec frame: the CTO seated in his suite
+			st := seed(2) // A's steady tick; append-only, seed() stays CTO-free
+			st.Employees = append(st.Employees, state.Employee{
+				ID: "theboringcto", Name: "theboringcto", Role: state.RoleCTO, Seat: "cto", Sprite: state.SpriteAtDesk,
+			})
 			return st
 		}()},
 	}

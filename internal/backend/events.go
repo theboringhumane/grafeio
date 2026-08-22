@@ -227,6 +227,15 @@ type normCtx struct {
 	// (Msg From/Kind "office") — never EvChatBoss (see mapTextDelta and
 	// the backend's maybeOfficeCompleted).
 	conciergeID string
+	// pseudoCTO — the boot pseudo-CTO latch: true while the idle
+	// "theboringcto" stand-in (pseudoCTOEmployee, cto.go) is the only CTO
+	// on the floor. liveBackend.Start seats him (demo parity); an
+	// architecture child session.created drops him (EvFire ahead of the
+	// real hire, so the reducer frees seat "cto" first); the fire paths
+	// re-seat him once the LAST real CTO is gone. The INVERSE of the
+	// concierge pseudo-desk: he is EvHire'd but NEVER keyed into
+	// ctx.employees, so every session-id mapper stays blind to him.
+	pseudoCTO bool
 }
 
 // thoughtCapRunes bounds a thought transcript. Raised from the old 400 (a
@@ -298,6 +307,40 @@ func (ctx *normCtx) dismissConcierge() {
 		delete(ctx.employees, ctx.conciergeID)
 	}
 	ctx.conciergeID = ""
+}
+
+// seatPseudoCTO latches the boot pseudo-CTO and returns his hire event
+// (nil when already seated — the exactly-once guard every path funnels
+// through). In-order emission does the rest: whoever re-seats him fires
+// the departing real CTO FIRST so the reducer frees seat "cto" before
+// this EvHire's AssignSeat puts the pseudo back in it.
+func (ctx *normCtx) seatPseudoCTO() []state.Event {
+	if ctx.pseudoCTO {
+		return nil
+	}
+	ctx.pseudoCTO = true
+	return []state.Event{{Kind: state.EvHire, Employee: pseudoCTOEmployee()}}
+}
+
+// dropPseudoCTO unlatches the pseudo: the architecture-child hire path
+// emits his EvFire ahead of the real theboringcto-N hire (one floor, one
+// CTO at a time — no double, no floor-0 overflow).
+func (ctx *normCtx) dropPseudoCTO() { ctx.pseudoCTO = false }
+
+// liveCTOs counts the REAL (session-keyed) CTO rows still on the floor —
+// a fired row counts as gone even while it lingers in ctx.employees
+// (session.deleted marks, never deletes). The pseudo never lands in
+// ctx.employees, so he neither swells nor blocks this count: the guard
+// that re-seats him asks "did we just lose the LAST real one?", which is
+// what keeps two overlapping architecture children from double-seating.
+func (ctx *normCtx) liveCTOs() int {
+	n := 0
+	for id, emp := range ctx.employees {
+		if emp.Role == state.RoleCTO && !ctx.fired[id] {
+			n++
+		}
+	}
+	return n
 }
 
 // Greek-desk naming per role (state canon). brain.json
@@ -1143,10 +1186,22 @@ func mapOCEvent(raw ocSSEEvent, ctx *normCtx, primaryID string, now int64) []sta
 		}
 		emp := ctx.issueEmployee(info)
 		task := ctx.issueTask(info, emp.Name, now)
-		return []state.Event{
-			{Kind: state.EvHire, Employee: emp},
-			{Kind: state.EvDispatch, Task: task, EmployeeID: emp.ID},
+		var evs []state.Event
+		// CTO swap: an architecture brief's child takes over the exec
+		// suite. Fire the boot pseudo-CTO FIRST — events emit in order, so
+		// the reducer removes him (freeing seat "cto") before the real
+		// theboringcto-N's EvHire re-seats it via AssignSeat: no double
+		// CTO, no floor-0 overflow. Exactly once per boot-pseudo:
+		// dropPseudoCTO clears the latch, so the NEXT architecture child
+		// hires plain while a real CTO already holds the chair.
+		if emp.Role == state.RoleCTO && ctx.pseudoCTO {
+			ctx.dropPseudoCTO()
+			evs = append(evs, state.Event{Kind: state.EvFire, EmployeeID: ctoName})
 		}
+		return append(evs,
+			state.Event{Kind: state.EvHire, Employee: emp},
+			state.Event{Kind: state.EvDispatch, Task: task, EmployeeID: emp.ID},
+		)
 
 	case "session.updated":
 		// Title often lands after creation; keep the board row honest.
@@ -1293,11 +1348,22 @@ func mapOCEvent(raw ocSSEEvent, ctx *normCtx, primaryID string, now int64) []sta
 		if json.Unmarshal(raw.Properties, &p) != nil {
 			return nil
 		}
-		if _, ok := ctx.employees[p.Info.ID]; !ok || ctx.fired[p.Info.ID] {
+		emp, ok := ctx.employees[p.Info.ID]
+		if !ok || ctx.fired[p.Info.ID] {
 			return nil
 		}
 		ctx.fired[p.Info.ID] = true
-		return []state.Event{{Kind: state.EvFire, EmployeeID: p.Info.ID}}
+		evs := []state.Event{{Kind: state.EvFire, EmployeeID: p.Info.ID}}
+		// CTO re-seat (mirror of deleteChild in opencode.go): the last
+		// real CTO just left, so the idle pseudo takes his exec suite
+		// back — AFTER the EvFire, so the reducer frees the chair before
+		// the hire's AssignSeat. Guards: latch still clear + no OTHER
+		// un-fired CTO row (overlapping architecture children re-seat
+		// exactly once, on the final departure).
+		if emp.Role == state.RoleCTO && !ctx.pseudoCTO && ctx.liveCTOs() == 0 {
+			evs = append(evs, ctx.seatPseudoCTO()...)
+		}
+		return evs
 
 	case "session.error":
 		var p ocSessionErrorProps

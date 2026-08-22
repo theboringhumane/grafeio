@@ -377,3 +377,89 @@ func TestCTOSuiteRenders120x30(t *testing.T) {
 		t.Fatalf("84x24 must not carry the CTO suite (bw<28) — it degrades to overflow")
 	}
 }
+
+// The suite gate is EXACTLY bw>=28 && topH>=7 (floorplan.go): bw first hits
+// 28 at W=108 (W*26/100), topH first hits 7 at H=23 ((H-2)*34/100). One
+// cell short on either axis and the CTO degrades to standing overflow.
+func TestCTOSuiteGateBoundaries(t *testing.T) {
+	cases := []struct {
+		w, h int
+		want bool
+	}{
+		{107, 23, false}, // bw=27: one col short of the width gate
+		{108, 23, true},  // the exact corner: 108*26/100=28 && 21*34/100=7
+		{108, 22, false}, // topH=6: one row short of the height gate
+		{107, 30, false}, // height alone can't rescue the width gate
+		{120, 22, false}, // width alone can't rescue the height gate
+		{140, 30, true},  // well past both (bw clamps to 30, topH to 9)
+	}
+	for _, c := range cases {
+		_, got := ComputePlan(c.w, c.h).Anchor["cto"]
+		if got != c.want {
+			t.Fatalf("%dx%d: cto anchor present=%v, want %v", c.w, c.h, got, c.want)
+		}
+	}
+}
+
+// 84x24 has no cto anchor (bw=21<28): SeatAnchor falls through to the
+// shared overflow spot beside the break area and he STANDS there — white,
+// lit — instead of sitting in a suite.
+func TestCTOOverflowStandsBreakArea84x24(t *testing.T) {
+	// ComputePlan re-pins CurrentPlan, so SeatAnchor below resolves
+	// against the 84x24 plan, not a cached wide one.
+	plan := ComputePlan(84, 24)
+	if anchor, ok := plan.Anchor["cto"]; ok {
+		t.Fatalf("84x24 must not carry the CTO suite, anchor at %v", anchor)
+	}
+	p := SeatAnchor("cto")
+	if p != plan.Hot.Overflow {
+		t.Fatalf("SeatAnchor(cto) = %v, want the shared overflow spot %v", p, plan.Hot.Overflow)
+	}
+	st := state.OfficeState{
+		Tick: 3,
+		Employees: []state.Employee{
+			// unique id: never a walker, so the fallback below is the only path
+			emp("cto-overflow", "theboringcto", state.RoleCTO, "cto", state.SpriteAtDesk),
+		},
+	}
+	rows := BuildRows(st, 84, 24)
+	c := rows[p.Y][p.X+1]
+	if c.Ch != 'C' {
+		t.Fatalf("overflow center (%d,%d) = %q, want 'C'", p.X+1, p.Y, c.Ch)
+	}
+	if c.FG != ROLE_COLOR[state.RoleCTO] || c.Dim {
+		t.Fatalf("overflow CTO cell = {FG:%q Dim:%v}, want lit %q", c.FG, c.Dim, ROLE_COLOR[state.RoleCTO])
+	}
+	// standing means bare floor: no chair under him to stay lit
+	t.Logf("CTO standing at the overflow spot, 84x24 (rows %d-%d x cols %d-%d):\n%s",
+		p.Y-1, p.Y+1, p.X-4, p.X+5, cropRows(rows, p.X-4, p.Y-1, p.X+5, p.Y+1))
+}
+
+// Frame zero, before ANY walker advance: SpritePosition misses so the
+// renderer must fall back to the seat anchor — the CTO is visible from the
+// very first frame, not only after EvTick has parked him.
+func TestCTOVisibleFirstFrame(t *testing.T) {
+	plan := ComputePlan(120, 30)
+	anchor, ok := plan.Anchor["cto"]
+	if !ok {
+		t.Fatalf("120x30 plan has no cto anchor")
+	}
+	st := state.OfficeState{
+		Tick: 3,
+		Employees: []state.Employee{
+			// unique id: guarantees no walker map entry from another test
+			emp("cto-first-frame", "theboringcto", state.RoleCTO, "cto", state.SpriteAtDesk),
+		},
+	}
+	if _, found := SpritePosition("cto-first-frame"); found {
+		t.Fatalf("walker for cto-first-frame must not exist before the first advance")
+	}
+	rows := BuildRows(st, 120, 30)
+	c := rows[anchor.Y][anchor.X+1]
+	if c.Ch != 'C' {
+		t.Fatalf("first-frame chair center (%d,%d) = %q, want 'C' via the SeatAnchor fallback", anchor.X+1, anchor.Y, c.Ch)
+	}
+	if c.FG != "white" || c.Dim {
+		t.Fatalf("first-frame CTO cell = {FG:%q Dim:%v}, want lit white", c.FG, c.Dim)
+	}
+}

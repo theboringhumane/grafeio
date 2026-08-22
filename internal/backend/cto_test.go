@@ -8,7 +8,12 @@
 //	(c) architecture routing: the ONE matcher sends arch/design/review
 //	    titles to the CTO (live roleFromSession) while plain briefs don't;
 //	(d) live wiring: child-return -> board drain -> one EvMail, latch-held
-//	    until the next dispatch.
+//	    until the next dispatch;
+//	(e)-(h) the LIVE boot pseudo-CTO: seated in the exec suite at Start
+//	    (demo parity), fired-ahead-of-hire when an architecture child swaps
+//	    in, re-seated exactly once when the last real CTO leaves
+//	    (deleteChild / session.deleted), never double-seated by two
+//	    overlapping architecture children.
 package backend
 
 import (
@@ -20,6 +25,7 @@ import (
 	"time"
 
 	"github.com/theboringhumane/theboringoffice/internal/config"
+	"github.com/theboringhumane/theboringoffice/internal/netwatch"
 	"github.com/theboringhumane/theboringoffice/internal/state"
 )
 
@@ -303,5 +309,286 @@ func TestLiveBoardDrainPostsOneCTOReview(t *testing.T) {
 	ms = mailsFrom(log, ctoName)
 	if len(ms) != 2 || ms[0].ID == ms[1].ID {
 		t.Fatalf("second batch must review once more (distinct mail), got %+v", ms)
+	}
+}
+
+// ---------------------------------------------------------------- boot pseudo-CTO
+// (e)–(h): the LIVE floor's idle pseudo-CTO contract — seated at boot
+// (demo parity), swapped for the real session-backed CTO on the first
+// architecture child, re-seated exactly once when the last real one
+// leaves.
+
+// startLiveForTest boots a REAL liveBackend (Start, not a field-pinned
+// stub) against a minimal opencode serve double: an empty session list
+// (ensurePrimary creates), one creatable primary, an EOF /event SSE (the
+// pump ladders silently — no frames ever arrive), and 200 DELETEs for
+// deleteChild. Hermetic: the agentmemory probe is pointed at an unroutable
+// port (instant refusal) and the internet watcher gets a scripted
+// always-online probe.
+func startLiveForTest(t *testing.T) (*liveBackend, *eventLog) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/session":
+			w.Write([]byte(`[]`))
+		case r.Method == http.MethodPost && r.URL.Path == "/session":
+			w.Write([]byte(`{"id":"ses-primary","title":"theboringoffice office","time":{"created":1,"updated":1}}`))
+		case strings.HasPrefix(r.URL.Path, "/event"):
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK) // empty body: streamOnce EOFs at once
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/session/"):
+			w.Write([]byte(`true`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("AGENTMEMORY_URL", "http://127.0.0.1:1") // refuse the lane probe instantly
+	probe := &scriptedProbe{online: true}
+	b := newLiveBackend(srv.URL, t.TempDir(), config.Default())
+	b.net = netwatch.New(probe.probe, 2*time.Millisecond)
+	log := &eventLog{}
+	if err := b.Start(log.emit); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Stop() }) // registered after srv.Close: runs first (LIFO)
+	return b, log
+}
+
+// archCreated builds a session.created SSE frame for a primary child.
+func archCreated(id, title string) ocSSEEvent {
+	return ocSSEEvent{Type: "session.created", Properties: json.RawMessage(
+		`{"info":{"id":"` + id + `","parentID":"ses-primary","title":"` + title + `","time":{"created":1,"updated":1}}}`)}
+}
+
+// sessDeleted builds a session.deleted SSE frame.
+func sessDeleted(id string) ocSSEEvent {
+	return ocSSEEvent{Type: "session.deleted", Properties: json.RawMessage(
+		`{"info":{"id":"` + id + `","time":{"created":1,"updated":1}}}`)}
+}
+
+// ctoWire — the pseudo-CTO's wire events, in emitted order (hires + fires
+// of ctoName, hires + fires of the real session-keyed CTOs): the seat
+// audit trail.
+func ctoWire(log *eventLog, realIDs ...string) []state.Event {
+	return eventsMatching(log, func(e state.Event) bool {
+		switch e.Kind {
+		case state.EvFire:
+			if e.EmployeeID == ctoName {
+				return true
+			}
+			for _, id := range realIDs {
+				if e.EmployeeID == id {
+					return true
+				}
+			}
+		case state.EvHire:
+			if e.Employee.ID == ctoName {
+				return true
+			}
+			for _, id := range realIDs {
+				if e.Employee.ID == id {
+					return true
+				}
+			}
+		}
+		return false
+	})
+}
+
+// wireKinds renders a ctoWire slice compactly for failure output and the
+// verbose-proof log: e.g. "EvHire:theboringcto EvFire:theboringcto".
+func wireKinds(evs []state.Event) string {
+	var parts []string
+	for _, e := range evs {
+		switch e.Kind {
+		case state.EvHire:
+			parts = append(parts, "EvHire:"+e.Employee.ID)
+		case state.EvFire:
+			parts = append(parts, "EvFire:"+e.EmployeeID)
+		default:
+			parts = append(parts, string(e.Kind))
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// pseudoState snapshots the pseudo latch + roster facts under the backend
+// mutex (the pump goroutine shares ctx, even if the stub never feeds it).
+func pseudoState(b *liveBackend) (latched, inEmployees bool, liveCTOs int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_, inEmployees = b.ctx.employees[ctoName]
+	return b.ctx.pseudoCTO, inEmployees, b.ctx.liveCTOs()
+}
+
+// (e) Live Start hires exactly THREE fixed seats — manager, hr, then the
+// idle pseudo-CTO at seat "cto" (demo parity) — and the pseudo is a floor
+// ghost: latched, EvHire'd, but NEVER keyed into ctx.employees.
+func TestLiveStartSeatsPseudoCTO(t *testing.T) {
+	b, log := startLiveForTest(t)
+
+	hires := eventsMatching(log, func(e state.Event) bool { return e.Kind == state.EvHire })
+	var hireIDs []string
+	for _, h := range hires {
+		hireIDs = append(hireIDs, h.Employee.ID)
+	}
+	t.Logf("boot hires: %s", strings.Join(hireIDs, " "))
+	if len(hires) != 3 || hireIDs[0] != "ses-primary" || hireIDs[1] != "hr" || hireIDs[2] != ctoName {
+		t.Fatalf("boot hires must be exactly [manager hr theboringcto], got %v", hireIDs)
+	}
+	pseudo := hires[2].Employee
+	if pseudo.Name != ctoName || pseudo.Role != state.RoleCTO || pseudo.Seat != "cto" || pseudo.Sprite != state.SpriteAtDesk {
+		t.Fatalf("pseudo identity = %+v, want theboringcto/cto/at-desk", pseudo)
+	}
+
+	latched, inEmployees, liveCTOs := pseudoState(b)
+	if !latched {
+		t.Fatal("Start must latch the pseudo-CTO")
+	}
+	if inEmployees {
+		t.Fatal("pseudo must NEVER be keyed into ctx.employees (session-id mappers would adopt him)")
+	}
+	if liveCTOs != 0 {
+		t.Fatalf("no real CTO on a fresh boot, liveCTOs = %d", liveCTOs)
+	}
+}
+
+// (f) An architecture-titled session.created FIRES the pseudo BEFORE
+// hiring the real theboringcto-1 — in-order events, so the reducer frees
+// seat "cto" ahead of the real hire's AssignSeat. Exactly once: the latch
+// is dropped, so the swap never repeats while the real CTO stands.
+func TestLiveArchitectureChildSwapsPseudoCTO(t *testing.T) {
+	b, log := startLiveForTest(t)
+
+	if err := b.onEvent(archCreated("ses-arch", "design the floor plan")); err != nil {
+		t.Fatal(err)
+	}
+
+	wire := ctoWire(log, "ses-arch")
+	t.Logf("cto wire: %s", wireKinds(wire))
+	if len(wire) != 3 ||
+		wire[0].Kind != state.EvHire || wire[0].Employee.ID != ctoName ||
+		wire[1].Kind != state.EvFire || wire[1].EmployeeID != ctoName ||
+		wire[2].Kind != state.EvHire || wire[2].Employee.ID != "ses-arch" {
+		t.Fatalf("swap must read [hire pseudo -> fire pseudo -> hire real], got %s", wireKinds(wire))
+	}
+	real := wire[2].Employee
+	if real.Role != state.RoleCTO || real.Name != "theboringcto-1" {
+		t.Fatalf("the real CTO must hire as theboringcto-1, got %+v", real)
+	}
+
+	latched, inEmployees, liveCTOs := pseudoState(b)
+	if latched {
+		t.Fatal("the swap must drop the pseudo latch")
+	}
+	if inEmployees || liveCTOs != 1 {
+		t.Fatalf("exactly one real CTO on the board: inEmployees=%v liveCTOs=%d", inEmployees, liveCTOs)
+	}
+}
+
+// (g1) deleteChild (the 10s-tidy path) fires the real CTO and re-seats
+// the pseudo exactly once — fire first, hire after.
+func TestLiveDeleteChildReseatsPseudoCTO(t *testing.T) {
+	b, log := startLiveForTest(t)
+	if err := b.onEvent(archCreated("ses-arch", "design the retry ladder")); err != nil {
+		t.Fatal(err)
+	}
+
+	b.deleteChild("ses-arch")
+
+	wire := ctoWire(log, "ses-arch")
+	t.Logf("cto wire: %s", wireKinds(wire))
+	want := "EvHire:theboringcto EvFire:theboringcto EvHire:ses-arch EvFire:ses-arch EvHire:theboringcto"
+	if got := wireKinds(wire); got != want {
+		t.Fatalf("re-seat via deleteChild:\nwant %s\ngot  %s", want, got)
+	}
+	latched, _, liveCTOs := pseudoState(b)
+	if !latched || liveCTOs != 0 {
+		t.Fatalf("pseudo must be re-seated with zero live CTOs: latched=%v liveCTOs=%d", latched, liveCTOs)
+	}
+
+	// A duplicate delete is swallowed by the fired dedupe — no second re-seat.
+	b.deleteChild("ses-arch")
+	if got := len(eventsMatching(log, func(e state.Event) bool {
+		return e.Kind == state.EvHire && e.Employee.ID == ctoName
+	})); got != 2 {
+		t.Fatalf("pseudo hires must total 2 (boot + one re-seat), got %d", got)
+	}
+}
+
+// (g2) the SSE session.deleted path plays the same re-seat (mirror of
+// deleteChild), and its own fired dedupe stays intact.
+func TestLiveSessionDeletedReseatsPseudoCTO(t *testing.T) {
+	b, log := startLiveForTest(t)
+	if err := b.onEvent(archCreated("ses-arch", "architect the org chart")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.onEvent(sessDeleted("ses-arch")); err != nil {
+		t.Fatal(err)
+	}
+	wire := ctoWire(log, "ses-arch")
+	t.Logf("cto wire: %s", wireKinds(wire))
+	want := "EvHire:theboringcto EvFire:theboringcto EvHire:ses-arch EvFire:ses-arch EvHire:theboringcto"
+	if got := wireKinds(wire); got != want {
+		t.Fatalf("re-seat via session.deleted:\nwant %s\ngot  %s", want, got)
+	}
+	latched, _, liveCTOs := pseudoState(b)
+	if !latched || liveCTOs != 0 {
+		t.Fatalf("pseudo must be re-seated with zero live CTOs: latched=%v liveCTOs=%d", latched, liveCTOs)
+	}
+
+	// The frame's own dedupe: a repeated session.deleted emits NOTHING.
+	before := len(log.kinds())
+	if err := b.onEvent(sessDeleted("ses-arch")); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(log.kinds()); got != before {
+		t.Fatalf("repeated session.deleted must be silent: %d events -> %d", before, got)
+	}
+}
+
+// (h) Two overlapping architecture children never double-seat the pseudo:
+// the first swap drops the latch, the SECOND child hires plain, the first
+// removal re-seats nothing (one real CTO still stands), and only the
+// final departure re-seats him — exactly once.
+func TestLiveOverlappingCTOChildrenReseatOnce(t *testing.T) {
+	b, log := startLiveForTest(t)
+
+	if err := b.onEvent(archCreated("ses-a", "design the floor plan")); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.onEvent(archCreated("ses-b", "review the reducer")); err != nil {
+		t.Fatal(err)
+	}
+	wire := ctoWire(log, "ses-a", "ses-b")
+	t.Logf("cto wire after both hires: %s", wireKinds(wire))
+	if got := wireKinds(wire); got != "EvHire:theboringcto EvFire:theboringcto EvHire:ses-a EvHire:ses-b" {
+		t.Fatalf("second arch child must hire plain (no swap), got %s", got)
+	}
+
+	// First removal: ses-b still stands — the pseudo stays off the floor.
+	b.deleteChild("ses-a")
+	if got := wireKinds(ctoWire(log, "ses-a", "ses-b")); got != "EvHire:theboringcto EvFire:theboringcto EvHire:ses-a EvHire:ses-b EvFire:ses-a" {
+		t.Fatalf("first removal must NOT re-seat (ses-b live), got %s", got)
+	}
+
+	// Final removal: the last real CTO is gone — re-seat exactly once.
+	b.deleteChild("ses-b")
+	wire = ctoWire(log, "ses-a", "ses-b")
+	t.Logf("cto wire after both removals: %s", wireKinds(wire))
+	want := "EvHire:theboringcto EvFire:theboringcto EvHire:ses-a EvHire:ses-b EvFire:ses-a EvFire:ses-b EvHire:theboringcto"
+	if got := wireKinds(wire); got != want {
+		t.Fatalf("final removal must re-seat exactly once:\nwant %s\ngot  %s", want, got)
+	}
+	latched, _, liveCTOs := pseudoState(b)
+	if !latched || liveCTOs != 0 {
+		t.Fatalf("after both removals: latched=%v liveCTOs=%d, want true/0", latched, liveCTOs)
+	}
+	if n := len(eventsMatching(log, func(e state.Event) bool {
+		return e.Kind == state.EvHire && e.Employee.ID == ctoName
+	})); n != 2 {
+		t.Fatalf("pseudo hires must total exactly 2 (boot + final re-seat), got %d", n)
 	}
 }
