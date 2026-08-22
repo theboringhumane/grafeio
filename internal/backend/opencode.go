@@ -109,10 +109,11 @@ type liveBackend struct {
 	respawnFresh  bool   // ResetPrimary(true) latched: next Send respawns a fresh session once
 	respawnOldID  string // primary id ResetPrimary dropped, so Send can un-seat it
 	// primaryOverride — the office-session resume pin (internal/app
-	// sessions.go) set BEFORE Start when a saved session.json for this
-	// directory exists. Start prefers it over find-or-create; a server-side
-	// 404/fetch failure degrades to the normal ensurePrimary path (degrade
-	// open — a stale file must never hard-fail a boot).
+	// sessions.go) set BEFORE Start: session.json's stored primary id, or
+	// the -s/--session explicit pin when the member names a session
+	// deterministically. Start prefers it over find-or-create; a
+	// server-side 404/fetch failure degrades to the normal ensurePrimary
+	// path (degrade open — a stale pin must never hard-fail a boot).
 	primaryOverride string
 	// promptModelRejected latches when a serve rejects the per-prompt model
 	// override with a 400 (an older/foreign server without the /doc model
@@ -845,11 +846,12 @@ func (b *liveBackend) ensurePrimary() (ocSession, error) {
 }
 
 // resolvePrimary is Start's boss-session choice: when a PrimaryOverride is
-// latched (the app restored an office session for this directory) the saved
-// session wins — BUT ONLY if the server still has it (a 404/fetch failure,
-// e.g. the member hand-deleted it server-side, falls back to the normal
-// find-or-create: degrade open, never hard fail the boot on a stale file).
-// Without an override this IS ensurePrimary.
+// latched — either by session.json's stored id (the app restored an office
+// session for this directory) or by the -s/--session explicit pin — the
+// pinned session wins — BUT ONLY if the server still has it (a 404/fetch
+// failure, e.g. the member hand-deleted it server-side, falls back to the
+// normal find-or-create: degrade open, never hard fail the boot on a stale
+// pin). Without an override this IS ensurePrimary.
 func (b *liveBackend) resolvePrimary() (ocSession, error) {
 	b.mu.Lock()
 	override := b.primaryOverride
@@ -858,10 +860,11 @@ func (b *liveBackend) resolvePrimary() (ocSession, error) {
 		var s ocSession
 		if err := b.doJSON(http.MethodGet, "/session/"+override, nil, &s); err == nil && s.ID != "" {
 			b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
-				"[theboringoffice] primary session: restored %s (office session on disk)", s.ID)})
+				"[theboringoffice] primary session: resume %s (pinned)", s.ID)})
 			return s, nil
 		}
-		b.fl.emit(state.Event{Kind: state.EvStatus, Text: "[theboringoffice] saved office session's primary " + override + " is gone server-side — normal find-or-create instead"})
+		b.fl.emit(state.Event{Kind: state.EvStatus, Text: fmt.Sprintf(
+			"[theboringoffice] pinned session %s not found server-side — starting normal find-or-create instead", override)})
 	}
 	return b.ensurePrimary()
 }
@@ -944,10 +947,11 @@ func (b *liveBackend) ResetPrimary(forceNew bool) error {
 // ---------------------------------------------------------------- office session seams (ADDITIVE)
 
 // PrimaryOverride pins the boss-session id Start should resume (the app
-// calls it BEFORE Start, after restoring a saved office session for this
-// directory — see internal/app/sessions.go). resolvePrimary verifies the
-// session still exists server-side; anything else falls back to
-// find-or-create.
+// calls it BEFORE Start — either with session.json's stored primary after
+// restoring a saved office session for this directory, or with the
+// -s/--session explicit pin; see internal/app/sessions.go + model.go's
+// WithResumeSession). resolvePrimary verifies the session still exists
+// server-side; anything else falls back to find-or-create.
 //
 // NOT part of state.Backend: the app type-asserts this seam (same pattern
 // as teamBackend/attachmentBackend); harness stubs never implement it.

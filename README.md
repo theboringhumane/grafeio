@@ -55,6 +55,21 @@ theboringoffice --demo     # touring mode: simulated events, labeled DEMO
 theboringoffice --server http://127.0.0.1:4096   # attach to an existing server
 ```
 
+
+## Resuming a session
+
+The office re-opens your last chat on launch. To boot into a *specific* past
+session instead, hand the app its id:
+
+```bash
+theboringoffice --session <session-id>   # short: -s <session-id>; env: THEBORINGOFFICE_SESSION
+```
+
+An id the server doesn't know never blocks boot — the app warns, then
+starts normally with the usual find-or-create. In-app, `/session` prints the
+current session id and where its session.json lives on disk, so you can note
+one down for a later `--session` pin.
+
 ![agents tab](docs/shots-go/agents.png)
 
 Working detail stays visible: opencode-style diffs (line numbers, full-row
@@ -217,6 +232,7 @@ clears the chips.
 | `/focus floor` | alias of `/zen` |
 | `/stop` | abort current work (boss + workers) |
 | `/new` | fresh office (transcript archived) |
+| `/session` | show the current primary session id + session.json path (`-s`/`--session` pins one at boot) |
 | `/quit` | exit theboringoffice |
 
 ## What v2 (Go) changed

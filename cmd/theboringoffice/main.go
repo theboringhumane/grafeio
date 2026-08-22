@@ -3,6 +3,10 @@
 //	theboringoffice                 live mode: spawn/attach `opencode serve` for <cwd>
 //	theboringoffice --demo          touring mode: simulated events (explicitly labeled)
 //	theboringoffice --server URL    attach to an existing server, don't spawn
+//	theboringoffice -s SESSION      resume a specific past opencode chat session by id
+//	                                (the --session long form; beats the saved-session
+//	                                restore and its 4-day freshness gate for this boot —
+//	                                /session in-app prints the id)
 //	theboringoffice --autokill 6s   exit after duration (CI / screenshot runs)
 //	theboringoffice --version       print version and exit
 package main
@@ -45,6 +49,8 @@ func envOr(key, legacyKey string) string {
 func main() {
 	demo := flag.Bool("demo", envOr("THEBORINGOFFICE_DEMO", "GRAFEIO_DEMO") == "1", "run with simulated events")
 	server := flag.String("server", "", "opencode serve URL (attach, don't spawn)")
+	session := flag.String("session", "", "resume this opencode chat session id (explicit pin; beats the saved-session restore)")
+	sessionShort := flag.String("s", "", "shorthand for -session")
 	autokill := flag.Duration("autokill", 0, "exit after this duration (shots/CI)")
 	theme := flag.String("theme", "", "color theme: noir|paper|mono|dracula|solarized")
 	printCfg := flag.Bool("print-default-config", false, "print the default brain.json and exit")
@@ -70,6 +76,14 @@ func main() {
 	}
 	if v := envOr("THEBORINGOFFICE_SERVER", "GRAFEIO_SERVER"); v != "" && *server == "" {
 		*server = v
+	}
+	// session-pin precedence: --session > -s > THEBORINGOFFICE_SESSION
+	// (GRAFEIO_SESSION fallback) — same shape as the server/theme overlays.
+	if *session == "" {
+		*session = *sessionShort
+	}
+	if v := envOr("THEBORINGOFFICE_SESSION", "GRAFEIO_SESSION"); v != "" && *session == "" {
+		*session = v
 	}
 	// theme precedence: --theme flag > THEBORINGOFFICE_THEME (GRAFEIO_THEME fallback) > brain.json ui.theme > persisted > default
 	if v := envOr("THEBORINGOFFICE_THEME", "GRAFEIO_THEME"); v != "" && *theme == "" {
@@ -98,7 +112,7 @@ func main() {
 		return panels.NewTerminal(cols, rows)
 	}
 
-	model := app.New(b, cfg)
+	model := app.New(b, cfg, app.WithResumeSession(*session))
 	if cfg.UI.Sounds != "" && cfg.UI.Sounds != "off" {
 		model.SetSoundBus(sndBus{sound.NewBus(cfg.UI.Sounds, "")})
 	}

@@ -19,7 +19,10 @@
 // uishot/headless — simply never implement them):
 //
 //	PrimaryOverride(id) — pre-Start resume pin (server-side 404 falls back
-//	                      to find-or-create; boot never hard-fails)
+//	                      to find-or-create; boot never hard-fails). Fed by
+//	                      session.json's stored id AND by the -s/--session
+//	                      boot flag (an explicit pin that skips the freshness
+//	                      gate)
 //	PrimaryID()         — current primary, feeds the snapshot
 //	NewOffice()         — /new: mint a fresh "theboringoffice office" primary NOW
 package app
@@ -181,10 +184,33 @@ func SaveSession(dir string, sf SessionFile) error {
 	return os.Rename(tmp, path)
 }
 
-// RestoreNotice — the dim office notice on a restored boot.
+// RestoreNotice — the dim office notice on a restored boot. Trails the
+// resume discoverability hint: /session prints this office's primary id and
+// -s|--session pins one explicitly on the next boot (bypassing the
+// freshness gate — deliberate resume semantics).
 func RestoreNotice(sf *SessionFile) string {
-	return fmt.Sprintf("restored office session from %s (%d msgs) · /new for a fresh office",
+	return fmt.Sprintf("restored office session from %s (%d msgs) · /new for a fresh office · /session prints the id (-s|--session pins one at boot)",
 		time.UnixMilli(sf.SavedAt).Local().Format("15:04"), len(sf.Chat))
+}
+
+// sessionInfo — the /session slash body: the current primary ("boss")
+// session id, where this directory's session.json lives, and the exact
+// command that resumes THIS session on a future boot. The id reads "" while
+// the backend has not resolved a primary yet (or a stub backend without
+// the seam — harnesses, demo) — reported honestly, never invented.
+func (m *Model) sessionInfo() string {
+	id := ""
+	if ps, ok := m.backend.(primarySeamBackend); ok {
+		id = ps.PrimaryID()
+	}
+	if id == "" {
+		return "session: no primary resolved yet (try again once the backend is up) · -s|--session <id> pins one at boot"
+	}
+	path := "n/a (no session dir)"
+	if m.sessDir != "" {
+		path = SessionPath(m.sessDir)
+	}
+	return fmt.Sprintf("session: %s (primary)\n  session.json: %s\n  resume on the next boot: theboringoffice -s %s", id, path, id)
 }
 
 // NewOfficeNotice — the office notice for /new (the file is KEPT: history

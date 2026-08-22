@@ -330,6 +330,13 @@ type Model struct {
 	sessDir  string
 	sessLast time.Time
 
+	// resumePin — an explicit opencode session id to boot into (main's
+	// -s/--session flag, threaded via WithResumeSession). Set pre-Start:
+	// it beats session.json's stored PrimaryID and skips the 4-day
+	// freshness gate (deliberate resume semantics); "" = the normal
+	// restore path.
+	resumePin string
+
 	// proj — cached project/git-branch info feeding the top bar right
 	// segment (internal/projinfo; TTL-bounded, exec at most once per TTL).
 	proj *projinfo.Cache
@@ -561,11 +568,24 @@ type questionLaterMsg struct{}
 // The ferry keeps the model value copy in Update the single writer.
 type stopWorkMsg struct{}
 
+// Option — a functional New option (additive: existing New(b, cfg)
+// callers compile untouched).
+type Option func(*Model)
+
+// WithResumeSession pins an explicit opencode session id to boot into
+// (main's -s/--session flag): the restore leg routes it into the backend's
+// PrimaryOverride INSTEAD of session.json's stored id and skips the 4-day
+// freshness gate — deliberate resume semantics for when the automatic
+// last-chat restore is not enough. "" is a no-op.
+func WithResumeSession(id string) Option {
+	return func(m *Model) { m.resumePin = id }
+}
+
 // New builds the app around a backend + the brain.json config. cfg is
 // nil-tolerant (config.Default() substituted — headless stubs and harnesses).
 // backend.Start is NOT called here — main owns that (goroutine →
 // tea.Program.Send).
-func New(b state.Backend, cfg *config.Config) Model {
+func New(b state.Backend, cfg *config.Config, opts ...Option) Model {
 	if cfg == nil {
 		cfg = config.Default()
 	}
@@ -676,6 +696,12 @@ func New(b state.Backend, cfg *config.Config) Model {
 	// (projinfo falls back to os.Getwd when sessDir is "").
 	m.proj = projinfo.DefaultCache()
 
+	// Options land BEFORE the restore leg reads them (WithResumeSession
+	// feeds resumePin) — construction above stays option-free.
+	for _, opt := range opts {
+		opt(&m)
+	}
+
 	// Office-session restore (LIVE ONLY — demo is a scripted tour and a
 	// restored real transcript would confuse it; per the ruling, demo
 	// skips). The PrimaryOverride MUST land before backend.Start (main
@@ -684,7 +710,38 @@ func New(b state.Backend, cfg *config.Config) Model {
 	if b != nil && b.Mode() == state.ModeLive {
 		if dir, err := os.Getwd(); err == nil {
 			m.sessDir = dir
-			if sf, ok := LoadSession(dir); ok && sf.Fresh() {
+			if m.resumePin != "" {
+				// EXPLICIT RESUME PIN (-s/--session): beats session.json's
+				// stored id AND skips the 4-day freshness gate — the member
+				// asked for THIS session deterministically. resolvePrimary
+				// (backend) still verifies the id server-side and degrades
+				// open to find-or-create on a 404, so the boot never
+				// hard-fails.
+				pinned := false
+				if ps, ok := b.(primarySeamBackend); ok {
+					ps.PrimaryOverride(m.resumePin)
+					pinned = true
+				}
+				sf, sfOK := LoadSession(dir)
+				switch {
+				case !pinned:
+					// A live harness stub without the seam: never fake the
+					// resume (that would be a silent substitution).
+					m.noticeErr("-s/--session: this backend cannot pin a session — starting normally")
+				case sfOK && sf.PrimaryID == m.resumePin:
+					// Pin == the stored id: hydrate as today (the skip
+					// guard below fires only on a DIFFERENT stored
+					// transcript).
+					m.hydrateSession(sf)
+					m.bootDone = true
+				default:
+					// HYDRATE-SKIP GUARD: the pinned server session is not
+					// the one session.json describes (or no file exists) —
+					// hydrating that stale, unrelated transcript would mask
+					// the pinned one.
+					m.notice(fmt.Sprintf("resumed session %s (explicit pin) · /new for a fresh office", m.resumePin))
+				}
+			} else if sf, ok := LoadSession(dir); ok && sf.Fresh() {
 				if sf.PrimaryID != "" {
 					if ps, ok := b.(primarySeamBackend); ok {
 						ps.PrimaryOverride(sf.PrimaryID)
@@ -2671,6 +2728,8 @@ const slashHelp = `commands:
   /perm              re-open an esc'd permission prompt
   /question          re-open a deferred boss question
   /new               fresh office (previous transcript archived on disk)
+  /session           show the primary session id + session.json path
+                     (boot flag -s|--session <id> resumes one)
   /status            office status
   /mcp [reconnect x] show MCP servers; reconnect one by name
   /quit              exit theboringoffice`
@@ -2938,6 +2997,11 @@ func (m *Model) applySlash(input string) tea.Cmd {
 		m.chat.SetQuestion(m.questionView(m.question))
 	case "/new":
 		m.newOffice() // sessions.go — clear surfaces + fresh "theboringoffice office"
+	case "/session":
+		// Discoverability for the -s/--session boot flag: the current
+		// primary id, where its session.json lives, and how to resume it
+		// next boot (see sessions.go sessionInfo).
+		m.notice(m.sessionInfo())
 	case "/status":
 		var pend, doing, done int
 		for _, t := range m.st.Tasks {
